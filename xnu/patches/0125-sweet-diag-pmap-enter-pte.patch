@@ -1,0 +1,18 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..18bb053 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -5606,6 +5606,13 @@ pmap_enter_pte(pmap_t pmap, pt_entry_t *pte_p, pt_entry_t *old_pte, pt_entry_t n
+ 			/* pte has been modified by another thread and we hold the wrong PVH lock. Retry. */
+ 			success = false;
+ 		} else {
++			if (((uintptr_t)pte_p) & 0x1f) {
++				/* SWEET diag: report what is being mapped when the 4-PTE group is misaligned */
++				panic("SWEET diag: pmap_enter_pte unaligned pmap=%p kernel=%d v=0x%llx pte_p=%p new_pte=0x%llx old_pte=0x%llx pa_valid=%d",
++				    pmap, (pmap == kernel_pmap), (unsigned long long)v, pte_p,
++				    (unsigned long long)new_pte, (unsigned long long)*old_pte,
++				    (int)pa_valid(pte_to_pa(new_pte)));
++			}
+ 			write_pte_fast(pte_p, new_pte);
+ 			success = true;
+ 		}
