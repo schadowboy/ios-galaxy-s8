@@ -1,0 +1,60 @@
+diff --git a/osfmk/kern/bsd_kern.c b/osfmk/kern/bsd_kern.c
+--- a/osfmk/kern/bsd_kern.c
++++ b/osfmk/kern/bsd_kern.c
+@@ -1819,6 +1819,7 @@
+ #include <kern/block_hint.h>
+ #include <kern/task_ref.h>
+ 
++#define S8P_BT_DEPTH 24
+ #define S8P_TPREV 96
+ static struct { uint64_t tid; uint64_t total; } s8p_tprev[S8P_TPREV];
+ static unsigned s8p_tprev_next;
+@@ -1908,15 +1909,33 @@
+ 			stc = 'S';
+ 		}
+ 		fp = get_saved_state_fp(ss);
+-		n = (size_t)snprintf(s8p_line, sizeof(s8p_line),
+-		    "S8PROF pc %s[%d] t%d st=%c pc=0x%llx lr=0x%llx cpu=%llu mach_msg=%c bt",
+-		    name, pid, tid_n, stc, get_saved_state_pc(ss), get_saved_state_lr(ss),
+-		    s8p_thread_cpu_delta_ms(th), mm ? 'y' : 'n');
+-		for (int i = 0; i < 6 && fp != 0 && (fp & 7) == 0 && n < sizeof(s8p_line) - 20; i++) {
++		{
++			char tname[MAXTHREADNAMESIZE];
++			tname[0] = '\0';
++			thread_get_thread_name(th, tname);
++			tname[24] = '\0';       /* print at most 24 chars */
++			for (char *c = tname; *c != '\0'; c++) {
++				if (*c < 0x21 || *c > 0x7e) {
++					*c = '_';
++				}
++			}
++			n = (size_t)snprintf(s8p_line, sizeof(s8p_line),
++			    "S8PROF pc %s[%d] t%d tn=%s st=%c pc=0x%llx lr=0x%llx sp=0x%llx cpu=%llu mach_msg=%c bt",
++			    name, pid, tid_n, tname[0] ? tname : "-", stc, get_saved_state_pc(ss),
++			    get_saved_state_lr(ss), get_saved_state_sp(ss),
++			    s8p_thread_cpu_delta_ms(th), mm ? 'y' : 'n');
++		}
++		for (int i = 0; i < S8P_BT_DEPTH && fp != 0 && (fp & 7) == 0; i++) {
+ 			uint64_t frame[2];
+ 			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+ 				break;
+ 			}
++			if (n > 176) {
++				/* line full: flush it and continue on a pc2 line */
++				printf("%s\n", s8p_line);
++				n = (size_t)snprintf(s8p_line, sizeof(s8p_line),
++				    "S8PROF pc2 %s[%d] t%d bt", name, pid, tid_n);
++			}
+ 			n += (size_t)snprintf(s8p_line + n, sizeof(s8p_line) - n, " 0x%llx", frame[1]);
+ 			if (frame[0] <= fp) {
+ 				break;
+@@ -1926,6 +1945,9 @@
+ 		printf("%s\n", s8p_line);
+ 	}
+ 	task_unlock(task);
++	printf("S8PROF timebase cntfrq=%llu kernel=%u\n",
++	    (unsigned long long)__builtin_arm_rsr64("CNTFRQ_EL0"),
++	    (unsigned)gPEClockFrequencyInfo.timebase_frequency_hz);
+ 	printf("S8PROF slide %s[%d] slide=0x%llx mh=0x%llx skipped=%d\n", name, pid, slide,
+ 	    (uint64_t)task->mach_header_vm_address, skipped);
+ 	task_deallocate(task);
