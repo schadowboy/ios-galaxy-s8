@@ -1,0 +1,429 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -39,6 +39,16 @@
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <kern/processor.h>
++#include <kern/sched.h>
++#include <kern/queue.h>
++#include <kern/recount.h>
++#include <kern/counter.h>
++#include <kern/host_statistics.h>
++#endif
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+@@ -175,7 +185,7 @@
+  * (to the device when write is set). Returns 0 or an errno.
+  */
+ static int
+-ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++ufs_scsi_raw(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+@@ -298,6 +308,46 @@
+ 	return 0;
+ }
+ 
++/*
++ * s8prof counters: every UFS command goes through here, always under
++ * sweet_ufs_lock (or single threaded during init), so plain increments are
++ * enough; the s8prof thread reads them racily (aligned 64-bit loads).
++ * Latency is the command time on the controller (doorbell to completion),
++ * lock wait is accounted separately in sweet_ufs_strategy.
++ */
++struct s8prof_ufs_stats {
++	volatile uint64_t rd_bytes, wr_bytes, rd_reqs, wr_reqs, other_reqs;
++	volatile uint64_t lat_abs, lat_max_abs;        /* mach absolute time units */
++	volatile uint64_t strat_reqs, lockwait_abs;    /* strategy() calls, time waiting for sweet_ufs_lock */
++	volatile uint64_t errors;
++};
++static struct s8prof_ufs_stats s8prof_ufs;
++
++static int
++ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++{
++	uint64_t t0 = mach_absolute_time();
++	int error = ufs_scsi_raw(cdb, cdb_len, len, write);
++	uint64_t dt = mach_absolute_time() - t0;
++	if (len == 0) {
++		s8prof_ufs.other_reqs++;
++	} else if (write) {
++		s8prof_ufs.wr_reqs++;
++		s8prof_ufs.wr_bytes += len;
++	} else {
++		s8prof_ufs.rd_reqs++;
++		s8prof_ufs.rd_bytes += len;
++	}
++	if (error) {
++		s8prof_ufs.errors++;
++	}
++	s8prof_ufs.lat_abs += dt;
++	if (dt > s8prof_ufs.lat_max_abs) {
++		s8prof_ufs.lat_max_abs = dt;
++	}
++	return error;
++}
++
+ /* READ(10) of count device blocks at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+@@ -477,7 +527,10 @@
+ 		goto done;
+ 	}
+ 
++	uint64_t lock_t0 = mach_absolute_time();
+ 	lck_mtx_lock(&sweet_ufs_lock);
++	s8prof_ufs.strat_reqs++;
++	s8prof_ufs.lockwait_abs += mach_absolute_time() - lock_t0;
+ 	for (uint32_t done = 0; done < count;) {
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / UFS_BLOCK;
+@@ -885,4 +938,322 @@
+ 	*dev = su.bdev;
+ 	return 0;
+ }
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * s8prof=N: every N seconds a kernel thread prints compact "S8PROF" lines
++ * with printf (same console/klog path as the S8RECOV and SWEET lines).
++ *
++ *  cpu : per-CPU busy % from recount_processor_usage(&processor->pr_recount)
++ *        (the idle time accumulated by the scheduler's idle accounting, plus
++ *        user/system time), as delta against the wall clock of the interval.
++ *  top : per-task CPU time (recount_task_times, user+system, mach time) deltas
++ *        over the global task queue, keyed by pid; shown as % of one CPU.
++ *  vm  : vm_page_* page counts, the vm_statistics_* scalable counters as
++ *        deltas, compressor counters.
++ *  sched: sched_run_buckets[TH_BUCKET_RUN] (runnable incl. running); context
++ *        switch rate from the sum of thread->c_switch over the global thread
++ *        queue (threads that exit during the interval drop out: clamped at 0).
++ *  ufs : s8prof_ufs counters kept by ufs_scsi()/sweet_ufs_strategy().
++ *
++ * tasks_threads_lock is held only for the pointer-chasing scan (no printf, no
++ * proc lookup inside); everything printed uses static buffers.
++ */
++#define S8P_MAXCPU      8
++#define S8P_MAXTASK     256
++#define S8P_TOP         6
++
++extern unsigned int vm_page_free_count, vm_page_active_count, vm_page_inactive_count,
++    vm_page_speculative_count, vm_page_wire_count, vm_page_throttled_count;
++extern uint32_t c_segment_pages_compressed;
++extern uint32_t c_segment_count;
++extern int64_t compressor_bytes_used;
++
++typedef struct {
++	int32_t  pid;
++	uint32_t nthr;
++	uint64_t total;
++	uint64_t delta;
++} s8p_task_t;
++
++enum {
++	S8P_VM_PAGEIN, S8P_VM_PAGEOUT, S8P_VM_FAULT, S8P_VM_DECOMP, S8P_VM_COMP,
++	S8P_VM_SWAPIN, S8P_VM_SWAPOUT, S8P_VM_N
++};
++enum {
++	S8P_D_RDB, S8P_D_WRB, S8P_D_RDQ, S8P_D_WRQ, S8P_D_OTH, S8P_D_LAT,
++	S8P_D_STRAT, S8P_D_LOCKW, S8P_D_ERR, S8P_D_N
++};
++
++static s8p_task_t s8p_cur[S8P_MAXTASK], s8p_prev[S8P_MAXTASK];
++static uint32_t s8p_ncur, s8p_nprev;
++static uint64_t s8p_p_idle[S8P_MAXCPU], s8p_p_usr[S8P_MAXCPU], s8p_p_sys[S8P_MAXCPU];
++static uint64_t s8p_vm_prev[S8P_VM_N], s8p_d_prev[S8P_D_N], s8p_csw_prev, s8p_last;
++static char s8p_line[208];
++static int s8prof_event;
++static uint32_t s8prof_secs;
++
++#define S8P_CAT(...) \
++	do { \
++	        if (n < sizeof(s8p_line)) { \
++	                n += (size_t)snprintf(s8p_line + n, sizeof(s8p_line) - n, __VA_ARGS__); \
++	        } \
++	} while (0)
++
++static uint64_t
++s8p_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++static void
++s8prof_report(bool print)
++{
++	uint64_t now = mach_absolute_time();
++	uint64_t wall = now - s8p_last;
++	size_t n;
++	unsigned ncpu = processor_count;
++	uint64_t cpu_busy[S8P_MAXCPU] = { 0 };
++	uint64_t tot_usr = 0, tot_sys = 0;
++
++	if (wall == 0) {
++		wall = 1;
++	}
++	s8p_last = now;
++	if (ncpu > S8P_MAXCPU) {
++		ncpu = S8P_MAXCPU;
++	}
++
++	/* (1) per-CPU accounting */
++	for (unsigned i = 0; i < ncpu; i++) {
++		processor_t pr = processor_array[i];
++		struct recount_usage u = { 0 };
++		uint64_t idle = 0;
++		if (pr == PROCESSOR_NULL) {
++			continue;
++		}
++		recount_processor_usage(&pr->pr_recount, &u, &idle);
++		uint64_t didle = idle - s8p_p_idle[i];
++		uint64_t dusr = u.ru_user_time_mach - s8p_p_usr[i];
++		uint64_t dsys = u.ru_system_time_mach - s8p_p_sys[i];
++		if (didle > wall) {
++			didle = wall;
++		}
++		cpu_busy[i] = 100 - didle * 100 / wall;
++		tot_usr += dusr;
++		tot_sys += dsys;
++		s8p_p_idle[i] = idle;
++		s8p_p_usr[i] = u.ru_user_time_mach;
++		s8p_p_sys[i] = u.ru_system_time_mach;
++	}
++
++	/* (2),(4) task and thread scan under tasks_threads_lock */
++	uint64_t csw_total = 0;
++	uint32_t nthreads = 0;
++	int ntasks;
++	task_t t;
++	thread_t th;
++	lck_mtx_lock(&tasks_threads_lock);
++	ntasks = tasks_count;
++	s8p_ncur = 0;
++	queue_iterate(&tasks, t, task_t, tasks) {
++		if (s8p_ncur < S8P_MAXTASK) {
++			struct recount_times_mach tm = recount_task_times(t);
++			s8p_task_t *e = &s8p_cur[s8p_ncur++];
++			e->pid = task_pid(t);
++			e->nthr = (uint32_t)t->thread_count;
++			e->total = tm.rtm_user + tm.rtm_system;
++			e->delta = 0;
++		}
++	}
++	queue_iterate(&threads, th, thread_t, threads) {
++		nthreads++;
++		csw_total += th->c_switch;
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++
++	for (uint32_t i = 0; i < s8p_ncur; i++) {
++		uint64_t before = 0;
++		for (uint32_t j = 0; j < s8p_nprev; j++) {
++			if (s8p_prev[j].pid == s8p_cur[i].pid) {
++				before = s8p_prev[j].total;
++				break;
++			}
++		}
++		s8p_cur[i].delta = s8p_cur[i].total >= before ? s8p_cur[i].total - before : 0;
++	}
++	/* remember the totals, then pick the top entries by zeroing taken deltas */
++	for (uint32_t i = 0; i < s8p_ncur; i++) {
++		s8p_prev[i] = s8p_cur[i];
++	}
++	s8p_nprev = s8p_ncur;
++
++	int32_t top_pid[S8P_TOP];
++	uint32_t top_nthr[S8P_TOP];
++	uint64_t top_delta[S8P_TOP];
++	unsigned ntop = 0;
++	while (ntop < S8P_TOP) {
++		int best = -1;
++		for (uint32_t i = 0; i < s8p_ncur; i++) {
++			if (s8p_cur[i].delta != 0 && (best < 0 || s8p_cur[i].delta > s8p_cur[best].delta)) {
++				best = (int)i;
++			}
++		}
++		if (best < 0) {
++			break;
++		}
++		top_pid[ntop] = s8p_cur[best].pid;
++		top_nthr[ntop] = s8p_cur[best].nthr;
++		top_delta[ntop] = s8p_cur[best].delta;
++		ntop++;
++		s8p_cur[best].delta = 0;
++	}
++
++	uint64_t csw_delta = csw_total >= s8p_csw_prev ? csw_total - s8p_csw_prev : 0;
++	s8p_csw_prev = csw_total;
++
++	/* (3) vm counters */
++	uint64_t vm_now[S8P_VM_N], vm_d[S8P_VM_N];
++	vm_now[S8P_VM_PAGEIN] = counter_load(&vm_statistics_pageins);
++	vm_now[S8P_VM_PAGEOUT] = counter_load(&vm_statistics_pageouts);
++	vm_now[S8P_VM_FAULT] = counter_load(&vm_statistics_faults);
++	vm_now[S8P_VM_DECOMP] = counter_load(&vm_statistics_decompressions);
++	vm_now[S8P_VM_COMP] = counter_load(&vm_statistics_compressions);
++	vm_now[S8P_VM_SWAPIN] = counter_load(&vm_statistics_swapins);
++	vm_now[S8P_VM_SWAPOUT] = counter_load(&vm_statistics_swapouts);
++	for (int i = 0; i < S8P_VM_N; i++) {
++		vm_d[i] = vm_now[i] - s8p_vm_prev[i];
++		s8p_vm_prev[i] = vm_now[i];
++	}
++
++	/* (5) disk counters */
++	uint64_t d_now[S8P_D_N], d_d[S8P_D_N];
++	d_now[S8P_D_RDB] = s8prof_ufs.rd_bytes;
++	d_now[S8P_D_WRB] = s8prof_ufs.wr_bytes;
++	d_now[S8P_D_RDQ] = s8prof_ufs.rd_reqs;
++	d_now[S8P_D_WRQ] = s8prof_ufs.wr_reqs;
++	d_now[S8P_D_OTH] = s8prof_ufs.other_reqs;
++	d_now[S8P_D_LAT] = s8prof_ufs.lat_abs;
++	d_now[S8P_D_STRAT] = s8prof_ufs.strat_reqs;
++	d_now[S8P_D_LOCKW] = s8prof_ufs.lockwait_abs;
++	d_now[S8P_D_ERR] = s8prof_ufs.errors;
++	uint64_t lat_max = s8prof_ufs.lat_max_abs;
++	s8prof_ufs.lat_max_abs = 0;
++	for (int i = 0; i < S8P_D_N; i++) {
++		d_d[i] = d_now[i] - s8p_d_prev[i];
++		s8p_d_prev[i] = d_now[i];
++	}
++
++	if (!print) {
++		return;
++	}
++
++	uint64_t wall_ms = s8p_us(wall) / 1000;
++	if (wall_ms == 0) {
++		wall_ms = 1;
++	}
++
++	/* line 1: header + scheduler */
++	n = 0;
++	S8P_CAT("S8PROF up=%llus dt=%llums run=%u thr=%u tasks=%d csw/s=%llu",
++	    s8p_us(now) / 1000000, wall_ms, os_atomic_load(&sched_run_buckets[TH_BUCKET_RUN], relaxed),
++	    nthreads, ntasks, csw_delta * 1000 / wall_ms);
++	printf("%s\n", s8p_line);
++
++	/* line 2: per-CPU */
++	n = 0;
++	S8P_CAT("S8PROF cpu");
++	for (unsigned i = 0; i < ncpu; i++) {
++		S8P_CAT(" %u:%llu%%", i, cpu_busy[i]);
++	}
++	S8P_CAT(" usr=%llu%% sys=%llu%%", tot_usr * 100 / (wall * ncpu), tot_sys * 100 / (wall * ncpu));
++	printf("%s\n", s8p_line);
++
++	/* line 3: vm page counts (in pages) */
++	n = 0;
++	S8P_CAT("S8PROF vm pg=%uK free=%u act=%u inact=%u spec=%u wire=%u thr=%u cseg=%u cpg=%u cMB=%llu",
++	    (unsigned)(PAGE_SIZE / 1024), vm_page_free_count, vm_page_active_count, vm_page_inactive_count,
++	    vm_page_speculative_count, vm_page_wire_count, vm_page_throttled_count,
++	    c_segment_count, c_segment_pages_compressed,
++	    (uint64_t)(compressor_bytes_used > 0 ? compressor_bytes_used : 0) >> 20);
++	printf("%s\n", s8p_line);
++
++	/* line 4: vm event deltas over the interval */
++	n = 0;
++	S8P_CAT("S8PROF vmd pgin=%llu pgout=%llu flt=%llu decomp=%llu comp=%llu swin=%llu swout=%llu",
++	    vm_d[S8P_VM_PAGEIN], vm_d[S8P_VM_PAGEOUT], vm_d[S8P_VM_FAULT], vm_d[S8P_VM_DECOMP],
++	    vm_d[S8P_VM_COMP], vm_d[S8P_VM_SWAPIN], vm_d[S8P_VM_SWAPOUT]);
++	printf("%s\n", s8p_line);
++
++	/* line 5: UFS */
++	uint64_t reqs = d_d[S8P_D_RDQ] + d_d[S8P_D_WRQ] + d_d[S8P_D_OTH];
++	n = 0;
++	S8P_CAT("S8PROF ufs rd=%lluKB/%llu wr=%lluKB/%llu oth=%llu avg=%lluus max=%lluus hw=%llu%% lockw=%lluus/%llu err=%llu",
++	    d_d[S8P_D_RDB] >> 10, d_d[S8P_D_RDQ], d_d[S8P_D_WRB] >> 10, d_d[S8P_D_WRQ], d_d[S8P_D_OTH],
++	    reqs ? s8p_us(d_d[S8P_D_LAT]) / reqs : 0, s8p_us(lat_max),
++	    d_d[S8P_D_LAT] * 100 / wall,
++	    d_d[S8P_D_STRAT] ? s8p_us(d_d[S8P_D_LOCKW]) / d_d[S8P_D_STRAT] : 0, d_d[S8P_D_STRAT],
++	    d_d[S8P_D_ERR]);
++	printf("%s\n", s8p_line);
++
++	/* lines 6-7: top tasks by CPU time, % of one CPU; proc lookup after the lock is dropped */
++	for (unsigned base = 0; base < S8P_TOP; base += 3) {
++		if (base >= ntop) {
++			break;
++		}
++		n = 0;
++		S8P_CAT("S8PROF top");
++		for (unsigned k = base; k < base + 3 && k < ntop; k++) {
++			char name[17];
++			proc_name(top_pid[k], name, sizeof(name));
++			if (name[0] == '\0') {
++				strlcpy(name, "?", sizeof(name));
++			}
++			S8P_CAT(" %s[%d]:%llu%%/%ut", name, top_pid[k], top_delta[k] * 100 / wall, top_nthr[k]);
++		}
++		printf("%s\n", s8p_line);
++	}
++}
++
++static void
++s8prof_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	s8prof_report(false);           /* baseline for the first interval */
++	for (;;) {
++		uint64_t deadline;
++		clock_interval_to_deadline(s8prof_secs * 1000, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&s8prof_event, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		s8prof_report(true);
++	}
++}
++
++/* Called once from IOKitBSDInitialize (a5xelte block). */
++void s8prof_init(void);
++
++void
++s8prof_init(void)
++{
++	uint32_t secs = 0;
++	thread_t thread;
++	if (!PE_parse_boot_argn("s8prof", &secs, sizeof(secs)) || secs == 0) {
++		return;
++	}
++	if (secs > 3600) {
++		secs = 3600;
++	}
++	s8prof_secs = secs;
++	s8p_last = mach_absolute_time();
++	printf("S8PROF: profiler every %u s\n", secs);
++	if (kernel_thread_start_priority(s8prof_thread, NULL, BASEPRI_PREEMPT, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("S8PROF: thread start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -72,6 +72,7 @@
+ extern void a5xelte_keys_init(void);
+ extern void a5xelte_touch_probe(void);
+ extern void s8_recov_init(void);
++extern void s8prof_init(void);
+ #endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -774,6 +775,7 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	s8_recov_init();
++	s8prof_init();
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
+ 	{
