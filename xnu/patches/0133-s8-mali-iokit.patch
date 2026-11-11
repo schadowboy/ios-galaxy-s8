@@ -1,0 +1,1419 @@
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -74,6 +74,7 @@
+ extern void s8_recov_init(void);
+ extern void s8prof_init(void);
+ extern void s8mali_init(void);
++extern void s8mali_drv_init(void);
+ #endif
+
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -778,6 +779,7 @@
+ 	s8_recov_init();
+ 	s8prof_init();
+ 	s8mali_init();
++	s8mali_drv_init();
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
+ 	{
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,4 +16,5 @@
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/S8Mali.cpp                                      optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+diff --git a/osfmk/conf/files b/osfmk/conf/files
+--- a/osfmk/conf/files
++++ b/osfmk/conf/files
+@@ -198,4 +198,5 @@
+ osfmk/kern/bsd_kern.c		optional mach_bsd
+ osfmk/kern/s8_mali.c		standard
++osfmk/kern/s8_mali_drv.c	standard
+ osfmk/kern/hibernate.c		optional hibernation
+ osfmk/kern/remote_time.c        standard
+diff --git a/osfmk/kern/s8_mali_drv.c b/osfmk/kern/s8_mali_drv.c
+new file mode 100755
+index 0000000..3ec9292
+--- /dev/null
++++ b/osfmk/kern/s8_mali_drv.c
+@@ -0,0 +1,791 @@
++/*
++ * s8mali_drv=1: hardware half of the S8Mali IOKit service (iokit/Kernel/arm/S8Mali.cpp): Mali-G71 MP20 (Exynos 8895,
++ * physical 0x13900000), polling only, one address space (AS0) shared by every client, jobs run one at a time and to
++ * their end inside the submit call.
++ *
++ * Derived in part from the HakiOS S9+ driver (core/drivers/gpu/hakios.mali.c, a polling single-job AS0-only Mali driver),
++ * which is a derivative work of Apple's XNU under the Apple Public Source License 2.0; the register map, page-table bits,
++ * the GET_PARAM register table (hakios_mali_parameter), the JS0/JS1 slot choice (fragment -> JS0, everything else ->
++ * JS1) and the fault-reset sequence follow it. This file is covered by the same license:
++ *
++ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
++ *
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. The rights granted to you under the License
++ * may not be used to create, or enable the creation or redistribution of,
++ * unlawful or unlicensed copies of an Apple operating system, or to
++ * circumvent, violate, or enable the circumvention or violation of, any
++ * terms of an Apple operating system software license agreement.
++ *
++ * Please obtain a copy of the License at
++ * http://www.opensource.apple.com/apsl/ and read it before using this file.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
++ *
++ * Power: the G3D domain is on at boot (read only check in the PMU); the GPU is soft-reset and L2/shaders/tiler are
++ * powered on lazily when the first user client opens (s8mali_gpu_open) and powered off and reset again when the last one
++ * closes. Boot-arg s8mali_heap_mb (default 64) is how much of a HEAP buffer (Mesa asks 128 MiB) is backed by memory.
++ * The GPU is not coherent with the CPU (COHERENCY_ENABLE = 31): page tables are cleaned to memory after every change;
++ * buffers are CPU write-combined (see S8Mali.cpp).
++ * Every line printed starts with "S8MALI:".
++ */
++#include <mach/mach_types.h>
++#include <mach/kern_return.h>
++#include <kern/kern_types.h>
++#include <kern/thread.h>
++#include <kern/sched.h>
++#include <kern/sched_prim.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/misc_protos.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_map.h>
++#include <vm/pmap.h>
++#include <pexpert/pexpert.h>
++#include <stdint.h>
++#include <stdarg.h>
++#include <string.h>
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++extern void S8MaliStart(void);          /* iokit/Kernel/arm/S8Mali.cpp */
++
++#define GPU_PHYS            0x13900000UL
++#define GPU_SIZE            0x5000
++#define PMU_PHYS            0x16480000UL
++#define PMU_SIZE            0x10000
++#define PMU_G3D_STATUS      0x40E4
++
++#define GPU_ID              0x000
++#define GPU_L2_FEATURES     0x004
++#define GPU_MMU_FEATURES    0x014
++#define GPU_INT_RAWSTAT     0x020
++#define GPU_INT_CLEAR       0x024
++#define GPU_CMD             0x030
++#define GPU_STATUS          0x034
++#define GPU_FAULTSTATUS     0x03c
++#define GPU_FAULTADDR_LO    0x040
++#define GPU_FAULTADDR_HI    0x044
++#define THREAD_MAX_THREADS  0x0a0
++#define THREAD_TLS_ALLOC    0x310
++#define SHADER_PRESENT      0x100
++#define TILER_PRESENT       0x110
++#define L2_PRESENT          0x120
++#define SHADER_READY        0x140
++#define TILER_READY         0x150
++#define L2_READY            0x160
++#define SHADER_PWRON        0x180
++#define TILER_PWRON         0x190
++#define L2_PWRON            0x1a0
++#define SHADER_PWROFF       0x1c0
++#define TILER_PWROFF        0x1d0
++#define L2_PWROFF           0x1e0
++#define COHERENCY_ENABLE    0x304
++#define COHERENCY_NONE      31u
++#define IRQ_RESET_COMPLETED (1u << 8)
++#define GPU_CMD_SOFT_RESET  1u
++#define GPU_L2_MMU_CONFIG   0xf0c
++#define L2_MMU_LIMIT_EXTERNAL (0xfu << 24)
++
++#define JOB_INT_RAWSTAT     0x1000
++#define JOB_INT_CLEAR       0x1004
++#define JOB_INT_MASK        0x1008
++#define JOB_INT_JS_STATE    0x1010
++#define JS0                 0x1800          /* fragment jobs */
++#define JS1                 0x1880          /* vertex / tiler / compute */
++#define JS_HEAD_LO          0x00
++#define JS_STATUS           0x24
++#define JS_HEAD_NEXT_LO     0x40
++#define JS_AFFINITY_NEXT_LO 0x50
++#define JS_AFFINITY_NEXT_HI 0x54
++#define JS_CONFIG_NEXT      0x58
++#define JS_COMMAND_NEXT     0x60
++#define JS_COMMAND_START    1u
++#define JS_CONFIG_VAL       ((3u << 8) | (3u << 12) | (8u << 16))
++
++#define MMU_INT_RAWSTAT     0x2000
++#define MMU_INT_CLEAR       0x2004
++#define AS0                 0x2400
++#define AS_TRANSTAB_LO      0x00
++#define AS_TRANSTAB_HI      0x04
++#define AS_MEMATTR_LO       0x08
++#define AS_MEMATTR_HI       0x0c
++#define AS_COMMAND          0x18
++#define AS_FAULTSTATUS      0x1c
++#define AS_FAULTADDR_LO     0x20
++#define AS_FAULTADDR_HI     0x24
++#define AS_STATUS           0x28
++#define AS_ACTIVE           1u
++#define AS_TRANSCFG_LO      0x30
++#define AS_TRANSCFG_HI      0x34
++#define AS_COMMAND_UPDATE   1u
++
++#define PTE_TABLE           3ull
++#define PTE_PAGE            3ull
++#define PTE_AF              (1ull << 10)
++#define PTE_SH_INNER        (3ull << 8)
++#define PTE_AP_RW           (1ull << 6)
++#define PTE_ADDRESS         0x0000fffffffff000ull
++#define TRANSCFG_AARCH64    6u
++#define TRANSCFG_INA(bits)  ((55u - (bits)) << 6)
++#define TRANSCFG_WALK_NC    (1u << 24)
++#define MEMATTR_WB          0x88888888u
++
++#define VA_START            0x2000000ull    /* PAN_VA_USER_START: Mesa's range for kernel-chosen addresses */
++#define VA_END              0x100000000ull  /* 4 GiB */
++#define VA_MAX_RANGES       4200
++#define MALI_PG             4096u
++#define TBL_PER_BLOCK       (PAGE_SIZE / MALI_PG)
++#define L3_TABLES           (VA_END >> 21)  /* 2048 */
++#define L2_TABLES           (VA_END >> 30)  /* 4 */
++#define MAX_BLOCKS          ((L3_TABLES + L2_TABLES + 2) / 4 + 16)
++#define JOB_TIMEOUT_US      1000000u
++
++#define P(fmt, ...) printf("S8MALI: " fmt "\n", ##__VA_ARGS__)
++
++struct tbl {
++	vm_offset_t va;
++	uint64_t    pa;
++};
++
++static LCK_GRP_DECLARE(s8d_grp, "s8mali-drv");
++static LCK_MTX_DECLARE(s8d_lock, &s8d_grp);
++
++static vm_offset_t g_gpu, g_pmu;
++static uint32_t g_opens;
++static bool g_up;
++static uint32_t g_shader, g_tiler, g_l2, g_va_bits, g_pa_bits, g_gpu_id;
++static uint32_t g_heap_mb = 64;
++static uint64_t g_seq, g_done_seq;
++static uint32_t g_jobs, g_faults;
++
++static struct tbl t_root, t_l1, t_l2[L2_TABLES], t_l3[L3_TABLES];
++static vm_offset_t t_blocks[MAX_BLOCKS];
++static uint32_t t_nblocks, t_inblock;   /* tables handed out of the newest block */
++static struct { uint64_t a, s; } va_used[VA_MAX_RANGES];
++static uint32_t va_n;
++
++static inline uint32_t
++rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(g_gpu + off);
++}
++
++static inline void
++wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(g_gpu + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++wait_for(uint32_t off, uint32_t mask, uint32_t want, uint32_t us)
++{
++	uint64_t deadline;
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &deadline);
++	deadline += mach_absolute_time();
++	while ((rd(off) & mask) != want) {
++		if (mach_absolute_time() >= deadline) {
++			return (rd(off) & mask) == want;
++		}
++	}
++	return true;
++}
++
++static void
++dump_state(const char *why)
++{
++	P("state (%s): GPU_INT_RAWSTAT=0x%x GPU_STATUS=0x%x GPU_FAULTSTATUS=0x%x GPU_FAULTADDR=0x%x%08x", why,
++	    rd(GPU_INT_RAWSTAT), rd(GPU_STATUS), rd(GPU_FAULTSTATUS), rd(GPU_FAULTADDR_HI), rd(GPU_FAULTADDR_LO));
++	P("state (%s): L2_READY=0x%x SHADER_READY=0x%x TILER_READY=0x%x JOB_RAWSTAT=0x%x JOB_JS_STATE=0x%x", why,
++	    rd(L2_READY), rd(SHADER_READY), rd(TILER_READY), rd(JOB_INT_RAWSTAT), rd(JOB_INT_JS_STATE));
++	P("state (%s): JS0_STATUS=0x%x JS1_STATUS=0x%x MMU_RAWSTAT=0x%x AS0_STATUS=0x%x AS0_FAULTSTATUS=0x%x "
++	    "AS0_FAULTADDR=0x%x%08x", why, rd(JS0 + JS_STATUS), rd(JS1 + JS_STATUS), rd(MMU_INT_RAWSTAT),
++	    rd(AS0 + AS_STATUS), rd(AS0 + AS_FAULTSTATUS), rd(AS0 + AS_FAULTADDR_HI), rd(AS0 + AS_FAULTADDR_LO));
++}
++
++static bool
++gpu_reset(void)
++{
++	wr(GPU_INT_CLEAR, 0xffffffffu);
++	wr(GPU_CMD, GPU_CMD_SOFT_RESET);
++	if (!wait_for(GPU_INT_RAWSTAT, IRQ_RESET_COMPLETED, IRQ_RESET_COMPLETED, 100000)) {
++		return false;
++	}
++	wr(GPU_INT_CLEAR, 0xffffffffu);
++	wr(COHERENCY_ENABLE, COHERENCY_NONE);
++	wr(GPU_L2_MMU_CONFIG, rd(GPU_L2_MMU_CONFIG) & ~L2_MMU_LIMIT_EXTERNAL);
++	return true;
++}
++
++static bool
++power_wait(uint32_t pwron, uint32_t ready, uint32_t mask, const char *name)
++{
++	if (mask == 0) {
++		return true;
++	}
++	wr(pwron, mask);
++	if (!wait_for(ready, mask, mask, 50000)) {
++		P("%s did not power up: READY=0x%x wanted 0x%x", name, rd(ready), mask);
++		return false;
++	}
++	return true;
++}
++
++static bool
++cores_on(void)
++{
++	return power_wait(L2_PWRON, L2_READY, g_l2, "L2") && power_wait(SHADER_PWRON, SHADER_READY, g_shader, "shaders") &&
++	       power_wait(TILER_PWRON, TILER_READY, g_tiler, "tiler");
++}
++
++static void
++cores_off(void)
++{
++	wr(SHADER_PWROFF, g_shader);
++	wr(TILER_PWROFF, g_tiler);
++	wr(L2_PWROFF, g_l2);
++	if (!wait_for(SHADER_READY, 0xffffffffu, 0, 50000) || !wait_for(TILER_READY, 0xffffffffu, 0, 50000) ||
++	    !wait_for(L2_READY, 0xffffffffu, 0, 50000)) {
++		P("power off incomplete: READY L2=0x%x SH=0x%x T=0x%x", rd(L2_READY), rd(SHADER_READY), rd(TILER_READY));
++	}
++}
++
++/* AS0 from the root table: wait idle, TRANSTAB/TRANSCFG/MEMATTR, UPDATE, wait idle (also drops the MMU's cached walks) */
++static bool
++as0_update(void)
++{
++	uint32_t transcfg = TRANSCFG_AARCH64 | TRANSCFG_INA(g_va_bits) | TRANSCFG_WALK_NC;
++
++	if (!wait_for(AS0 + AS_STATUS, AS_ACTIVE, 0, 50000)) {
++		P("AS0 busy before update");
++		return false;
++	}
++	wr(AS0 + AS_TRANSTAB_LO, (uint32_t)t_root.pa);
++	wr(AS0 + AS_TRANSTAB_HI, (uint32_t)(t_root.pa >> 32));
++	wr(AS0 + AS_TRANSCFG_LO, transcfg);
++	wr(AS0 + AS_TRANSCFG_HI, 0);
++	wr(AS0 + AS_MEMATTR_LO, MEMATTR_WB);
++	wr(AS0 + AS_MEMATTR_HI, MEMATTR_WB);
++	wr(AS0 + AS_COMMAND, AS_COMMAND_UPDATE);
++	if (!wait_for(AS0 + AS_STATUS, AS_ACTIVE, 0, 50000)) {
++		P("AS0 update did not finish");
++		return false;
++	}
++	return true;
++}
++
++/* ---- page tables (lock held) ---- */
++
++static bool
++tbl_alloc(struct tbl *t)
++{
++	if (t_nblocks == 0 || t_inblock == TBL_PER_BLOCK) {
++		vm_offset_t va = 0;
++		ppnum_t pn;
++
++		if (t_nblocks >= MAX_BLOCKS) {
++			return false;
++		}
++		if (kmem_alloc(kernel_map, &va, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_DIAG) !=
++		    KERN_SUCCESS) {
++			return false;
++		}
++		pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++		if (pn == 0) {
++			kmem_free(kernel_map, va, PAGE_SIZE);
++			return false;
++		}
++		FlushPoC_DcacheRegion(va, PAGE_SIZE);
++		t_blocks[t_nblocks++] = va;
++		t_inblock = 0;
++	}
++	t->va = t_blocks[t_nblocks - 1] + (vm_offset_t)t_inblock * MALI_PG;
++	t->pa = ((uint64_t)pmap_find_phys(kernel_pmap, (addr64_t)t_blocks[t_nblocks - 1]) << PAGE_SHIFT) +
++	    (uint64_t)t_inblock * MALI_PG;
++	t_inblock++;
++	return true;
++}
++
++static void
++tables_free(void)
++{
++	for (uint32_t i = 0; i < t_nblocks; i++) {
++		kmem_free(kernel_map, t_blocks[i], PAGE_SIZE);
++		t_blocks[i] = 0;
++	}
++	t_nblocks = 0;
++	t_inblock = 0;
++	bzero(&t_root, sizeof(t_root));
++	bzero(&t_l1, sizeof(t_l1));
++	bzero(t_l2, sizeof(t_l2));
++	bzero(t_l3, sizeof(t_l3));
++	va_n = 0;
++}
++
++static inline uint64_t
++pte_page(uint64_t pa)
++{
++	return (pa & PTE_ADDRESS) | PTE_AF | PTE_SH_INNER | PTE_AP_RW | PTE_PAGE;
++}
++
++/* one 4 KiB Mali page, no cache maintenance (s8mali_maps_done does it) */
++static bool
++map_page(uint64_t gpu, uint64_t pa)
++{
++	volatile uint64_t *t0, *t1, *t2, *t3;
++
++	if (gpu < VA_START || gpu >= VA_END || (g_pa_bits < 64 && (pa >> g_pa_bits) != 0)) {
++		return false;
++	}
++	if (t_l2[gpu >> 30].va == 0 && !tbl_alloc(&t_l2[gpu >> 30])) {
++		return false;
++	}
++	if (t_l3[gpu >> 21].va == 0 && !tbl_alloc(&t_l3[gpu >> 21])) {
++		return false;
++	}
++	t0 = (volatile uint64_t *)t_root.va;
++	t1 = (volatile uint64_t *)t_l1.va;
++	t2 = (volatile uint64_t *)t_l2[gpu >> 30].va;
++	t3 = (volatile uint64_t *)t_l3[gpu >> 21].va;
++	t0[(gpu >> 39) & 511] = t_l1.pa | PTE_TABLE;
++	t1[(gpu >> 30) & 511] = t_l2[gpu >> 30].pa | PTE_TABLE;
++	t2[(gpu >> 21) & 511] = t_l3[gpu >> 21].pa | PTE_TABLE;
++	t3[(gpu >> 12) & 511] = pte_page(pa);
++	return true;
++}
++
++static void
++flush_range_tables(uint64_t gpu, uint64_t size)
++{
++	FlushPoC_DcacheRegion(t_root.va, MALI_PG);
++	FlushPoC_DcacheRegion(t_l1.va, MALI_PG);
++	for (uint64_t a = gpu; a < gpu + size; a += (1ull << 21) - (a & ((1ull << 21) - 1))) {
++		if (t_l2[a >> 30].va != 0) {
++			FlushPoC_DcacheRegion(t_l2[a >> 30].va, MALI_PG);
++		}
++		if (t_l3[a >> 21].va != 0) {
++			FlushPoC_DcacheRegion(t_l3[a >> 21].va, MALI_PG);
++		}
++	}
++}
++
++/* ---- GPU address allocator: sorted used ranges, first fit in [VA_START, VA_END) ---- */
++
++static uint64_t
++va_alloc(uint64_t size, bool exec)
++{
++	uint64_t cand = VA_START;
++	uint32_t i;
++
++	if (size == 0 || size > VA_END - VA_START || va_n >= VA_MAX_RANGES) {
++		return 0;
++	}
++	for (i = 0; i <= va_n; i++) {
++		uint64_t limit = i < va_n ? va_used[i].a : VA_END;
++
++		/* code may not cross a 16 MiB line (S9+ hakios.mali_va.h rule) */
++		if (exec && size <= (16ull << 20) && ((cand ^ (cand + size - 1)) >> 24) != 0) {
++			cand = (cand + (16ull << 20) - 1) & ~((16ull << 20) - 1);
++		}
++		if (cand + size <= limit) {
++			memmove(&va_used[i + 1], &va_used[i], (va_n - i) * sizeof(va_used[0]));
++			va_used[i].a = cand;
++			va_used[i].s = size;
++			va_n++;
++			return cand;
++		}
++		if (i < va_n) {
++			cand = va_used[i].a + va_used[i].s;
++		}
++	}
++	return 0;
++}
++
++static void
++va_free(uint64_t gpu)
++{
++	for (uint32_t i = 0; i < va_n; i++) {
++		if (va_used[i].a == gpu) {
++			memmove(&va_used[i], &va_used[i + 1], (va_n - i - 1) * sizeof(va_used[0]));
++			va_n--;
++			return;
++		}
++	}
++}
++
++/* ---- bring-up and tear-down ---- */
++
++static bool
++bringup(void)
++{
++	uint32_t pmu_status, id;
++
++	if (!g_gpu) {
++		g_gpu = ml_io_map(GPU_PHYS, GPU_SIZE);
++		g_pmu = ml_io_map(PMU_PHYS, PMU_SIZE);
++	}
++	if (!g_gpu || !g_pmu) {
++		P("ml_io_map failed");
++		return false;
++	}
++	pmu_status = *(volatile uint32_t *)(g_pmu + PMU_G3D_STATUS);
++	if ((pmu_status & 0xf) != 0xf) {
++		P("G3D domain not on (PMU 0x%x), not touching the GPU", pmu_status);
++		return false;
++	}
++	id = rd(GPU_ID);
++	if ((id & 0xf00f0000u) != 0x60000000u) {
++		P("unexpected GPU_ID 0x%x", id);
++		return false;
++	}
++	g_gpu_id = id;
++	g_shader = rd(SHADER_PRESENT);
++	g_tiler = rd(TILER_PRESENT);
++	g_l2 = rd(L2_PRESENT);
++	g_va_bits = rd(GPU_MMU_FEATURES) & 0xff;
++	g_pa_bits = (rd(GPU_MMU_FEATURES) >> 8) & 0xff;
++	if (g_va_bits < 40 || g_va_bits > 55 || rd(SHADER_PRESENT + 4) != 0) {
++		P("MMU VA bits %u / shader_present hi: unsupported", g_va_bits);
++		return false;
++	}
++	if (!gpu_reset() || !cores_on()) {
++		dump_state("bring-up");
++		(void)gpu_reset();
++		return false;
++	}
++	if (!tbl_alloc(&t_root) || !tbl_alloc(&t_l1)) {
++		P("page table allocation failed");
++		goto fail;
++	}
++	FlushPoC_DcacheRegion(t_root.va, MALI_PG);
++	FlushPoC_DcacheRegion(t_l1.va, MALI_PG);
++	if (!as0_update()) {
++		dump_state("as0");
++		goto fail;
++	}
++	g_up = true;
++	P("GPU up: GPU_ID=0x%x SHADER=0x%x TILER=0x%x L2=0x%x va_bits=%u pa_bits=%u heap_mb=%u", g_gpu_id, g_shader, g_tiler,
++	    g_l2, g_va_bits, g_pa_bits, g_heap_mb);
++	return true;
++fail:
++	cores_off();
++	(void)gpu_reset();
++	tables_free();
++	return false;
++}
++
++bool s8mali_gpu_open(void);
++bool
++s8mali_gpu_open(void)
++{
++	bool ok = true;
++
++	lck_mtx_lock(&s8d_lock);
++	if (g_opens == 0) {
++		ok = bringup();
++	}
++	if (ok) {
++		g_opens++;
++		P("open: clients=%u", g_opens);
++	}
++	lck_mtx_unlock(&s8d_lock);
++	return ok;
++}
++
++void s8mali_gpu_close(void);
++void
++s8mali_gpu_close(void)
++{
++	lck_mtx_lock(&s8d_lock);
++	if (g_opens > 0 && --g_opens == 0 && g_up) {
++		cores_off();
++		(void)gpu_reset();
++		tables_free();
++		g_up = false;
++		P("close: last client gone, GPU off (jobs=%u faults=%u)", g_jobs, g_faults);
++	} else {
++		P("close: clients=%u", g_opens);
++	}
++	lck_mtx_unlock(&s8d_lock);
++}
++
++uint32_t s8mali_heap_mb(void);
++uint32_t
++s8mali_heap_mb(void)
++{
++	return g_heap_mb;
++}
++
++/* ---- buffer address space API for the user client ---- */
++
++uint64_t s8mali_va_alloc(uint64_t size, bool exec);
++uint64_t
++s8mali_va_alloc(uint64_t size, bool exec)
++{
++	uint64_t a = 0;
++
++	lck_mtx_lock(&s8d_lock);
++	if (g_up) {
++		a = va_alloc(size, exec);
++	}
++	lck_mtx_unlock(&s8d_lock);
++	return a;
++}
++
++bool s8mali_map_page(uint64_t gpu, uint64_t pa);
++bool
++s8mali_map_page(uint64_t gpu, uint64_t pa)
++{
++	bool ok;
++
++	lck_mtx_lock(&s8d_lock);
++	ok = g_up && map_page(gpu, pa);
++	lck_mtx_unlock(&s8d_lock);
++	return ok;
++}
++
++/* after a BO's pages are entered: tables to memory, MMU forgets its cached walks */
++void s8mali_maps_done(uint64_t gpu, uint64_t size);
++void
++s8mali_maps_done(uint64_t gpu, uint64_t size)
++{
++	lck_mtx_lock(&s8d_lock);
++	if (g_up) {
++		flush_range_tables(gpu, size);
++		(void)as0_update();
++	}
++	lck_mtx_unlock(&s8d_lock);
++}
++
++/* take a BO out of the tables (`mapped` bytes of it were entered), then give its addresses back */
++void s8mali_unmap(uint64_t gpu, uint64_t size, uint64_t mapped);
++void
++s8mali_unmap(uint64_t gpu, uint64_t size, uint64_t mapped)
++{
++	lck_mtx_lock(&s8d_lock);
++	if (g_up) {
++		for (uint64_t off = 0; off < mapped; off += MALI_PG) {
++			uint64_t a = gpu + off;
++
++			if (t_l3[a >> 21].va != 0) {
++				((volatile uint64_t *)t_l3[a >> 21].va)[(a >> 12) & 511] = 0;
++			}
++		}
++		flush_range_tables(gpu, mapped ? mapped : MALI_PG);
++		(void)as0_update();
++		va_free(gpu);
++	}
++	lck_mtx_unlock(&s8d_lock);
++	(void)size;
++}
++
++/* ---- GET_PARAM: Linux's DRM_PANFROST_PARAM_* from the registers (S9+ hakios_mali_parameter) ---- */
++
++bool s8mali_gpu_param(uint32_t which, uint64_t *value);
++bool
++s8mali_gpu_param(uint32_t which, uint64_t *value)
++{
++	static const uint16_t simple[] = {
++		[5] = 0xe00,
++		[6] = 0x018, [7] = 0x01c, [8] = 0x004, [9] = 0x008, [10] = 0x00c, [11] = 0x010, [12] = 0x014,
++		[13] = 0x0ac, [14] = 0x0a0, [15] = 0x0a4, [16] = 0x0a8, [17] = 0x300,
++		[18] = 0x0b0, [19] = 0x0b4, [20] = 0x0b8, [21] = 0x0bc,
++	};
++	bool ok = true;
++
++	lck_mtx_lock(&s8d_lock);
++	if (!g_up) {
++		lck_mtx_unlock(&s8d_lock);
++		return false;
++	}
++	switch (which) {
++	case 0:
++		/*
++		 * GPU_PROD_ID: GPU_ID[31:16] is 0x60a0 on this G71 (the 0x00f0 nibble is the architecture revision). Mesa
++		 * 25.0.7 compares the product id exactly with 0x6000 (pan_props.c MODEL table), so report it masked with
++		 * 0xf00f. Mesa 26.3 wants the raw 0x60a0: that would be a build-time or boot-arg choice, not done here.
++		 */
++		*value = (g_gpu_id >> 16) & 0xf00f;
++		break;
++	case 1:
++		*value = g_gpu_id & 0xffff;
++		break;
++	case 2:
++	case 3:
++	case 4:
++		*value = rd(0x100 + (which - 2) * 0x10) | ((uint64_t)rd(0x104 + (which - 2) * 0x10) << 32);
++		break;
++	case 38:        /* NR_CORE_GROUPS: one L2 */
++		*value = 1;
++		break;
++	case 39:        /* THREAD_TLS_ALLOC, never less than THREAD_MAX_THREADS (S9+ hakios.mali.c:1526) */
++		*value = rd(THREAD_TLS_ALLOC);
++		if (*value < rd(THREAD_MAX_THREADS)) {
++			*value = rd(THREAD_MAX_THREADS);
++		}
++		break;
++	case 40:        /* AFBC_FEATURES: 0 = supported to Mesa 25.0.7 */
++		*value = 0;
++		break;
++	default:
++		if (which >= 22 && which <= 37) {
++			*value = rd(0x0c0 + (which - 22) * 4);
++		} else if (which < sizeof(simple) / sizeof(simple[0]) && simple[which] != 0) {
++			*value = rd(simple[which]);
++		} else {
++			ok = false;
++		}
++		break;
++	}
++	lck_mtx_unlock(&s8d_lock);
++	return ok;
++}
++
++/* ---- jobs ---- */
++
++static void
++describe_fault(uint64_t addr)
++{
++	for (uint32_t i = 0; i < va_n; i++) {
++		if (addr >= va_used[i].a && addr < va_used[i].a + va_used[i].s) {
++			P("  fault address 0x%llx is %llu bytes into the live BO at 0x%llx (size 0x%llx)", addr, addr - va_used[i].a,
++			    va_used[i].a, va_used[i].s);
++			return;
++		}
++	}
++	P("  fault address 0x%llx is in no live BO", addr);
++}
++
++/*
++ * One job chain from GPU address `chain` (fragment -> JS0 with FS requirement, else JS1), run to its end before this
++ * returns. 0 = done; else the slot's JS_STATUS or 0xff for no answer within a second. On failure the GPU is soft-reset,
++ * powered up and AS0 reprogrammed (the BO pages stay in the tables), so the next job finds it working; the kernel never
++ * panics. *seq is the job's number either way.
++ */
++uint32_t s8mali_gpu_submit(uint64_t chain, bool fragment, uint64_t *seq);
++uint32_t
++s8mali_gpu_submit(uint64_t chain, bool fragment, uint64_t *seq)
++{
++	uint32_t slot = fragment ? 0 : 1, js = fragment ? JS0 : JS1, status = 0, raw = 0;
++	uint32_t done = 1u << slot, fail = 1u << (slot + 16);
++	uint64_t deadline;
++	bool finished = false;
++
++	lck_mtx_lock(&s8d_lock);
++	*seq = ++g_seq;
++	if (!g_up) {
++		lck_mtx_unlock(&s8d_lock);
++		return 0xfe;
++	}
++	wr(JOB_INT_MASK, 0);
++	wr(JOB_INT_CLEAR, done | fail);
++	wr(MMU_INT_CLEAR, 0xffffffffu);
++	wr(js + JS_HEAD_NEXT_LO, (uint32_t)chain);
++	wr(js + JS_HEAD_NEXT_LO + 4, (uint32_t)(chain >> 32));
++	wr(js + JS_AFFINITY_NEXT_LO, g_shader);
++	wr(js + JS_AFFINITY_NEXT_HI, 0);
++	wr(js + JS_CONFIG_NEXT, JS_CONFIG_VAL);
++	wr(js + JS_COMMAND_NEXT, JS_COMMAND_START);
++	nanoseconds_to_absolutetime((uint64_t)JOB_TIMEOUT_US * NSEC_PER_USEC, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		raw = rd(JOB_INT_RAWSTAT);
++		if (raw & (done | fail)) {
++			break;
++		}
++		if (mach_absolute_time() >= deadline) {
++			break;
++		}
++	}
++	finished = (raw & done) && !(raw & fail);
++	g_jobs++;
++	if (!finished) {
++		uint64_t fa;
++
++		g_faults++;
++		status = (raw & fail) ? rd(js + JS_STATUS) : 0xff;
++		fa = rd(AS0 + AS_FAULTADDR_LO) | ((uint64_t)rd(AS0 + AS_FAULTADDR_HI) << 32);
++		if (g_faults <= 20 || (g_faults & 255) == 0) {
++			P("job %llu on JS%u did not finish: JOB_RAWSTAT=0x%x JS_STATUS=0x%x MMU_RAWSTAT=0x%x AS0_FAULTSTATUS=0x%x "
++			    "chain=0x%llx (fault #%u)", *seq, slot, raw, rd(js + JS_STATUS), rd(MMU_INT_RAWSTAT),
++			    rd(AS0 + AS_FAULTSTATUS), chain, g_faults);
++			describe_fault(fa);
++		}
++		(void)gpu_reset();
++		if (!cores_on() || !as0_update()) {
++			P("after the reset the GPU did not come back");
++			dump_state("recover");
++		}
++		wr(MMU_INT_CLEAR, 0xffffffffu);
++	}
++	wr(JOB_INT_CLEAR, done | fail);
++	g_done_seq = *seq;
++	lck_mtx_unlock(&s8d_lock);
++	return status;
++}
++
++/* jobs run to their end inside submit: a number that has been given out is done */
++bool s8mali_gpu_wait(uint64_t seq, uint64_t timeout_ns);
++bool
++s8mali_gpu_wait(uint64_t seq, uint64_t timeout_ns)
++{
++	bool done;
++
++	(void)timeout_ns;
++	lck_mtx_lock(&s8d_lock);
++	done = seq <= g_done_seq;
++	lck_mtx_unlock(&s8d_lock);
++	return done;
++}
++
++/* ---- boot ---- */
++
++static void
++s8mali_drv_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	S8MaliStart();
++	thread_terminate_self();
++}
++
++void s8mali_drv_init(void);
++void
++s8mali_drv_init(void)
++{
++	uint32_t on = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("s8mali_drv", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	(void)PE_parse_boot_argn("s8mali_heap_mb", &g_heap_mb, sizeof(g_heap_mb));
++	if (g_heap_mb < 4 || g_heap_mb > 128) {
++		g_heap_mb = 64;
++	}
++	P("s8mali_drv=1: registering the S8Mali IOKit service (heap %u MiB)", g_heap_mb);
++	if (kernel_thread_start_priority(s8mali_drv_thread, NULL, BASEPRI_DEFAULT, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		P("thread start failed");
++	}
++}
++
++#else /* !ARM64_BOARD_CONFIG_A5XELTE */
++
++void s8mali_drv_init(void);
++
++void
++s8mali_drv_init(void)
++{
++}
++
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
+diff --git a/iokit/Kernel/arm/S8Mali.cpp b/iokit/Kernel/arm/S8Mali.cpp
+new file mode 100755
+index 0000000..b6e31d4
+--- /dev/null
++++ b/iokit/Kernel/arm/S8Mali.cpp
+@@ -0,0 +1,579 @@
++/*
++ * S8Mali: the Galaxy S8's Mali-G71 MP20 for programs to draw with (boot-arg s8mali_drv=1).
++ *
++ * Service and user client of the interface Linux's panfrost DRM driver has, as the HakiOS S9+ kernel exposes it
++ * (core/drivers/gpu/hakios.mali.cpp, "HakiosMali"/"HakiosMaliUserClient", itself taken from HakiOS's RedwoodMali, Apple
++ * Public Source License 2.0, as is this file): every request is IOConnectCallStructMethod with the request's number (the
++ * low byte of the DRM ioctl code) as the selector and the request's structure passed in and back; a buffer's memory is
++ * the client memory of the type that is the buffer's handle (IOConnectMapMemory64). The numbers and structure layouts are
++ * the S9+ ones so that baseline-support/hakios-drm/hakios.drm.c works unchanged except for the service's name; they are
++ * written down in analysis/s8mali-abi.md.
++ *
++ * SERVICE NAME: S8MALI_SERVICE_NAME below, the one place to change it. The object that is registered is of the class
++ * HakiosMali, a subclass of S8Mali, so both IOServiceMatching("S8Mali") and IOServiceMatching("HakiosMali") find it
++ * (IOServiceMatching matches by class, subclasses included). The user client class is S8MaliUserClient (property
++ * IOUserClientClass). C++ class names cannot come from a #define: renaming means editing the class names too.
++ *
++ * Differences from the S9+ service: no IOSurface requests (0x7c, 0x7e, 0x7f: kIOReturnUnsupported), no job queue thread
++ * (the C half runs a job to its end inside SUBMIT, polling, so WAIT is always immediately true), power is up while at
++ * least one client is open, a HEAP buffer is backed only up to boot-arg s8mali_heap_mb (default 64 MiB).
++ *
++ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
++ *
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. The rights granted to you under the License
++ * may not be used to create, or enable the creation or redistribution of,
++ * unlawful or unlicensed copies of an Apple operating system, or to
++ * circumvent, violate, or enable the circumvention or violation of, any
++ * terms of an Apple operating system software license agreement.
++ *
++ * Please obtain a copy of the License at
++ * http://www.opensource.apple.com/apsl/ and read it before using this file.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++
++#include <device/device_types.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <mach/vm_param.h>
++#include <sys/systm.h>
++
++#define S8MALI_SERVICE_NAME     "S8Mali"
++#define S8MALI_CLIENT_CLASS     "S8MaliUserClient"
++
++extern "C" {
++bool s8mali_gpu_open(void);
++void s8mali_gpu_close(void);
++uint32_t s8mali_heap_mb(void);
++uint64_t s8mali_va_alloc(uint64_t size, bool exec);
++bool s8mali_map_page(uint64_t gpu, uint64_t pa);
++void s8mali_maps_done(uint64_t gpu, uint64_t size);
++void s8mali_unmap(uint64_t gpu, uint64_t size, uint64_t mapped);
++bool s8mali_gpu_param(uint32_t which, uint64_t * value);
++uint32_t s8mali_gpu_submit(uint64_t chain, bool fragment, uint64_t * seq);
++bool s8mali_gpu_wait(uint64_t seq, uint64_t timeout_ns);
++void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++void S8MaliStart(void);
++}
++
++/* selectors: the low byte of Linux's ioctl codes (DRM_COMMAND_BASE 0x40 + panfrost's number), as the S9+ service has them */
++enum {
++	kDrmGemClose            = 0x09,
++	kPanfrostSubmit         = 0x40,
++	kPanfrostWaitBO         = 0x41,
++	kPanfrostCreateBO       = 0x42,
++	kPanfrostMmapBO         = 0x43,
++	kPanfrostGetParam       = 0x44,
++	kPanfrostGetBOOffset    = 0x45,
++	kPanfrostMadvise        = 0x48,
++	kPanfrostSetLabelBO     = 0x49,         /* accepted, ignored */
++	kPanfrostSyncBO         = 0x4c,         /* accepted, ignored: buffers are write-combined */
++	kS8MaliWait             = 0x7d,         /* wait for a job by its number (struct mali_wait) */
++};
++
++struct mali_wait {
++	uint64_t seq;
++	int64_t timeout_ns;
++};
++
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++
++struct drm_panfrost_submit {
++	uint64_t jc;                    /* in: GPU address of the job chain; back: the job's number */
++	uint64_t in_syncs;
++	uint32_t in_sync_count;
++	uint32_t out_sync;
++	uint64_t bo_handles;
++	uint32_t bo_handle_count;
++	uint32_t requirements;
++	uint32_t jm_ctx_handle;         /* (Mesa's 1.5 structure; the shim passes 40 bytes) */
++	uint32_t pad;
++};
++#define PANFROST_JD_REQ_FS      (1u << 0)
++
++struct drm_panfrost_wait_bo {
++	uint32_t handle, pad;
++	int64_t timeout_ns;
++};
++
++struct drm_panfrost_create_bo {
++	uint32_t size, flags, handle, pad;
++	uint64_t offset;
++};
++#define PANFROST_BO_NOEXEC      (1u << 0)
++#define PANFROST_BO_HEAP        (1u << 1)
++
++struct drm_panfrost_mmap_bo {
++	uint32_t handle, flags;
++	uint64_t offset;
++};
++
++struct drm_panfrost_get_param {
++	uint32_t param, pad;
++	uint64_t value;
++};
++
++struct drm_panfrost_get_bo_offset {
++	uint32_t handle, pad;
++	uint64_t offset;
++};
++
++struct drm_panfrost_madvise {
++	uint32_t handle, madv, retained;
++};
++
++#define MALI_BUFFERS            4096
++#define MALI_BUFFER_MAX         (256ull << 20)
++
++struct mali_buffer {
++	IOBufferMemoryDescriptor * memory;
++	uint64_t address, size;                 /* GPU address; the size the program asked for (page rounded) */
++	uint64_t backed;                        /* bytes with memory behind them (less than `size` for a clipped HEAP) */
++	uint64_t last_seq;
++	uint32_t flags;
++};
++
++static IOLock * gLock;
++static uint32_t gLogOpen, gLogBO, gLogSubmit, gLogMisc;
++static uint32_t gClients, gBuffers, gSubmits, gFailed;
++
++/* rate limit: the first `first` lines, then every 1024th */
++static inline bool
++allow(uint32_t * n, uint32_t first)
++{
++	uint32_t v = (*n)++;
++	return v < first || (v & 1023) == 0;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++class S8Mali : public IOService
++{
++	OSDeclareDefaultStructors(S8Mali);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++/* the S9+ shim's name for the service: an instance of this class is found under either name */
++class HakiosMali : public S8Mali
++{
++	OSDeclareDefaultStructors(HakiosMali);
++};
++
++OSDefineMetaClassAndStructors(S8Mali, IOService);
++OSDefineMetaClassAndStructors(HakiosMali, S8Mali);
++
++bool
++S8Mali::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, S8MALI_CLIENT_CLASS);
++	setName(S8MALI_SERVICE_NAME);
++	registerService();
++	return true;
++}
++
++extern "C" void
++S8MaliStart(void)
++{
++	IOService * provider = NULL;
++	HakiosMali * gpu;
++
++	for (int i = 0; i < 600 && (provider = IOService::getPlatform()) == NULL; i++) {
++		IOSleep(100);
++	}
++	gLock = IOLockAlloc();
++	gpu = OSTypeAlloc(HakiosMali);
++	if (gpu == NULL || provider == NULL || gLock == NULL || !gpu->init() || !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		IOLog("S8MALI: cannot create the service\n");
++		return;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		IOLog("S8MALI: the service did not start\n");
++	} else {
++		IOLog("S8MALI: service %s registered (class S8Mali, also HakiosMali)\n", S8MALI_SERVICE_NAME);
++	}
++	gpu->release();
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++class S8MaliUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(S8MaliUserClient);
++
++	struct mali_buffer *    fBuffers;               /* handle n is fBuffers[n - 1] */
++	uint32_t                fNextBuffer;
++	uint32_t                fSubmits;
++	bool                    fOpen;
++
++	struct mali_buffer * buffer(uint32_t handle);
++	void freeBuffer(struct mali_buffer * b);
++	IOReturn createBO(struct drm_panfrost_create_bo * request);
++	void closeAll(void);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(S8MaliUserClient, IOUserClient);
++
++bool
++S8MaliUserClient::start(IOService * provider)
++{
++	if (!IOUserClient::start(provider)) {
++		return false;
++	}
++	fBuffers = IONewZero(struct mali_buffer, MALI_BUFFERS);
++	if (fBuffers == NULL) {
++		return false;
++	}
++	/* power: the GPU is reset and powered on lazily here, at the first client */
++	if (!s8mali_gpu_open()) {
++		IOLog("S8MALI: open failed (GPU did not come up)\n");
++		return false;
++	}
++	fOpen = true;
++	OSIncrementAtomic((SInt32 *) &gClients);
++	if (allow(&gLogOpen, 50)) {
++		IOLog("S8MALI: client opened (clients=%u)\n", gClients);
++	}
++	return true;
++}
++
++struct mali_buffer *
++S8MaliUserClient::buffer(uint32_t handle)
++{
++	if (fBuffers == NULL || handle == 0 || handle > MALI_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++		return NULL;
++	}
++	return &fBuffers[handle - 1];
++}
++
++/* With the lock held. Jobs run to their end inside SUBMIT, so nothing of the buffer is in use by the GPU. */
++void
++S8MaliUserClient::freeBuffer(struct mali_buffer * b)
++{
++	s8mali_unmap(b->address, b->size, b->backed);
++	/*
++	 * The buffer is write-combined for the program, but its kernel mapping (and the physical-aperture alias) may still
++	 * have lines of it; drop them before the pages go back to the allocator, so no stale line is evicted over what a
++	 * later owner writes.
++	 */
++	void * kva = b->memory->getBytesNoCopy();
++	if (kva != NULL) {
++		FlushPoC_DcacheRegion((vm_offset_t) kva, (size_t) b->backed);
++	}
++	if (allow(&gLogBO, 100)) {
++		IOLog("S8MALI: bo free va=0x%llx size=0x%llx\n", b->address, b->size);
++	}
++	b->memory->release();
++	OSDecrementAtomic((SInt32 *) &gBuffers);
++	bzero(b, sizeof(*b));
++}
++
++/* With the lock held. */
++IOReturn
++S8MaliUserClient::createBO(struct drm_panfrost_create_bo * request)
++{
++	uint64_t size = round_page_64(request->size), backed = size;
++	bool heap = (request->flags & PANFROST_BO_HEAP) != 0;
++	IOBufferMemoryDescriptor * memory;
++	struct mali_buffer * b = NULL;
++	uint64_t address;
++
++	if (size == 0 || size > MALI_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	if (heap) {
++		/* Mesa's 128 MiB tiler heap: Linux grows it on a fault; here it is backed up to s8mali_heap_mb */
++		uint64_t limit = round_page_64((uint64_t) s8mali_heap_mb() << 20);
++
++		if (backed > limit) {
++			backed = limit;
++		}
++	}
++	for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % MALI_BUFFERS;
++
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			request->handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL) {
++		IOLog("S8MALI: no handles left\n");
++		return kIOReturnNoSpace;
++	}
++	/* write-combined for the program (what S9+ does): no CPU cache line between the program and the memory the GPU sees */
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache, (vm_size_t) backed, PAGE_SIZE);
++	if (memory == NULL) {
++		IOLog("S8MALI: no memory for a buffer of %llu bytes (backed %llu)\n", size, backed);
++		return kIOReturnNoMemory;
++	}
++	{
++		void * kva = memory->getBytesNoCopy();
++
++		/* zero, then to memory: dirty kernel-side lines must never be evicted over what the GPU or program writes */
++		if (kva != NULL) {
++			bzero(kva, (size_t) backed);
++			FlushPoC_DcacheRegion((vm_offset_t) kva, (size_t) backed);
++		}
++	}
++	address = s8mali_va_alloc(size, !(request->flags & PANFROST_BO_NOEXEC));
++	if (address == 0) {
++		IOLog("S8MALI: no GPU address space for %llu bytes\n", size);
++		memory->release();
++		return kIOReturnNoSpace;
++	}
++	/* every 4 KiB of it: the GPU's pages are a quarter of the kernel's 16 KiB ones */
++	bool mapped = true;
++
++	for (uint64_t offset = 0; offset < backed && mapped; offset += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++
++		mapped = phys != 0 && s8mali_map_page(address + offset, phys);
++	}
++	if (!mapped) {
++		IOLog("S8MALI: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
++		s8mali_unmap(address, size, backed);
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	s8mali_maps_done(address, backed);
++	b->memory = memory;
++	b->address = address;
++	b->size = size;
++	b->backed = backed;
++	b->flags = request->flags;
++	OSIncrementAtomic((SInt32 *) &gBuffers);
++	request->offset = address;
++	if (allow(&gLogBO, 100)) {
++		IOLog("S8MALI: bo create handle=%u va=0x%llx size=0x%llx backed=0x%llx flags=0x%x (buffers=%u)\n", request->handle,
++		    address, size, backed, request->flags, gBuffers);
++	}
++	return kIOReturnSuccess;
++}
++
++void
++S8MaliUserClient::closeAll(void)
++{
++	IOLockLock(gLock);
++	for (uint32_t i = 0; fBuffers != NULL && i < MALI_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL) {
++			freeBuffer(&fBuffers[i]);
++		}
++	}
++	if (fOpen) {
++		fOpen = false;
++		OSDecrementAtomic((SInt32 *) &gClients);
++		s8mali_gpu_close();             /* last client: cores off, reset */
++	}
++	IOLockUnlock(gLock);
++}
++
++IOReturn
++S8MaliUserClient::clientClose(void)
++{
++	closeAll();
++	if (allow(&gLogOpen, 50)) {
++		IOLog("S8MALI: client closed after %u job chains (%u failed)\n", fSubmits, gFailed);
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++S8MaliUserClient::free(void)
++{
++	if (gLock != NULL) {
++		closeAll();
++	}
++	if (fBuffers != NULL) {
++		IODelete(fBuffers, struct mali_buffer, MALI_BUFFERS);
++		fBuffers = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++S8MaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory)
++{
++	struct mali_buffer * b;
++	IOReturn ret = kIOReturnBadArgument;
++
++	IOLockLock(gLock);
++	b = buffer(type);
++	if (b != NULL) {
++		b->memory->retain();
++		*memory = b->memory;
++		*options = 0;   /* the descriptor's own cache mode (write-combine) */
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gLock);
++	return ret;
++}
++
++IOReturn
++S8MaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
++{
++	union {
++		struct drm_gem_close close;
++		struct drm_panfrost_submit submit;
++		struct drm_panfrost_wait_bo wait;
++		struct drm_panfrost_create_bo create;
++		struct drm_panfrost_mmap_bo mmap;
++		struct drm_panfrost_get_param param;
++		struct drm_panfrost_get_bo_offset offset;
++		struct drm_panfrost_madvise madvise;
++		struct mali_wait waitseq;
++	} r;
++	size_t size = args->structureInputSize;
++	struct mali_buffer * b;
++	IOReturn ret = kIOReturnSuccess;
++
++	(void)dispatch;
++	(void)target;
++	(void)reference;
++	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL || gLock == NULL) {
++		return kIOReturnBadArgument;
++	}
++	bzero(&r, sizeof(r));
++	memcpy(&r, args->structureInput, size);
++
++	/* jobs end inside SUBMIT, so these never block: any job number given out is done */
++	if (selector == kS8MaliWait || selector == kPanfrostWaitBO) {
++		uint64_t seq = r.waitseq.seq;
++
++		if (selector == kPanfrostWaitBO) {
++			IOLockLock(gLock);
++			b = buffer(r.wait.handle);
++			seq = b != NULL ? b->last_seq : 0;
++			IOLockUnlock(gLock);
++			if (b == NULL) {
++				return kIOReturnNotFound;
++			}
++		}
++		ret = (seq == 0 || s8mali_gpu_wait(seq, 0)) ? kIOReturnSuccess : kIOReturnTimeout;
++		if (args->structureOutput != NULL && args->structureOutputSize >= size) {
++			memcpy(args->structureOutput, &r, size);
++			args->structureOutputSize = (uint32_t) size;
++		}
++		return ret;
++	}
++
++	IOLockLock(gLock);
++	switch (selector) {
++	case kPanfrostGetParam:
++		if (!s8mali_gpu_param(r.param.param, &r.param.value)) {
++			ret = kIOReturnBadArgument;
++		}
++		break;
++	case kPanfrostCreateBO:
++		ret = createBO(&r.create);
++		break;
++	case kPanfrostMmapBO:                   /* the offset is the handle: the program maps client memory of that type */
++		ret = buffer(r.mmap.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		r.mmap.offset = (uint64_t) r.mmap.handle << 12;
++		break;
++	case kPanfrostGetBOOffset:
++		b = buffer(r.offset.handle);
++		ret = b != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		r.offset.offset = b != NULL ? b->address : 0;
++		break;
++	case kPanfrostSubmit: {
++		uint64_t seq = 0;
++		uint32_t status = 0;
++
++		fSubmits++;
++		gSubmits++;
++		if (r.submit.jc != 0) {
++			/* the CPU wrote the chain through a write-combined mapping: make sure it has left the write buffers */
++			__asm__ volatile ("dsb sy" ::: "memory");
++			status = s8mali_gpu_submit(r.submit.jc, (r.submit.requirements & PANFROST_JD_REQ_FS) != 0, &seq);
++			if (status != 0) {
++				/* the GPU was reset; the job is lost. The call still succeeds (Mesa would abort on an error) */
++				gFailed++;
++			}
++		}
++		for (uint32_t i = 0; seq != 0 && i < r.submit.bo_handle_count && i < 4096; i += 64) {
++			uint32_t handles[64];
++			uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
++
++			if (copyin((user_addr_t) (r.submit.bo_handles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
++				break;
++			}
++			for (uint32_t k = 0; k < n; k++) {
++				b = buffer(handles[k]);
++				if (b != NULL) {
++					b->last_seq = seq;
++				}
++			}
++		}
++		if (allow(&gLogSubmit, 30) || status != 0) {
++			IOLog("S8MALI: submit jc=0x%llx %s req=0x%x bos=%u -> job %llu status=0x%x\n", r.submit.jc,
++			    (r.submit.requirements & PANFROST_JD_REQ_FS) ? "JS0" : "JS1", r.submit.requirements,
++			    r.submit.bo_handle_count, seq, status);
++		}
++		r.submit.jc = seq;      /* back in jc, as S9+: the shim puts the chain address back and keeps the number */
++		break;
++	}
++	case kPanfrostMadvise:
++		r.madvise.retained = 1;
++		break;
++	case kPanfrostSetLabelBO:
++	case kPanfrostSyncBO:
++		break;
++	case kDrmGemClose:
++		b = buffer(r.close.handle);
++		if (b != NULL) {
++			freeBuffer(b);
++		} else {
++			ret = kIOReturnNotFound;
++		}
++		break;
++	default:
++		if (allow(&gLogMisc, 20)) {
++			IOLog("S8MALI: request %#x (%zu bytes) is not known here\n", selector, size);
++		}
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(gLock);
++
++	if (args->structureOutput != NULL && args->structureOutputSize >= size) {
++		memcpy(args->structureOutput, &r, size);
++		args->structureOutputSize = (uint32_t) size;
++	}
++	return ret;
++}
++
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
