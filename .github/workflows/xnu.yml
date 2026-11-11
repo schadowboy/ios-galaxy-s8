@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      runner_labels:
+        description: 'runs-on labels as JSON, e.g. ["self-hosted","macOS","X64"] (default hosted macos-15)'
+        default: '["macos-15"]'
   push:
     branches: [main, codex/a5xelte-bringup, s8-dreamlte]
     paths:
@@ -36,7 +39,7 @@ jobs:
   build:
     # macos-14 is retired; macos-15 oldest Xcode is 16.0 (was: macos-14 shipped Xcode 15.x): its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-15
+    runs-on: ${{ fromJSON(inputs.runner_labels || '["macos-15"]') }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -64,15 +67,25 @@ jobs:
 
       - name: Deps
         run: |
-          brew install jq gum bash cmake ninja
-          # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
-          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
-          sudo chmod +x /usr/local/bin/xcodes
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          XC=$(ls -d /Applications/Xcode_*.app /Applications/Xcode.app 2>/dev/null | sort -V | head -1)
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
-          sudo xcode-select -s "$XC"
+          export DEVELOPER_DIR="$XC/Contents/Developer"
+          if [ "$RUNNER_ENVIRONMENT" = "github-hosted" ]; then
+            brew install jq gum bash cmake ninja
+            # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
+            printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+            sudo chmod +x /usr/local/bin/xcodes
+            sudo xcode-select -s "$XC"
+          else
+            # self-hosted: no sudo. Xcode and the KDK are installed once by hand
+            # (KDK at /Library/Developer/KDKs); Xcode is picked through DEVELOPER_DIR.
+            for t in jq gum cmake ninja xcodes; do
+              command -v "$t" >/dev/null || brew install "$t"
+            done
+            ls /Library/Developer/KDKs
+          fi
           xcodebuild -version
           xcrun --find iig
 
