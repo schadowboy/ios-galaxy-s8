@@ -81,9 +81,15 @@ jobs:
           else
             # self-hosted: no sudo. Xcode and the KDK are installed once by hand
             # (KDK at /Library/Developer/KDKs); Xcode is picked through DEVELOPER_DIR.
-            for t in jq gum cmake ninja xcodes; do
-              command -v "$t" >/dev/null || brew install "$t"
+            # No Homebrew bottles on macOS 14: jq, gum, cmake and ninja are installed by hand.
+            for t in jq gum cmake ninja; do
+              command -v "$t" >/dev/null || { echo "missing $t on the self-hosted runner"; exit 1; }
             done
+            # build.sh only checks that xcodes exists; the real one needs macOS 15, so stub it
+            mkdir -p "$RUNNER_TEMP/bin"
+            printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/bin/xcodes"
+            chmod +x "$RUNNER_TEMP/bin/xcodes"
+            echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
             ls /Library/Developer/KDKs
           fi
           xcodebuild -version
