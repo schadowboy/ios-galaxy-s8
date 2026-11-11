@@ -1,0 +1,645 @@
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -73,6 +73,7 @@
+ extern void a5xelte_touch_probe(void);
+ extern void s8_recov_init(void);
+ extern void s8prof_init(void);
++extern void s8mali_init(void);
+ #endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -776,6 +777,7 @@
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	s8_recov_init();
+ 	s8prof_init();
++	s8mali_init();
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
+ 	{
+diff --git a/osfmk/conf/files b/osfmk/conf/files
+--- a/osfmk/conf/files
++++ b/osfmk/conf/files
+@@ -196,6 +196,7 @@
+ osfmk/kern/zalloc.c			standard
+ osfmk/kern/zalloc_bounds.c	standard bound-checks
+ osfmk/kern/bsd_kern.c		optional mach_bsd
++osfmk/kern/s8_mali.c		standard
+ osfmk/kern/hibernate.c		optional hibernation
+ osfmk/kern/remote_time.c        standard
+ osfmk/kern/memset_s.c		standard
+diff --git a/osfmk/kern/s8_mali.c b/osfmk/kern/s8_mali.c
+new file mode 100644
+--- /dev/null
++++ b/osfmk/kern/s8_mali.c
+@@ -0,0 +1,610 @@
++/*
++ * s8mali=1: Mali-G71 MP20 (Exynos 8895, physical 0x13900000) bring-up and job self-test, polling only.
++ *
++ * Parts of the register map, the page-table entry bits, the TRANSCFG/MEMATTR values, the job header/WRITE_VALUE
++ * payload layout and the JS_CONFIG value follow the HakiOS S9+ driver (core/drivers/gpu/hakios.mali.c, a polling,
++ * single-job, AS0-only Mali driver for a Bifrost G52/G72), which is a derivative work of Apple's XNU and is licensed
++ * under the Apple Public Source License 2.0. This file is covered by the same license:
++ *
++ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
++ *
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. The rights granted to you under the License
++ * may not be used to create, or enable the creation or redistribution of,
++ * unlawful or unlicensed copies of an Apple operating system, or to
++ * circumvent, violate, or enable the circumvention or violation of, any
++ * terms of an Apple operating system software license agreement.
++ *
++ * Please obtain a copy of the License at
++ * http://www.opensource.apple.com/apsl/ and read it before using this file.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
++ *
++ * Sequence (every step prints "S8MALI:" lines with printf, which reach the klog ring):
++ *  1 map the GPU registers, read GPU_ID and the PRESENT/feature registers
++ *  2 check the G3D power domain is ON in the PMU (read only); otherwise stop without touching the GPU
++ *  3 soft reset, power L2, shaders, tiler and poll READY
++ *  4 allocate wired pages, build AArch64-4K Mali page tables for AS0, program AS0
++ *  5 build WRITE_VALUE and NULL jobs
++ *  6 submit them on JS1 (and WRITE_VALUE on JS0), poll JOB_IRQ_RAWSTAT, check the result
++ *  7 power the cores off, reset, free the pages
++ * Every wait has a timeout. The GPU is non-coherent (COHERENCY_ENABLE = 31 "none"), so the CPU cleans+invalidates
++ * (dc civac, FlushPoC_DcacheRegion) the job and table pages before the GPU reads them and again before the CPU reads
++ * what the GPU wrote; JS_CONFIG asks the GPU for flush-clean at the start and end of every job.
++ */
++#include <mach/mach_types.h>
++#include <mach/kern_return.h>
++#include <kern/kern_types.h>
++#include <kern/thread.h>
++#include <kern/sched.h>
++#include <kern/sched_prim.h>
++#include <kern/clock.h>
++#include <kern/misc_protos.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_map.h>
++#include <vm/pmap.h>
++#include <pexpert/pexpert.h>
++#include <stdint.h>
++#include <string.h>
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);       /* osfmk/arm64/caches_asm.s: dc civac loop */
++
++#define S8M_GPU_PHYS        0x13900000UL
++#define S8M_GPU_SIZE        0x5000
++#define S8M_PMU_PHYS        0x16480000UL    /* pmu_system_controller, 0124 maps it too */
++#define S8M_PMU_SIZE        0x10000
++#define S8M_PMU_G3D_STATUS  0x40E4          /* [3:0] == 0xF when pd-g3d is on (gpu-plan.md section 3) */
++
++/* GPU registers: hakios.mali.c lines 439-501 (Linux panfrost_regs.h offsets) */
++#define GPU_ID              0x000
++#define GPU_L2_FEATURES     0x004
++#define GPU_CORE_FEATURES   0x008
++#define GPU_TILER_FEATURES  0x00c
++#define GPU_MEM_FEATURES    0x010
++#define GPU_MMU_FEATURES    0x014           /* [7:0] bits of GPU address, [15:8] bits of physical address */
++#define GPU_AS_PRESENT      0x018
++#define GPU_JS_PRESENT      0x01c
++#define GPU_INT_RAWSTAT     0x020
++#define GPU_INT_CLEAR       0x024
++#define GPU_INT_MASK        0x028
++#define GPU_STATUS          0x034
++#define GPU_CMD             0x030
++#define GPU_FAULTSTATUS     0x03c           /* panfrost_regs.h GPU_FAULT_STATUS (task statement), guess for G71 */
++#define GPU_FAULTADDR_LO    0x040           /* guess (panfrost GPU_FAULT_ADDRESS) */
++#define GPU_FAULTADDR_HI    0x044
++#define THREAD_MAX_THREADS  0x0a0
++#define SHADER_PRESENT      0x100
++#define SHADER_PRESENT_HI   0x104
++#define TILER_PRESENT       0x110
++#define L2_PRESENT          0x120
++#define SHADER_READY        0x140
++#define TILER_READY         0x150
++#define L2_READY            0x160
++#define SHADER_PWRON        0x180
++#define TILER_PWRON         0x190
++#define L2_PWRON            0x1a0
++#define SHADER_PWROFF       0x1c0           /* panfrost_regs.h; the loader probe verified 0x1c0/0x1d0/0x1e0 work */
++#define TILER_PWROFF        0x1d0
++#define L2_PWROFF           0x1e0
++#define COHERENCY_FEATURES  0x300
++#define COHERENCY_ENABLE    0x304
++#define COHERENCY_NONE      31u
++#define IRQ_RESET_COMPLETED (1u << 8)
++#define GPU_CMD_SOFT_RESET  1u
++#define GPU_L2_MMU_CONFIG   0xf0c
++#define L2_MMU_LIMIT_EXTERNAL (0xfu << 24)
++
++#define JOB_INT_RAWSTAT     0x1000
++#define JOB_INT_CLEAR       0x1004
++#define JOB_INT_MASK        0x1008
++#define JOB_INT_JS_STATE    0x1010          /* panfrost JOB_INT_JS_STATE, task statement */
++#define JS0                 0x1800
++#define JS1                 0x1880          /* slot 1 = vertex/tiler/compute, JS0 = fragment (hakios.mali.c 480, 1386) */
++#define JS_HEAD_LO          0x00
++#define JS_STATUS           0x24
++#define JS_HEAD_NEXT_LO     0x40
++#define JS_HEAD_NEXT_HI     0x44
++#define JS_AFFINITY_NEXT_LO 0x50
++#define JS_AFFINITY_NEXT_HI 0x54
++#define JS_CONFIG_NEXT      0x58
++#define JS_COMMAND_NEXT     0x60
++#define JS_COMMAND_START    1u
++/* hakios.mali.c:488: AS 0 [3:0], START_FLUSH_CLEAN [9:8]=3, END_FLUSH_CLEAN [13:12]=3, priority [19:16]=8 */
++#define JS_CONFIG_VAL       ((3u << 8) | (3u << 12) | (8u << 16))
++
++#define MMU_INT_RAWSTAT     0x2000
++#define MMU_INT_CLEAR       0x2004
++#define AS0                 0x2400          /* + 0x40 * n; hakios.mali.c:490 */
++#define AS_TRANSTAB_LO      0x00
++#define AS_TRANSTAB_HI      0x04
++#define AS_MEMATTR_LO       0x08
++#define AS_MEMATTR_HI       0x0c
++#define AS_COMMAND          0x18
++#define AS_FAULTSTATUS      0x1c
++#define AS_FAULTADDR_LO     0x20            /* hakios.mali.c:1672: AS0 + 0x20 (low), + 0x24 (high) */
++#define AS_FAULTADDR_HI     0x24
++#define AS_STATUS           0x28
++#define AS_ACTIVE           1u
++#define AS_TRANSCFG_LO      0x30
++#define AS_TRANSCFG_HI      0x34
++#define AS_COMMAND_UPDATE   1u
++
++/* page table entries: hakios.mali.c lines 630-635 */
++#define PTE_TABLE           3ull
++#define PTE_PAGE            3ull
++#define PTE_AF              (1ull << 10)
++#define PTE_SH_INNER        (3ull << 8)
++#define PTE_AP_RW           (1ull << 6)
++#define PTE_ADDRESS         0x0000fffffffff000ull
++/* hakios.mali.c lines 638-641, 666-667 (fastmap: walk not cached) */
++#define TRANSCFG_AARCH64    6u
++#define TRANSCFG_INA(bits)  ((55u - (bits)) << 6)
++#define TRANSCFG_WALK_NC    (1u << 24)
++#define MEMATTR_WB          0x88888888u     /* hakios.mali.c:606-607 */
++
++/* job header / WRITE_VALUE: hakios.mali.c:572-580 (word indices of a uint32_t array) */
++#define JOB_TYPE_NULL       1u              /* panfrost MALI_JOB_TYPE_NULL = 1 */
++#define JOB_TYPE_WRITE_VALUE 2u             /* hakios.mali.c:572 (2u << 1) */
++#define WV_IMMEDIATE_32     6u              /* hakios.mali.c:580 "a 32-bit immediate" */
++
++#define S8M_JOB_VA          0x10000000ull   /* GPU VA of the job page (any value below 2^48 with level 0) */
++#define S8M_DATA_VA         0x10001000ull   /* GPU VA of the data page */
++#define S8M_WV_OFF          0x000
++#define S8M_NULL_OFF        0x100
++#define S8M_MAGIC           0x5338414cu     /* ASCII "S8AL" (as a big-endian number) */
++#define S8M_MAGIC_JS0       0x4a533030u
++#define S8M_FILL            0xa5a5a5a5u
++#define S8M_TIMEOUT_US      200000u
++
++#define P(fmt, ...) printf("S8MALI: " fmt "\n", ##__VA_ARGS__)
++
++static vm_offset_t s8m_gpu, s8m_pmu;
++static uint32_t s8m_event;
++static uint32_t s8m_delay = 60;
++
++static inline uint32_t
++rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(s8m_gpu + off);
++}
++
++static inline void
++wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(s8m_gpu + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* until (reg & mask) == want, at most us microseconds by the clock */
++static bool
++wait_for(uint32_t off, uint32_t mask, uint32_t want, uint32_t us)
++{
++	uint64_t deadline;
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &deadline);
++	deadline += mach_absolute_time();
++	while ((rd(off) & mask) != want) {
++		if (mach_absolute_time() >= deadline) {
++			return (rd(off) & mask) == want;
++		}
++	}
++	return true;
++}
++
++/* until (reg & mask) != 0 */
++static bool
++wait_any(uint32_t off, uint32_t mask, uint32_t us)
++{
++	uint64_t deadline;
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &deadline);
++	deadline += mach_absolute_time();
++	while ((rd(off) & mask) == 0) {
++		if (mach_absolute_time() >= deadline) {
++			return (rd(off) & mask) != 0;
++		}
++	}
++	return true;
++}
++
++static void
++dump_state(const char *why)
++{
++	P("state (%s): GPU_INT_RAWSTAT=0x%x GPU_STATUS=0x%x GPU_FAULTSTATUS=0x%x GPU_FAULTADDR=0x%x%08x", why,
++	    rd(GPU_INT_RAWSTAT), rd(GPU_STATUS), rd(GPU_FAULTSTATUS), rd(GPU_FAULTADDR_HI), rd(GPU_FAULTADDR_LO));
++	P("state (%s): L2_READY=0x%x SHADER_READY=0x%x TILER_READY=0x%x", why, rd(L2_READY), rd(SHADER_READY),
++	    rd(TILER_READY));
++	P("state (%s): JOB_RAWSTAT=0x%x JOB_JS_STATE=0x%x JS0_STATUS=0x%x JS1_STATUS=0x%x", why, rd(JOB_INT_RAWSTAT),
++	    rd(JOB_INT_JS_STATE), rd(JS0 + JS_STATUS), rd(JS1 + JS_STATUS));
++	P("state (%s): MMU_RAWSTAT=0x%x AS0_STATUS=0x%x AS0_FAULTSTATUS=0x%x AS0_FAULTADDR=0x%x%08x", why,
++	    rd(MMU_INT_RAWSTAT), rd(AS0 + AS_STATUS), rd(AS0 + AS_FAULTSTATUS), rd(AS0 + AS_FAULTADDR_HI),
++	    rd(AS0 + AS_FAULTADDR_LO));
++}
++
++static bool
++gpu_reset(void)
++{
++	wr(GPU_INT_CLEAR, 0xffffffffu);
++	wr(GPU_CMD, GPU_CMD_SOFT_RESET);
++	if (!wait_for(GPU_INT_RAWSTAT, IRQ_RESET_COMPLETED, IRQ_RESET_COMPLETED, 100000)) {
++		return false;
++	}
++	wr(GPU_INT_CLEAR, 0xffffffffu);
++	wr(COHERENCY_ENABLE, COHERENCY_NONE);                                           /* hakios.mali.c:524 */
++	wr(GPU_L2_MMU_CONFIG, rd(GPU_L2_MMU_CONFIG) & ~L2_MMU_LIMIT_EXTERNAL);          /* hakios.mali.c:525 */
++	return true;
++}
++
++static bool
++power_wait(uint32_t pwron, uint32_t ready, uint32_t mask, const char *name)
++{
++	if (mask == 0) {
++		return true;
++	}
++	wr(pwron, mask);
++	if (!wait_for(ready, mask, mask, 50000)) {
++		P("%s did not power up: READY=0x%x wanted 0x%x", name, rd(ready), mask);
++		return false;
++	}
++	return true;
++}
++
++/* one wired page: kernel va and physical address (4 KB used) */
++struct s8m_page {
++	vm_offset_t va;
++	uint64_t    pa;
++};
++
++static bool
++page_alloc(struct s8m_page *pg)
++{
++	vm_offset_t va = 0;
++	ppnum_t pn;
++
++	/*
++	 * Only the first 4 KB of each allocation is used, so physical contiguity within the page is all that is
++	 * needed (a kernel page is one physical page); the pages themselves need not be adjacent: each has its own
++	 * entry in the Mali tables.
++	 */
++	if (kmem_alloc(kernel_map, &va, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS) {
++		return false;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++	if (pn == 0) {
++		kmem_free(kernel_map, va, PAGE_SIZE);
++		return false;
++	}
++	pg->va = va;
++	pg->pa = ((uint64_t)pn << PAGE_SHIFT);  /* kmem_alloc returns page aligned memory */
++	FlushPoC_DcacheRegion(va, 4096);        /* the zeroes in memory */
++	return true;
++}
++
++static void
++page_free(struct s8m_page *pg)
++{
++	if (pg->va) {
++		kmem_free(kernel_map, pg->va, PAGE_SIZE);
++		pg->va = 0;
++	}
++}
++
++/* PTE (level 3, page): hakios.mali.c:766 */
++static uint64_t
++pte_page(uint64_t pa)
++{
++	return (pa & PTE_ADDRESS) | PTE_AF | PTE_SH_INNER | PTE_AP_RW | PTE_PAGE;
++}
++
++/* Submit the chain at GPU VA `chain` on slot register base `js` (JS0 or JS1), poll; returns true if done bit set. */
++static bool
++run_job(uint32_t js, uint64_t chain, uint32_t aff, uint32_t *rawstat, uint32_t *status)
++{
++	uint32_t slot = (js == JS0) ? 0 : 1;
++	uint32_t done = 1u << slot, fail = 1u << (slot + 16);
++	bool ok;
++
++	wr(JOB_INT_MASK, 0);                                                            /* polling */
++	wr(JOB_INT_CLEAR, 0xffffffffu);
++	wr(MMU_INT_CLEAR, 0xffffffffu);
++	wr(js + JS_HEAD_NEXT_LO, (uint32_t)chain);
++	wr(js + JS_HEAD_NEXT_LO + 4, (uint32_t)(chain >> 32));
++	wr(js + JS_AFFINITY_NEXT_LO, aff);
++	wr(js + JS_AFFINITY_NEXT_HI, 0);
++	wr(js + JS_CONFIG_NEXT, JS_CONFIG_VAL);
++	wr(js + JS_COMMAND_NEXT, JS_COMMAND_START);
++	ok = wait_any(JOB_INT_RAWSTAT, done | fail, S8M_TIMEOUT_US);
++	*rawstat = rd(JOB_INT_RAWSTAT);
++	*status = rd(js + JS_STATUS);
++	return ok && (*rawstat & done) && !(*rawstat & fail);
++}
++
++static void
++s8mali_run(void)
++{
++	struct s8m_page root = { 0 }, l1 = { 0 }, l2 = { 0 }, l3 = { 0 }, job = { 0 }, data = { 0 };
++	struct s8m_page *all[] = { &root, &l1, &l2, &l3, &job, &data };
++	bool cores_on = false, reset_ok = true, faulted = false;
++	uint32_t shader, tiler, l2m, aff, id, va_bits, pa_bits, rawstat, status;
++	uint32_t pmu_status;
++	volatile uint32_t *jw, *dw;
++
++	/* (1) map and read the identification registers */
++	s8m_gpu = ml_io_map(S8M_GPU_PHYS, S8M_GPU_SIZE);
++	s8m_pmu = ml_io_map(S8M_PMU_PHYS, S8M_PMU_SIZE);
++	if (!s8m_gpu || !s8m_pmu) {
++		P("ml_io_map failed gpu=%p pmu=%p", (void *)s8m_gpu, (void *)s8m_pmu);
++		return;
++	}
++
++	/* (2) the power domain first, read only: reading the GPU with the domain off is a bus hang (gpu-plan.md 1.3) */
++	pmu_status = *(volatile uint32_t *)(s8m_pmu + S8M_PMU_G3D_STATUS);
++	P("PMU G3D status (0x16480000+0x40E4) = 0x%x (%s)", pmu_status, (pmu_status & 0xf) == 0xf ? "ON" : "NOT ON");
++	if ((pmu_status & 0xf) != 0xf) {
++		P("G3D domain is not on, not touching the GPU");
++		return;
++	}
++
++	id = rd(GPU_ID);
++	shader = rd(SHADER_PRESENT);
++	tiler = rd(TILER_PRESENT);
++	l2m = rd(L2_PRESENT);
++	P("GPU_ID=0x%x (expect 0x60a00001) L2_FEATURES=0x%x CORE_FEATURES=0x%x TILER_FEATURES=0x%x MEM_FEATURES=0x%x",
++	    id, rd(GPU_L2_FEATURES), rd(GPU_CORE_FEATURES), rd(GPU_TILER_FEATURES), rd(GPU_MEM_FEATURES));
++	P("MMU_FEATURES=0x%x AS_PRESENT=0x%x JS_PRESENT=0x%x THREAD_MAX=0x%x COHERENCY_FEATURES=0x%x",
++	    rd(GPU_MMU_FEATURES), rd(GPU_AS_PRESENT), rd(GPU_JS_PRESENT), rd(THREAD_MAX_THREADS), rd(COHERENCY_FEATURES));
++	P("SHADER_PRESENT=0x%x/0x%x TILER_PRESENT=0x%x L2_PRESENT=0x%x", shader, rd(SHADER_PRESENT_HI), tiler, l2m);
++	if ((id & 0xf00f0000u) != 0x60000000u) {
++		/* Panfrost compares GPU_ID with the 0xf00f mask; 0x60a00001 is product 0x6000 (G71) */
++		P("unexpected GPU_ID, stopping");
++		return;
++	}
++	va_bits = rd(GPU_MMU_FEATURES) & 0xff;
++	pa_bits = (rd(GPU_MMU_FEATURES) >> 8) & 0xff;
++	if (va_bits < 40 || va_bits > 55) {
++		P("MMU VA bits %u: this self-test only implements the 4-level layout (48 bit), stopping", va_bits);
++		return;
++	}
++
++	/* (3) soft reset, cores on (panfrost order: L2, shaders, tiler; hakios.mali.c gpu_cores_on) */
++	if (!gpu_reset()) {
++		P("soft reset did not complete (RAWSTAT bit 8)");
++		dump_state("reset");
++		return;
++	}
++	P("soft reset ok, GPU_STATUS=0x%x", rd(GPU_STATUS));
++	if (!power_wait(L2_PWRON, L2_READY, l2m, "L2") || !power_wait(SHADER_PWRON, SHADER_READY, shader, "shaders") ||
++	    !power_wait(TILER_PWRON, TILER_READY, tiler, "tiler")) {
++		dump_state("power on");
++		reset_ok = gpu_reset();
++		return;
++	}
++	cores_on = true;
++	P("power on ok: L2_READY=0x%x SHADER_READY=0x%x TILER_READY=0x%x", rd(L2_READY), rd(SHADER_READY),
++	    rd(TILER_READY));
++	aff = shader & (~shader + 1);   /* the lowest present shader core */
++
++	/* (4) wired pages and page tables */
++	for (unsigned i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
++		if (!page_alloc(all[i])) {
++			P("page allocation %u failed", i);
++			goto out;
++		}
++	}
++	P("pages: root pa=0x%llx l1 pa=0x%llx l2 pa=0x%llx l3 pa=0x%llx job pa=0x%llx data pa=0x%llx (PAGE_SIZE=%lu)",
++	    root.pa, l1.pa, l2.pa, l3.pa, job.pa, data.pa, (unsigned long)PAGE_SIZE);
++	/* PA width check: the GPU can only reach pa_bits of physical address */
++	if (pa_bits < 64 && ((job.pa | data.pa | root.pa | l1.pa | l2.pa | l3.pa) >> pa_bits) != 0) {
++		P("a page is above the GPU's %u physical bits, stopping", pa_bits);
++		goto out;
++	}
++	{
++		volatile uint64_t *t0 = (volatile uint64_t *)root.va, *t1 = (volatile uint64_t *)l1.va,
++		    *t2 = (volatile uint64_t *)l2.va, *t3 = (volatile uint64_t *)l3.va;
++		uint64_t va = S8M_JOB_VA;
++
++		/* level 0 (bits 47:39), 1 (38:30), 2 (29:21), 3 (20:12): 4 KB AArch64 tables, hakios.mali.c:756-767 */
++		t0[(va >> 39) & 511] = l1.pa | PTE_TABLE;
++		t1[(va >> 30) & 511] = l2.pa | PTE_TABLE;
++		t2[(va >> 21) & 511] = l3.pa | PTE_TABLE;
++		t3[(S8M_JOB_VA >> 12) & 511] = pte_page(job.pa);
++		t3[(S8M_DATA_VA >> 12) & 511] = pte_page(data.pa);
++	}
++	/* (5) jobs, built through the kernel mapping, then cleaned to memory */
++	jw = (volatile uint32_t *)job.va;
++	dw = (volatile uint32_t *)data.va;
++	{
++		volatile uint32_t *wv = jw + S8M_WV_OFF / 4, *nj = jw + S8M_NULL_OFF / 4;
++
++		/* header: word0 exception_status, 1 first_incomplete_task, 2-3 fault_pointer, 4 flags, 5 deps, 6-7 next_job */
++		wv[4] = (JOB_TYPE_WRITE_VALUE << 1) | 1u | (1u << 16); /* hakios.mali.c:572: size bit, type, index 1 */
++		wv[6] = 0;
++		wv[7] = 0;                                              /* next_job = 0 */
++		wv[8] = (uint32_t)S8M_DATA_VA;                          /* payload: address (u64) */
++		wv[9] = (uint32_t)(S8M_DATA_VA >> 32);
++		wv[10] = WV_IMMEDIATE_32;                               /* type (u32) */
++		wv[12] = S8M_MAGIC;                                     /* immediate (u64) */
++		wv[13] = 0;
++		nj[4] = (JOB_TYPE_NULL << 1) | 1u | (1u << 16);
++		nj[6] = 0;
++		nj[7] = 0;
++	}
++	dw[0] = S8M_FILL;
++	dw[16] = S8M_FILL;
++	FlushPoC_DcacheRegion(root.va, 4096);
++	FlushPoC_DcacheRegion(l1.va, 4096);
++	FlushPoC_DcacheRegion(l2.va, 4096);
++	FlushPoC_DcacheRegion(l3.va, 4096);
++	FlushPoC_DcacheRegion(job.va, 4096);
++	FlushPoC_DcacheRegion(data.va, 4096);
++
++	/* AS0: hakios.mali.c as0_update lines 597-609: wait idle, TRANSTAB, TRANSCFG, MEMATTR, UPDATE, wait idle */
++	if (!wait_for(AS0 + AS_STATUS, AS_ACTIVE, 0, 50000)) {
++		P("AS0 busy before update");
++		dump_state("as0");
++		goto out;
++	}
++	{
++		uint32_t transcfg = TRANSCFG_AARCH64 | TRANSCFG_INA(va_bits) | TRANSCFG_WALK_NC;
++
++		wr(AS0 + AS_TRANSTAB_LO, (uint32_t)root.pa);
++		wr(AS0 + AS_TRANSTAB_HI, (uint32_t)(root.pa >> 32));
++		wr(AS0 + AS_TRANSCFG_LO, transcfg);
++		wr(AS0 + AS_TRANSCFG_HI, 0);
++		wr(AS0 + AS_MEMATTR_LO, MEMATTR_WB);
++		wr(AS0 + AS_MEMATTR_HI, MEMATTR_WB);
++		wr(AS0 + AS_COMMAND, AS_COMMAND_UPDATE);
++		P("AS0 programmed: TRANSTAB=0x%llx TRANSCFG=0x%x (va_bits=%u) MEMATTR=0x%x", root.pa, transcfg, va_bits,
++		    MEMATTR_WB);
++	}
++	if (!wait_for(AS0 + AS_STATUS, AS_ACTIVE, 0, 50000)) {
++		P("AS0 update did not finish");
++		dump_state("as0 update");
++		goto out;
++	}
++
++	/* (6a) WRITE_VALUE on JS1 */
++	{
++		bool ok = run_job(JS1, S8M_JOB_VA + S8M_WV_OFF, aff, &rawstat, &status);
++		uint32_t val, hdr0;
++
++		FlushPoC_DcacheRegion(data.va, 4096);   /* drop CPU copies before reading what the GPU wrote */
++		FlushPoC_DcacheRegion(job.va, 4096);
++		val = dw[0];
++		hdr0 = jw[S8M_WV_OFF / 4];
++		P("write_value test %s value=0x%x status=0x%x rawstat=0x%x (js1 done=%d header.exception_status=0x%x)",
++		    (ok && val == S8M_MAGIC) ? "PASS" : "FAIL", val, status, rawstat, ok, hdr0);
++		if (!ok || val != S8M_MAGIC) {
++			faulted = true;
++			dump_state("write_value");
++			if (rawstat & (1u << 17)) {
++				P("job fault: JS1_STATUS=0x%x HEAD=0x%x", status, rd(JS1 + JS_HEAD_LO));
++			}
++			if (rd(MMU_INT_RAWSTAT) || rd(AS0 + AS_FAULTSTATUS)) {
++				P("MMU fault: AS0_FAULTSTATUS=0x%x AS0_FAULTADDR=0x%x%08x (job VA 0x%llx data VA 0x%llx)",
++				    rd(AS0 + AS_FAULTSTATUS), rd(AS0 + AS_FAULTADDR_HI), rd(AS0 + AS_FAULTADDR_LO), S8M_JOB_VA,
++				    S8M_DATA_VA);
++			} else if (!(rawstat & ((1u << 1) | (1u << 17)))) {
++				P("timeout: no done/fail bit in %u us", S8M_TIMEOUT_US);
++			}
++			goto out;
++		}
++	}
++
++	/* (6b) NULL job on JS1 (no memory access except the header) */
++	{
++		bool ok = run_job(JS1, S8M_JOB_VA + S8M_NULL_OFF, aff, &rawstat, &status);
++
++		P("null_job test %s status=0x%x rawstat=0x%x", ok ? "PASS" : "FAIL", status, rawstat);
++		if (!ok) {
++			faulted = true;
++			dump_state("null_job");
++			goto out;
++		}
++	}
++
++	/* (6c) WRITE_VALUE on JS0 (the fragment slot), informational: a second value in the same data page */
++	{
++		volatile uint32_t *wv = jw + S8M_WV_OFF / 4;
++		bool ok;
++		uint32_t val;
++
++		wv[0] = 0;                                  /* clear the status the GPU wrote */
++		wv[8] = (uint32_t)(S8M_DATA_VA + 0x40);
++		wv[9] = (uint32_t)((S8M_DATA_VA + 0x40) >> 32);
++		wv[12] = S8M_MAGIC_JS0;
++		FlushPoC_DcacheRegion(job.va, 4096);
++		ok = run_job(JS0, S8M_JOB_VA + S8M_WV_OFF, aff, &rawstat, &status);
++		FlushPoC_DcacheRegion(data.va, 4096);
++		val = dw[16];
++		P("write_value on JS0 %s value=0x%x status=0x%x rawstat=0x%x", (ok && val == S8M_MAGIC_JS0) ? "PASS" : "FAIL",
++		    val, status, rawstat);
++		if (!ok) {
++			faulted = true;
++			dump_state("js0");
++		}
++	}
++
++out:
++	/* (7) leave the GPU idle: cores off, reset (also clears AS0), only then free the pages */
++	if (cores_on && !faulted) {
++		wr(SHADER_PWROFF, shader);
++		wr(TILER_PWROFF, tiler);
++		wr(L2_PWROFF, l2m);
++		if (!wait_for(SHADER_READY, 0xffffffffu, 0, 50000) || !wait_for(TILER_READY, 0xffffffffu, 0, 50000) ||
++		    !wait_for(L2_READY, 0xffffffffu, 0, 50000)) {
++			P("power off incomplete: READY L2=0x%x SH=0x%x T=0x%x", rd(L2_READY), rd(SHADER_READY), rd(TILER_READY));
++		} else {
++			P("cores powered off");
++		}
++	}
++	if (cores_on) {
++		reset_ok = gpu_reset();
++		P("final soft reset %s, GPU_STATUS=0x%x", reset_ok ? "ok" : "TIMED OUT", rd(GPU_STATUS));
++	}
++	for (unsigned i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
++		if (reset_ok) {
++			page_free(all[i]);
++		} else {
++			P("reset failed, leaking page %u", i);
++		}
++	}
++}
++
++static void
++s8mali_thread(void *arg, wait_result_t result)
++{
++	uint64_t deadline;
++
++	(void)arg;
++	(void)result;
++	clock_interval_to_deadline(s8m_delay * 1000, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&s8m_event, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++	P("start (delay %u s)", s8m_delay);
++	s8mali_run();
++	P("done");
++	thread_terminate_self();
++}
++
++/* Called once from IOKitBSDInitialize (a5xelte block), next to s8prof_init(). */
++void s8mali_init(void);
++
++void
++s8mali_init(void)
++{
++	uint32_t on = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("s8mali", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	(void)PE_parse_boot_argn("s8mali_delay", &s8m_delay, sizeof(s8m_delay));
++	if (s8m_delay > 3600) {
++		s8m_delay = 3600;
++	}
++	P("self-test enabled, runs %u s after kernel start", s8m_delay);
++	if (kernel_thread_start_priority(s8mali_thread, NULL, BASEPRI_DEFAULT, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		P("thread start failed");
++	}
++}
++
++#else /* !ARM64_BOARD_CONFIG_A5XELTE */
++
++void s8mali_init(void);
++
++void
++s8mali_init(void)
++{
++}
++
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
