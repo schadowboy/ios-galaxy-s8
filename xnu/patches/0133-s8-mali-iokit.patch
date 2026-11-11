@@ -834,10 +834,10 @@ index 0000000..3ec9292
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
 diff --git a/iokit/Kernel/arm/S8Mali.cpp b/iokit/Kernel/arm/S8Mali.cpp
 new file mode 100755
-index 0000000..b6e31d4
+index 0000000..4a6aa47
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Mali.cpp
-@@ -0,0 +1,579 @@
+@@ -0,0 +1,578 @@
 +/*
 + * S8Mali: the Galaxy S8's Mali-G71 MP20 for programs to draw with (boot-arg s8mali_drv=1).
 + *
@@ -878,7 +878,6 @@ index 0000000..b6e31d4
 + */
 +#if defined(ARM64_BOARD_CONFIG_A5XELTE)
 +
-+#include <device/device_types.h>
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOLocks.h>
 +#include <IOKit/IOKitKeys.h>
