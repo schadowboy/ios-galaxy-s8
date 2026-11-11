@@ -2,16 +2,29 @@ diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
 index 00568d3..18bb053 100644
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
-@@ -5606,6 +5606,13 @@ pmap_enter_pte(pmap_t pmap, pt_entry_t *pte_p, pt_entry_t *old_pte, pt_entry_t n
+@@ -5606,6 +5606,26 @@ pmap_enter_pte(pmap_t pmap, pt_entry_t *pte_p, pt_entry_t *old_pte, pt_entry_t n
  			/* pte has been modified by another thread and we hold the wrong PVH lock. Retry. */
  			success = false;
  		} else {
 +			if (((uintptr_t)pte_p) & 0x1f) {
 +				/* SWEET diag: report what is being mapped when the 4-PTE group is misaligned */
-+				panic("SWEET diag: pmap_enter_pte unaligned pmap=%p kernel=%d v=0x%llx pte_p=%p new_pte=0x%llx old_pte=0x%llx pa_valid=%d",
-+				    pmap, (pmap == kernel_pmap), (unsigned long long)v, pte_p,
-+				    (unsigned long long)new_pte, (unsigned long long)*old_pte,
-+				    (int)pa_valid(pte_to_pa(new_pte)));
++				uintptr_t sweet_bt[6] = { 0, 0, 0, 0, 0, 0 };
++				uintptr_t *sweet_fp = (uintptr_t *)__builtin_frame_address(0);
++				for (int sweet_i = 0; sweet_i < 6; sweet_i++) {
++					if (((uintptr_t)sweet_fp & 0xf) || (uintptr_t)sweet_fp < VM_MIN_KERNEL_ADDRESS) {
++						break;
++					}
++					sweet_bt[sweet_i] = sweet_fp[1];
++					if (sweet_fp[0] <= (uintptr_t)sweet_fp) {
++						break;
++					}
++					sweet_fp = (uintptr_t *)sweet_fp[0];
++				}
++				panic("SWEET diag: v=0x%llx k=%d ps=%u pa=0x%llx p=%p bt=%p,%p,%p,%p,%p,%p pm=%p",
++				    (unsigned long long)v, (pmap == kernel_pmap),
++				    (unsigned)pt_attr_page_size(pt_attr), (unsigned long long)pte_to_pa(new_pte), pte_p,
++				    (void *)sweet_bt[0], (void *)sweet_bt[1], (void *)sweet_bt[2],
++				    (void *)sweet_bt[3], (void *)sweet_bt[4], (void *)sweet_bt[5], pmap);
 +			}
  			write_pte_fast(pte_p, new_pte);
  			success = true;
