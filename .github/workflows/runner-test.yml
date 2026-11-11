@@ -1,0 +1,20 @@
+name: runner-test
+on:
+  push:
+    branches: [runner-test]
+jobs:
+  probe:
+    runs-on: [self-hosted, macOS, X64]
+    timeout-minutes: 15
+    steps:
+      - name: Read-only environment probe
+        run: |
+          set +e
+          echo "== host"; sw_vers; uname -m; sysctl -n machdep.cpu.brand_string; sysctl -n hw.ncpu; echo "mem GB: $(( $(sysctl -n hw.memsize) / 1073741824 ))"
+          echo "== disk"; df -h / | tail -1
+          echo "== xcode"; xcode-select -p; xcodebuild -version; ls -d /Applications/Xcode*.app 2>/dev/null; xcrun --find iig
+          echo "== kdk"; ls /Library/Developer/KDKs 2>/dev/null
+          echo "== tools"; for t in git brew cmake ninja jq gum bash xcodes python3; do printf '%s: ' $t; command -v $t || echo MISSING; done
+          echo "== sudo (non-interactive, no changes)"; sudo -n true 2>&1 && echo "passwordless sudo: YES" || echo "passwordless sudo: NO"
+          echo "== net"; curl -sI https://github.com | head -1
+          echo "== runner"; echo "$RUNNER_NAME $RUNNER_OS $RUNNER_ARCH workdir=$GITHUB_WORKSPACE"
