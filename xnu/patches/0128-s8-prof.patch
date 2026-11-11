@@ -1,24 +1,7 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -39,6 +39,16 @@
- #include <pexpert/device_tree.h>
- #include <libkern/libkern.h>
- #include <machine/atomic.h>
-+#if defined(ARM64_BOARD_CONFIG_A5XELTE)
-+#include <kern/task.h>
-+#include <kern/thread.h>
-+#include <kern/processor.h>
-+#include <kern/sched.h>
-+#include <kern/queue.h>
-+#include <kern/recount.h>
-+#include <kern/counter.h>
-+#include <kern/host_statistics.h>
-+#endif
- 
- extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
- /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
-@@ -175,7 +185,7 @@
+@@ -175,7 +175,7 @@
   * (to the device when write is set). Returns 0 or an errno.
   */
  static int
@@ -27,24 +10,42 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  {
  	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
  	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
-@@ -298,6 +308,46 @@
+@@ -298,6 +298,64 @@
  	return 0;
  }
  
 +/*
-+ * s8prof counters: every UFS command goes through here, always under
-+ * sweet_ufs_lock (or single threaded during init), so plain increments are
-+ * enough; the s8prof thread reads them racily (aligned 64-bit loads).
-+ * Latency is the command time on the controller (doorbell to completion),
-+ * lock wait is accounted separately in sweet_ufs_strategy.
++ * s8prof counters (osfmk/kern/bsd_kern.c prints them): every UFS command goes
++ * through ufs_scsi(), always under sweet_ufs_lock (or single threaded during
++ * init), so plain increments are enough; the s8prof thread reads them racily
++ * (aligned 64-bit loads). Latency is the command time on the controller
++ * (doorbell to completion); lock wait is accounted in sweet_ufs_strategy.
 + */
-+struct s8prof_ufs_stats {
++static struct {
 +	volatile uint64_t rd_bytes, wr_bytes, rd_reqs, wr_reqs, other_reqs;
 +	volatile uint64_t lat_abs, lat_max_abs;        /* mach absolute time units */
 +	volatile uint64_t strat_reqs, lockwait_abs;    /* strategy() calls, time waiting for sweet_ufs_lock */
 +	volatile uint64_t errors;
-+};
-+static struct s8prof_ufs_stats s8prof_ufs;
++} s8prof_ufs;
++
++void s8prof_ufs_snapshot(uint64_t out[9], uint64_t *lat_max_abs);
++
++/* out[]: rd_bytes wr_bytes rd_reqs wr_reqs other_reqs lat_abs strat_reqs lockwait_abs errors */
++void
++s8prof_ufs_snapshot(uint64_t out[9], uint64_t *lat_max_abs)
++{
++	out[0] = s8prof_ufs.rd_bytes;
++	out[1] = s8prof_ufs.wr_bytes;
++	out[2] = s8prof_ufs.rd_reqs;
++	out[3] = s8prof_ufs.wr_reqs;
++	out[4] = s8prof_ufs.other_reqs;
++	out[5] = s8prof_ufs.lat_abs;
++	out[6] = s8prof_ufs.strat_reqs;
++	out[7] = s8prof_ufs.lockwait_abs;
++	out[8] = s8prof_ufs.errors;
++	*lat_max_abs = s8prof_ufs.lat_max_abs;
++	s8prof_ufs.lat_max_abs = 0;
++}
 +
 +static int
 +ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
@@ -74,7 +75,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  /* READ(10) of count device blocks at lba into the bounce buffer. */
  static int
  ufs_read_blocks(uint64_t lba, uint32_t count)
-@@ -477,7 +527,10 @@
+@@ -477,7 +535,10 @@
  		goto done;
  	}
  
@@ -85,11 +86,32 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	for (uint32_t done = 0; done < count;) {
  		uint64_t pos = off + done;
  		uint64_t lba = pos / UFS_BLOCK;
-@@ -885,4 +938,322 @@
- 	*dev = su.bdev;
- 	return 0;
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -72,6 +72,7 @@
+ extern void a5xelte_keys_init(void);
+ extern void a5xelte_touch_probe(void);
+ extern void s8_recov_init(void);
++extern void s8prof_init(void);
+ #endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -774,6 +775,7 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	s8_recov_init();
++	s8prof_init();
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
+ 	{
+diff --git a/osfmk/kern/bsd_kern.c b/osfmk/kern/bsd_kern.c
+--- a/osfmk/kern/bsd_kern.c
++++ b/osfmk/kern/bsd_kern.c
+@@ -1514,3 +1514,323 @@
+ 		return KERN_FAILURE;
+ 	}
  }
-+
 +#if defined(ARM64_BOARD_CONFIG_A5XELTE)
 +/*
 + * s8prof=N: every N seconds a kernel thread prints compact "S8PROF" lines
@@ -110,6 +132,15 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 + * tasks_threads_lock is held only for the pointer-chasing scan (no printf, no
 + * proc lookup inside); everything printed uses static buffers.
 + */
++#include <kern/sched.h>
++#include <kern/sched_prim.h>
++#include <kern/clock.h>
++#include <kern/counter.h>
++#include <kern/host_statistics.h>
++#include <kern/misc_protos.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++
 +#define S8P_MAXCPU      8
 +#define S8P_MAXTASK     256
 +#define S8P_TOP         6
@@ -119,6 +150,9 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +extern uint32_t c_segment_pages_compressed;
 +extern uint32_t c_segment_count;
 +extern int64_t compressor_bytes_used;
++extern void proc_name(int pid, char *buf, int size);
++/* bsd/dev/sweet_ufs.c: ufs_scsi()/sweet_ufs_strategy() counters, see s8prof_ufs_stats there */
++extern void s8prof_ufs_snapshot(uint64_t out[9], uint64_t *lat_max_abs);
 +
 +typedef struct {
 +	int32_t  pid;
@@ -281,17 +315,8 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +
 +	/* (5) disk counters */
 +	uint64_t d_now[S8P_D_N], d_d[S8P_D_N];
-+	d_now[S8P_D_RDB] = s8prof_ufs.rd_bytes;
-+	d_now[S8P_D_WRB] = s8prof_ufs.wr_bytes;
-+	d_now[S8P_D_RDQ] = s8prof_ufs.rd_reqs;
-+	d_now[S8P_D_WRQ] = s8prof_ufs.wr_reqs;
-+	d_now[S8P_D_OTH] = s8prof_ufs.other_reqs;
-+	d_now[S8P_D_LAT] = s8prof_ufs.lat_abs;
-+	d_now[S8P_D_STRAT] = s8prof_ufs.strat_reqs;
-+	d_now[S8P_D_LOCKW] = s8prof_ufs.lockwait_abs;
-+	d_now[S8P_D_ERR] = s8prof_ufs.errors;
-+	uint64_t lat_max = s8prof_ufs.lat_max_abs;
-+	s8prof_ufs.lat_max_abs = 0;
++	uint64_t lat_max = 0;
++	s8prof_ufs_snapshot(d_now, &lat_max);   /* order = S8P_D_* enum; resets the max */
 +	for (int i = 0; i < S8P_D_N; i++) {
 +		d_d[i] = d_now[i] - s8p_d_prev[i];
 +		s8p_d_prev[i] = d_now[i];
@@ -407,23 +432,3 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
- #endif /* ARM64_BOARD_CONFIG_SWEET */
-diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
---- a/iokit/bsddev/IOKitBSDInit.cpp
-+++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -72,6 +72,7 @@
- extern void a5xelte_keys_init(void);
- extern void a5xelte_touch_probe(void);
- extern void s8_recov_init(void);
-+extern void s8prof_init(void);
- #endif
- 
- #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
-@@ -774,6 +775,7 @@
- 
- #if defined(ARM64_BOARD_CONFIG_A5XELTE)
- 	s8_recov_init();
-+	s8prof_init();
- 	a5xelte_keys_init();
- 	a5xelte_touch_probe();
- 	{
