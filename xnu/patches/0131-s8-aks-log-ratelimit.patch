@@ -1,0 +1,53 @@
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index d11fe26..64732ae 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -24,6 +24,12 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <libkern/c++/OSString.h>
+ #include <sys/proc.h>
++#include <libkern/OSAtomic.h>
++#include <pexpert/pexpert.h>
++
++/* Rate limiting of the per-call log (see externalMethod). */
++static SInt32 sweet_aks_counts[32];
++static int sweet_aks_logall = -1;
+ 
+ /* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
+ enum {
+@@ -234,6 +240,35 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
++
++	/*
++	 * Selectors 7/17/35 are polled constantly (Spotlight alone made ~64k
++	 * lines per boot): log the first 10 calls per (proc, selector) and then
++	 * every 2000th. Errors are always logged in full; boot-arg s8aks_log=1
++	 * restores logging of every call.
++	 */
++	bool full = true;
++	uint32_t nth = 0;
++	if (ret == kIOReturnSuccess && (selector == 7 || selector == 17 || selector == 35)) {
++		if (sweet_aks_logall < 0) {
++			uint32_t v = 0;
++			sweet_aks_logall = (PE_parse_boot_argn("s8aks_log", &v, sizeof(v)) && v != 0) ? 1 : 0;
++		}
++		if (!sweet_aks_logall) {
++			uint32_t h = 2166136261u ^ selector;
++			for (const char *c = name; *c != '\0'; c++) {
++				h = (h ^ (uint8_t)*c) * 16777619u;
++			}
++			nth = (uint32_t)OSIncrementAtomic(&sweet_aks_counts[h & 31]) + 1;
++			full = nth <= 10;
++			if (!full && (nth % 2000) == 0) {
++				IOLog("SWEET AKS: %s sel %u x%u (rate-limited)\n", name, selector, nth);
++			}
++			if (!full) {
++				return ret;
++			}
++		}
++	}
+ 	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+ 	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
+ 	return ret;
