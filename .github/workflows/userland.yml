@@ -1,0 +1,55 @@
+name: userland
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_labels:
+        description: 'runs-on labels as JSON, e.g. ["self-hosted","macOS","X64"] (default hosted macos-15)'
+        default: '["macos-15"]'
+  push:
+    branches: [s8-dreamlte]
+    paths:
+      - "userland/**"
+      - ".github/workflows/userland.yml"
+
+concurrency:
+  group: userland-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ${{ fromJSON(inputs.runner_labels || '["macos-15"]') }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_*.app /Applications/Xcode.app 2>/dev/null | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR="$XC/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Get ldid
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ldid"
+          # Procursus ldid; asset name by host arch
+          if [ "$(uname -m)" = arm64 ]; then PAT='ldid_macosx_arm64'; else PAT='ldid_macosx_x86_64'; fi
+          gh release download -R ProcursusTeam/ldid --pattern "$PAT" -D "$RUNNER_TEMP/ldid" --clobber
+          mv "$RUNNER_TEMP/ldid/$PAT" "$RUNNER_TEMP/ldid/ldid"
+          chmod +x "$RUNNER_TEMP/ldid/ldid"
+          "$RUNNER_TEMP/ldid/ldid" 2>&1 | head -3 || true
+          echo "LDID=$RUNNER_TEMP/ldid/ldid" >> "$GITHUB_ENV"
+
+      - name: Build and sign
+        run: bash userland/build-ios.sh "$PWD/out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: userland-s8mali
+          path: out/
+          if-no-files-found: error

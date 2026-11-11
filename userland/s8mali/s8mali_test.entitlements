@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	Minimal. Our AMFI (as the S9+ miniamfi) accepts any signature and reads entitlements only from the signature,
+	so these change nothing in access; they only say what is meant. The S9+ reaches its GPU service with no
+	IOKit entitlement at all (triangle_app.entitlements: "DELIBERATELY ABSENT: anything about ... IOKit").
+	The iokit-user-client-class key is kept in case the S8's sandbox stand-in ever starts checking it (guess).
+-->
+<plist version="1.0">
+<dict>
+	<key>platform-application</key>
+	<true/>
+	<key>get-task-allow</key>
+	<true/>
+	<key>com.apple.security.iokit-user-client-class</key>
+	<array>
+		<string>S8MaliUserClient</string>
+		<string>S8Mali</string>
+	</array>
+</dict>
+</plist>
