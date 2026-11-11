@@ -1,0 +1,196 @@
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+index 13e62e5..f17361d 100644
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1094,6 +1094,23 @@ PEHaltRestartInternal(unsigned int type, uint32_t details)
+ 	}
+ 
+ skip_to_haltRestart:
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/*
++	 * S8: every reboot, halt and panic restart resets into TWRP recovery
++	 * unless boot-arg s8noreset is set. Panic path: panic_trap_to_debugger ->
++	 * debugger_collect_diagnostics -> kdp_machine_reboot_type ->
++	 * PEHaltRestart(kPEPanicRestartCPU) -> here.
++	 */
++	if (type == kPEHaltCPU || type == kPERestartCPU || type == kPEUPSDelayHaltCPU ||
++	    type == kPEPanicRestartCPU || type == kPEHangCPU) {
++		uint32_t s8noreset = 0;
++		if (!PE_parse_boot_argn("s8noreset", &s8noreset, sizeof(s8noreset))) {
++			extern void s8_reset_to_recovery(const char *why);
++			printf("S8RECOV: PE halt/restart type %u\n", type);
++			s8_reset_to_recovery("PE_halt_restart");
++		}
++	}
++#endif
+ 	if (gIOPlatform) {
+ 		// note that this will not necessarily halt or restart the system...
+ 		// Implementors of this function will check the type and take action accordingly
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index b6ba676..411888d 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -71,6 +71,7 @@ extern boolean_t cpuid_vmm_present(void);
+ extern void a5xelte_emmc_probe(void);
+ extern void a5xelte_keys_init(void);
+ extern void a5xelte_touch_probe(void);
++extern void s8_recov_init(void);
+ #endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -772,6 +773,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	}
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	s8_recov_init();
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
+ 	{
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 1966bdd..5bc0247 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -29,6 +29,7 @@
+ #include <arm64/sweet_early.h>
+ #include <pexpert/arm/protos.h>
+ #include <kern/sched_prim.h>
++#include <kern/thread.h>
+ #if HIBERNATION
+ #include <machine/pal_hibernate.h>
+ #endif /* HIBERNATION */
+@@ -736,9 +737,27 @@ static volatile uint8_t *klog_data;
+ static uint32_t klog_start, klog_size;
+ static void klog_putc(uint8_t c);
+ 
++/*
++ * Reset into TWRP recovery (Samsung recipe: INFORM2/INFORM3 then PMU
++ * SWRESET). The PMU is mapped here, early, because ml_io_map cannot be
++ * called in panic context. The klog ring above is plain persistent RAM
++ * written straight through the device mapping, so there is nothing to flush.
++ */
++#define S8_PMU_PA               0x16480000
++#define S8_PMU_INFORM2          0x808
++#define S8_PMU_INFORM3          0x80c
++#define S8_PMU_SWRESET          0x400
++static volatile uint8_t *s8_pmu;
++volatile uint64_t s8recov_deadline_abs;     /* s8recov=N: abs time of the reset */
++static volatile uint64_t s8recov_fire;
++static void klog_puts(const char *s);
++__attribute__((noreturn)) void s8_reset_to_recovery(const char *why);
++extern void thread_terminate_self(void);
++
+ static void
+ klog_init(void)
+ {
++	s8_pmu = (volatile uint8_t *)ml_io_map(S8_PMU_PA, 0x1000);
+ 	klog_hdr = (volatile uint32_t *)ml_io_map(A5_KLOG_PHYS, A5_KLOG_SIZE);
+ 	if (klog_hdr == NULL) {
+ 		return;
+@@ -771,6 +790,107 @@ klog_putc(uint8_t c)
+ 	}
+ 	klog_hdr[1] = klog_start;
+ 	klog_hdr[2] = klog_size;
++	/*
++	 * Scheduler-independent fallback for s8recov=N: every console
++	 * character checks the deadline. No locks are taken on this path.
++	 */
++	if (s8recov_deadline_abs != 0 && mach_absolute_time() >= s8recov_deadline_abs) {
++		s8recov_deadline_abs = 0;
++		s8_reset_to_recovery("console timer expired");
++	}
++}
++
++static void
++klog_puts(const char *s)
++{
++	for (; *s; s++) {
++		klog_putc((uint8_t)*s);
++	}
++}
++
++__attribute__((noreturn))
++void
++s8_reset_to_recovery(const char *why)
++{
++	if (s8_pmu != NULL && !s8recov_fire) {
++		s8recov_fire = 1;
++		s8recov_deadline_abs = 0;
++		klog_puts("\nS8RECOV: ");
++		klog_puts(why);
++		klog_puts("\n");
++		__builtin_arm_dsb(DSB_SY);
++		*(volatile uint32_t *)(s8_pmu + S8_PMU_INFORM2) = 0x12345678;
++		*(volatile uint32_t *)(s8_pmu + S8_PMU_INFORM3) = 0x12345674;   /* 'recovery' */
++		__builtin_arm_dsb(DSB_SY);
++		*(volatile uint32_t *)(s8_pmu + S8_PMU_SWRESET) = 1;
++		__builtin_arm_dsb(DSB_SY);
++	}
++	for (;;) {
++		__builtin_arm_wfe();
++	}
++}
++
++static int s8recov_event;
++
++static void
++s8recov_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	for (;;) {
++		uint64_t now = mach_absolute_time();
++		uint64_t dl = s8recov_deadline_abs;
++		if (dl == 0) {
++			thread_terminate_self();
++		}
++		if (now >= dl) {
++			printf("S8RECOV: timer expired\n");
++			s8_reset_to_recovery("timer expired");
++		}
++		uint64_t rem_ns;
++		uint64_t deadline;
++		absolutetime_to_nanoseconds(dl - now, &rem_ns);
++		if (rem_ns > 1000ull * NSEC_PER_MSEC) {
++			rem_ns = 1000ull * NSEC_PER_MSEC;
++		}
++		clock_interval_to_deadline((uint32_t)(rem_ns / NSEC_PER_MSEC) + 1, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&s8recov_event, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++/* Called once from IOKitBSDInitialize (a5xelte block). */
++void
++s8_recov_init(void)
++{
++	uint32_t secs = 0;
++	thread_t thread;
++	if (!PE_parse_boot_argn("s8recov", &secs, sizeof(secs)) || secs == 0) {
++		return;
++	}
++	uint64_t ns = (uint64_t)secs * NSEC_PER_SEC;
++	uint64_t abs;
++	nanoseconds_to_absolutetime(ns, &abs);
++	s8recov_deadline_abs = abs;      /* mach_absolute_time() counts from kernel start */
++	printf("S8RECOV: reset to recovery %u s after kernel start\n", secs);
++	if (kernel_thread_start(s8recov_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("S8RECOV: timer thread start failed (console fallback only)\n");
++	}
++}
++#else
++void s8_reset_to_recovery(const char *why);
++void s8_recov_init(void);
++void
++s8_reset_to_recovery(const char *why)
++{
++	(void)why;
++}
++
++void
++s8_recov_init(void)
++{
+ }
+ #endif
+ 
