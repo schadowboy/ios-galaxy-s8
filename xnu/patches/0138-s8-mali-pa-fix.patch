@@ -1,0 +1,440 @@
+S8 Mali PA-panic fix (0138): buffers are wired kmem_alloc pages (the 0130 self-test recipe) described by a plain kernel-task
+IOGeneralMemoryDescriptor subclass (S8MaliBO) instead of an IOBufferMemoryDescriptor with kIOMapWriteCombineCache; PAs come
+from pmap_find_phys only (checked against the managed RAM range); the program's mapping is the default cacheable one and every
+buffer is cleaned+invalidated by kernel VA before and after each job. Boot-arg s8mali_trace=1 prints the first 200 steps (each
+before the call it names). Also pmap_sync_page_attributes_phys used (pp << PAGE_SHIFT) on a 32 bit ppnum_t (lost bits 32+ of the
+PA, RAM is at 0x880000000): now ptoa(pp).
+
+diff --git a/iokit/Kernel/arm/S8Mali.cpp b/iokit/Kernel/arm/S8Mali.cpp
+--- a/iokit/Kernel/arm/S8Mali.cpp
++++ b/iokit/Kernel/arm/S8Mali.cpp
+@@ -45,6 +45,7 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOMemoryDescriptor.h>
+ #include <mach/vm_param.h>
+ #include <sys/systm.h>
+ 
+@@ -64,6 +65,10 @@
+ bool s8mali_gpu_wait(uint64_t seq, uint64_t timeout_ns);
+ bool s8mali_pa_ok(uint64_t pa, uint64_t len);
+ uint64_t s8mali_kva_pa(vm_offset_t kva);
++bool s8mali_trace_on(void);
++bool s8mali_bo_alloc(uint64_t size, vm_offset_t * kva);
++void s8mali_bo_free(vm_offset_t kva, uint64_t size);
++void s8mali_bo_sync(vm_offset_t kva, uint64_t size);
+ void s8mali_log_bad_pa(uint64_t pa, uint32_t bo, uint64_t off, const char * step);
+ /* osfmk/arm64/caches_asm.s: FlushPoC_DcacheRegion(VIRTUAL address, byte count): dc civac per line; it takes a VA, never a PA */
+ void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+@@ -142,9 +147,10 @@
+ #define MALI_BUFFER_MAX         (256ull << 20)
+ 
+ struct mali_buffer {
+-	IOBufferMemoryDescriptor * memory;
++	IOMemoryDescriptor * memory;            /* an S8MaliBO: owns the kernel memory at `kva` */
+ 	uint64_t address, size;                 /* GPU address; the size the program asked for (page rounded) */
+ 	uint64_t backed;                        /* bytes with memory behind them (less than `size` for a clipped HEAP) */
++	vm_offset_t kva;                        /* the kernel virtual address of that memory */
+ 	uint64_t last_seq;
+ 	uint32_t flags;
+ };
+@@ -166,11 +172,19 @@
+  * rings) rather than IOLog so a line written just before a panic is not lost in the os_log path. Per-page lines
+  * have their own counter (first 12, then every 4096th) so they cannot use up the 40.
+  */
+-static uint32_t gStepN, gStepPage;
+-#define STEP(fmt, ...)  do { uint32_t _n = gStepN++; if (_n < 40 || (_n & 255) == 0) { \
++static uint32_t gStepN, gStepPage, gStepQ;
++/*
++ * boot-arg s8mali_trace=1 (0138): the first 200 STEP lines are printed (then every 256th), per-page lines the first 12 then
++ * every 64th; STEP_Q (GET_PARAM and request entry, which come in dozens) has its own small budget so it cannot use up the
++ * 200 that name the buffer steps. Every STEP sits BEFORE the call it names: the last line on the panic screen is the failing step.
++ */
++#define STEP(fmt, ...)  do { uint32_t _n = gStepN++; if (s8mali_trace_on() ? (_n < 200 || (_n & 255) == 0) : \
++	                         (_n < 40 || (_n & 255) == 0)) { \
+ 	                             printf("S8MALI: step " fmt "\n", ##__VA_ARGS__); } } while (0)
+-#define STEP_PAGE(fmt, ...) do { uint32_t _n = gStepPage++; if (_n < 12 || (_n & 4095) == 0) { \
++#define STEP_PAGE(fmt, ...) do { uint32_t _n = gStepPage++; if (_n < 12 || (_n & (s8mali_trace_on() ? 63 : 4095)) == 0) { \
+ 	                                 printf("S8MALI: step " fmt "\n", ##__VA_ARGS__); } } while (0)
++#define STEP_Q(fmt, ...) do { uint32_t _n = gStepQ++; if (_n < (s8mali_trace_on() ? 48u : 6u)) { \
++	                              printf("S8MALI: step " fmt "\n", ##__VA_ARGS__); } } while (0)
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+@@ -230,6 +244,55 @@
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
++/*
++ * A buffer's memory (0138): wired kernel memory from kmem_alloc described as a plain virtual-range descriptor of the kernel
++ * task. The descriptor owns the memory: it is freed when the LAST reference goes (the program's mapping holds one), so
++ * closing the handle or the connection never pulls pages out from under a mapping that is still alive.
++ */
++class S8MaliBO : public IOGeneralMemoryDescriptor
++{
++	OSDeclareDefaultStructors(S8MaliBO);
++
++	vm_offset_t     fKva;
++	uint64_t        fBytes;
++
++public:
++	bool setup(vm_offset_t kva, uint64_t bytes);
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(S8MaliBO, IOGeneralMemoryDescriptor);
++
++bool
++S8MaliBO::setup(vm_offset_t kva, uint64_t bytes)
++{
++	IOAddressRange range;
++
++	range.address = kva;
++	range.length = bytes;
++	/* not AutoPrepare, no mapper: the pages are wired already and the GPU is given PAs by the driver, not by IOKit */
++	if (!initWithOptions(&range, 1, 0, kernel_task, kIOMemoryTypeVirtual64 | kIODirectionInOut, NULL)) {
++		return false;
++	}
++	fKva = kva;
++	fBytes = bytes;
++	return true;
++}
++
++void
++S8MaliBO::free(void)
++{
++	vm_offset_t kva = fKva;
++	uint64_t bytes = fBytes;
++
++	fKva = 0;
++	IOGeneralMemoryDescriptor::free();
++	if (kva != 0) {
++		STEP("BO free: kmem_free kva=0x%llx bytes=0x%llx", (uint64_t) kva, bytes);
++		s8mali_bo_free(kva, bytes);
++	}
++}
++
+ class S8MaliUserClient : public IOUserClient
+ {
+ 	OSDeclareDefaultStructors(S8MaliUserClient);
+@@ -242,6 +305,7 @@
+ 	struct mali_buffer * buffer(uint32_t handle);
+ 	void freeBuffer(struct mali_buffer * b);
+ 	IOReturn createBO(struct drm_panfrost_create_bo * request);
++	void syncAll(const char * when);
+ 	void closeAll(void);
+ 
+ public:
+@@ -295,15 +359,11 @@
+ 	s8mali_unmap(b->address, b->size, b->backed);
+ 	STEP("freeBuffer unmapped va=0x%llx", b->address);
+ 	/*
+-	 * The buffer is write-combined for the program, but its kernel mapping (and the physical-aperture alias) may still
+-	 * have lines of it; drop them before the pages go back to the allocator, so no stale line is evicted over what a
+-	 * later owner writes.
++	 * The program's mapping is cacheable: clean and invalidate by kernel VA before the pages can go back to the allocator
++	 * (S8MaliBO::free does it once more), so no stale line is evicted over what a later owner writes.
+ 	 */
+-	void * kva = b->memory->getBytesNoCopy();
+-	STEP("freeBuffer kva=0x%llx (flush by VA)", (uint64_t) (uintptr_t) kva);
+-	if (kva != NULL) {
+-		FlushPoC_DcacheRegion((vm_offset_t) kva, (size_t) b->backed);
+-	}
++	STEP("freeBuffer sync by VA kva=0x%llx bytes=0x%llx", (uint64_t) b->kva, b->backed);
++	s8mali_bo_sync(b->kva, b->backed);
+ 	if (allow(&gLogBO, 100)) {
+ 		IOLog("S8MALI: bo free va=0x%llx size=0x%llx\n", b->address, b->size);
+ 	}
+@@ -320,7 +380,7 @@
+ {
+ 	uint64_t size = round_page_64(request->size), backed = size;
+ 	bool heap = (request->flags & PANFROST_BO_HEAP) != 0;
+-	IOBufferMemoryDescriptor * memory;
++	S8MaliBO * memory;
+ 	struct mali_buffer * b = NULL;
+ 	uint64_t address;
+ 
+@@ -350,28 +410,35 @@
+ 		IOLog("S8MALI: no handles left\n");
+ 		return kIOReturnNoSpace;
+ 	}
+-	/* write-combined for the program (what S9+ does): no CPU cache line between the program and the memory the GPU sees */
+-	STEP("createBO handle=%u allocating IOBufferMemoryDescriptor backed=0x%llx", request->handle, backed);
+-	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache, (vm_size_t) backed, PAGE_SIZE);
+-	if (memory == NULL) {
++	/*
++	 * Wired zeroed kernel pages (kmem_alloc), flushed to memory by VA: what the 0130 self test did on the phone. No cache
++	 * mode on the memory: the program's mapping is the default cacheable one and SUBMIT cleans/invalidates the buffers.
++	 */
++	vm_offset_t kva = 0;
++
++	STEP("createBO handle=%u kmem_alloc(0x%llx) next", request->handle, backed);
++	if (!s8mali_bo_alloc(backed, &kva)) {
+ 		IOLog("S8MALI: no memory for a buffer of %llu bytes (backed %llu)\n", size, backed);
+ 		return kIOReturnNoMemory;
+ 	}
+-	void * kva = memory->getBytesNoCopy();
+-
+-	STEP("createBO handle=%u descriptor=0x%llx kva=0x%llx", request->handle, (uint64_t) (uintptr_t) memory,
+-	    (uint64_t) (uintptr_t) kva);
+-	/* zero, then to memory: dirty kernel-side lines must never be evicted over what the GPU or program writes */
+-	if (kva != NULL) {
+-		bzero(kva, (size_t) backed);
+-		FlushPoC_DcacheRegion((vm_offset_t) kva, (size_t) backed);     /* by VA */
++	STEP("createBO handle=%u kva=0x%llx, S8MaliBO init next", request->handle, (uint64_t) kva);
++	memory = OSTypeAlloc(S8MaliBO);
++	if (memory == NULL) {
++		s8mali_bo_free(kva, backed);
++		return kIOReturnNoMemory;
++	}
++	if (!memory->setup(kva, backed)) {
++		memory->release();
++		s8mali_bo_free(kva, backed);
++		IOLog("S8MALI: the descriptor of a buffer of %llu bytes did not initialise\n", size);
++		return kIOReturnNoMemory;
+ 	}
+-	STEP("createBO handle=%u zeroed and flushed by VA", request->handle);
++	STEP("createBO handle=%u descriptor=0x%llx kva=0x%llx, va_alloc next", request->handle, (uint64_t) (uintptr_t) memory,
++	    (uint64_t) kva);
+ 	address = s8mali_va_alloc(size, !(request->flags & PANFROST_BO_NOEXEC));
+ 	if (address == 0) {
+ 		IOLog("S8MALI: no GPU address space for %llu bytes\n", size);
+-		memory->release();
++		memory->release();              /* S8MaliBO::free gives the pages back */
+ 		return kIOReturnNoSpace;
+ 	}
+ 	STEP("createBO handle=%u gpu va=0x%llx, entering pages", request->handle, address);
+@@ -379,31 +446,24 @@
+ 	bool mapped = true;
+ 
+ 	for (uint64_t offset = 0; offset < backed && mapped; offset += 4096) {
+-		IOByteCount length = 0;
+-		addr64_t phys = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
+-		/* ground truth: where the kernel pmap says this wired kernel page really is */
+-		uint64_t vpa = kva != NULL ? s8mali_kva_pa((vm_offset_t) kva + (vm_offset_t) offset) : 0;
+-
+-		STEP_PAGE("createBO bo=%u off=0x%llx getPhysicalSegment=0x%llx len=0x%llx pmap=0x%llx", request->handle, offset,
+-		    (uint64_t) phys, (uint64_t) length, vpa);
+-		if (vpa != 0 && vpa != (uint64_t) phys) {
+-			printf("S8MALI: PA mismatch bo=%u off=0x%llx getPhysicalSegment=0x%llx kernel pmap=0x%llx (using the pmap one)\n",
+-			    request->handle, offset, (uint64_t) phys, vpa);
+-			phys = vpa;
+-		}
+-		if (!s8mali_pa_ok((uint64_t) phys, 4096)) {
+-			s8mali_log_bad_pa((uint64_t) phys, request->handle, offset, "createBO.getPhysicalSegment");
++		/* where the kernel pmap says this wired kernel page really is (never IOMemoryDescriptor::getPhysicalSegment) */
++		uint64_t phys = s8mali_kva_pa(kva + (vm_offset_t) offset);
++
++		STEP_PAGE("createBO bo=%u off=0x%llx pmap=0x%llx", request->handle, offset, phys);
++		if (!s8mali_pa_ok(phys, 4096)) {
++			s8mali_log_bad_pa(phys, request->handle, offset, "createBO.pmap_find_phys");
+ 			mapped = false;
+ 			break;
+ 		}
+ 		mapped = s8mali_map_page(address + offset, phys);
+ 		if (!mapped) {
+ 			printf("S8MALI: map_page failed bo=%u off=0x%llx pa=0x%llx step=createBO.map_page\n", request->handle, offset,
+-			    (uint64_t) phys);
++			    phys);
+ 		}
+ 	}
+ 	if (!mapped) {
+ 		IOLog("S8MALI: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
++		STEP("createBO handle=%u failed, unmapping", request->handle);
+ 		s8mali_unmap(address, size, backed);
+ 		memory->release();
+ 		return kIOReturnNoMemory;
+@@ -412,6 +472,7 @@
+ 	s8mali_maps_done(address, backed);
+ 	STEP("createBO handle=%u done", request->handle);
+ 	b->memory = memory;
++	b->kva = kva;
+ 	b->address = address;
+ 	b->size = size;
+ 	b->backed = backed;
+@@ -425,6 +486,26 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++/* With the lock held: clean + invalidate by kernel VA the memory of every buffer of this client */
++void
++S8MaliUserClient::syncAll(const char * when)
++{
++	uint32_t n = 0;
++
++	for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL) {
++			n++;
++		}
++	}
++	STEP("SUBMIT sync %s: %u buffers", when, n);
++	for (uint32_t i = 0; i < MALI_BUFFERS && n != 0; i++) {
++		if (fBuffers[i].memory != NULL) {
++			s8mali_bo_sync(fBuffers[i].kva, fBuffers[i].backed);
++			n--;
++		}
++	}
++}
++
+ void
+ S8MaliUserClient::closeAll(void)
+ {
+@@ -472,15 +553,17 @@
+ 	struct mali_buffer * b;
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
++	STEP("clientMemoryForType type=%u enter", (unsigned) type);
+ 	IOLockLock(gLock);
+ 	b = buffer(type);
+ 	if (b != NULL) {
+ 		b->memory->retain();
+ 		*memory = b->memory;
+-		*options = 0;   /* the descriptor's own cache mode (write-combine) */
++		*options = 0;   /* the default (cacheable) mapping; SUBMIT cleans and invalidates the buffers around a job */
+ 		ret = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(gLock);
++	STEP("clientMemoryForType type=%u -> 0x%x; the mapping into the program follows", (unsigned) type, (unsigned) ret);
+ 	return ret;
+ }
+ 
+@@ -506,6 +589,7 @@
+ 	(void)dispatch;
+ 	(void)target;
+ 	(void)reference;
++	STEP_Q("externalMethod selector=0x%x in=%zu", selector, size);
+ 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL || gLock == NULL) {
+ 		return kIOReturnBadArgument;
+ 	}
+@@ -536,17 +620,18 @@
+ 	IOLockLock(gLock);
+ 	switch (selector) {
+ 	case kPanfrostGetParam:
+-		STEP("GET_PARAM enter param=%u", r.param.param);
++		STEP_Q("GET_PARAM enter param=%u", r.param.param);
+ 		if (!s8mali_gpu_param(r.param.param, &r.param.value)) {
+ 			ret = kIOReturnBadArgument;
+ 		}
+-		STEP("GET_PARAM param=%u -> ret=0x%x value=0x%llx", r.param.param, (unsigned) ret, r.param.value);
++		STEP_Q("GET_PARAM param=%u -> ret=0x%x value=0x%llx", r.param.param, (unsigned) ret, r.param.value);
+ 		break;
+ 	case kPanfrostCreateBO:
+ 		ret = createBO(&r.create);
+ 		break;
+ 	case kPanfrostMmapBO:                   /* the offset is the handle: the program maps client memory of that type */
+-		ret = buffer(r.mmap.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		STEP("MMAP_BO handle=%u", r.mmap.handle);
++		ret =buffer(r.mmap.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
+ 		r.mmap.offset = (uint64_t) r.mmap.handle << 12;
+ 		break;
+ 	case kPanfrostGetBOOffset:
+@@ -562,9 +647,12 @@
+ 		gSubmits++;
+ 		STEP("SUBMIT enter jc=0x%llx req=0x%x bos=%u", r.submit.jc, r.submit.requirements, r.submit.bo_handle_count);
+ 		if (r.submit.jc != 0) {
+-			/* the CPU wrote the chain through a write-combined mapping: make sure it has left the write buffers */
++			/* cacheable program mappings, non-coherent GPU: clean+invalidate every buffer by kernel VA (data caches are physically
++			 * tagged, so lines dirtied through the program's own mapping are covered) before the job, and again after it */
++			syncAll("before the job");
+ 			__asm__ volatile ("dsb sy" ::: "memory");
+ 			status = s8mali_gpu_submit(r.submit.jc, (r.submit.requirements & PANFROST_JD_REQ_FS) != 0, &seq);
++			syncAll("after the job");
+ 			if (status != 0) {
+ 				/* the GPU was reset; the job is lost. The call still succeeds (Mesa would abort on an error) */
+ 				gFailed++;
+diff --git a/osfmk/kern/s8_mali_drv.c b/osfmk/kern/s8_mali_drv.c
+--- a/osfmk/kern/s8_mali_drv.c
++++ b/osfmk/kern/s8_mali_drv.c
+@@ -172,6 +172,62 @@
+ 	return pn == 0 ? 0 : (((uint64_t)pn << PAGE_SHIFT) | ((uint64_t)kva & PAGE_MASK));
+ }
+ 
++/*
++ * Buffer memory (0138). The IOBufferMemoryDescriptor with kIOMapWriteCombineCache that 0133 used is replaced by what the
++ * 0130 self test did (and what passed on the phone): wired, zeroed pages from kmem_alloc, their PAs from the kernel pmap
++ * (pmap_find_phys), caches maintained by VIRTUAL address (FlushPoC_DcacheRegion). Reason: a write-combine IOBMD makes
++ * mach_make_memory_entry change the WIMG mode of the VM object behind the buffer, and for kernel memory that object is the
++ * shared kernel object: vm_object_change_wimg_mode -> pmap_set_cache_attributes on EVERY resident page of it ->
++ * pmap_sync_wimg -> pmap_sync_page_attributes_phys -> flush_dcache(phys) -> phystokv_range, which panics for a PA it does
++ * not map. The program's mapping is the cacheable default one; S8Mali.cpp cleans and invalidates the buffers around each job.
++ */
++static bool g_trace;
++bool s8mali_trace_on(void);
++bool
++s8mali_trace_on(void)
++{
++	return g_trace;
++}
++
++bool s8mali_bo_alloc(uint64_t size, vm_offset_t *kva);
++bool
++s8mali_bo_alloc(uint64_t size, vm_offset_t *kva)
++{
++	vm_offset_t va = 0;
++
++	if (size == 0 || (size & PAGE_MASK) != 0) {
++		return false;
++	}
++	if (kmem_alloc(kernel_map, &va, (vm_size_t)size, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS ||
++	    va == 0) {
++		return false;
++	}
++	/* zeroes to memory: no dirty kernel-side line may be evicted later over what the GPU or the program writes */
++	FlushPoC_DcacheRegion(va, (size_t)size);
++	*kva = va;
++	return true;
++}
++
++void s8mali_bo_free(vm_offset_t kva, uint64_t size);
++void
++s8mali_bo_free(vm_offset_t kva, uint64_t size)
++{
++	if (kva != 0) {
++		FlushPoC_DcacheRegion(kva, (size_t)size);
++		kmem_free(kernel_map, kva, (vm_size_t)size);
++	}
++}
++
++/* clean + invalidate by kernel VA: data caches are physically tagged, so this also covers lines the program dirtied through its own mapping */
++void s8mali_bo_sync(vm_offset_t kva, uint64_t size);
++void
++s8mali_bo_sync(vm_offset_t kva, uint64_t size)
++{
++	if (kva != 0 && size != 0) {
++		FlushPoC_DcacheRegion(kva, (size_t)size);
++	}
++}
++
+ void s8mali_log_bad_pa(uint64_t pa, uint32_t bo, uint64_t off, const char *step);
+ void
+ s8mali_log_bad_pa(uint64_t pa, uint32_t bo, uint64_t off, const char *step)
+@@ -804,6 +860,14 @@
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("s8mali_heap_mb", &g_heap_mb, sizeof(g_heap_mb));
++	{
++		uint32_t tr = 0;
++
++		g_trace = PE_parse_boot_argn("s8mali_trace", &tr, sizeof(tr)) && tr != 0;
++		if (g_trace) {
++			P("s8mali_trace=1: the first 200 steps are printed, every one before the call it names");
++		}
++	}
+ 	if (g_heap_mb < 4 || g_heap_mb > 128) {
+ 		g_heap_mb = 64;
+ 	}
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6901,7 +6901,8 @@
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	/* ptoa(): pp is a 32 bit ppnum_t, pp << PAGE_SHIFT would drop every physical address bit above bit 31 (RAM is at 0x880000000) */
++	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP
