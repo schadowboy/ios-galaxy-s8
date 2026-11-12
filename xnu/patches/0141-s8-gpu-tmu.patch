@@ -1,0 +1,85 @@
+Subject: [PATCH] 0141 GPU temperature read (second TMU block), boot-arg s8gputmu
+
+Reads the GPU sensor (DT tmuctrl_2, 0x10084000 sensor 0) with the same calibration as the CPU block and logs
+'S8DVFS: gpu temp=' about every 10 s. Log only (no throttling from it). Off unless s8gputmu=1: the block's
+clock/power is unproven.
+---
+diff --git a/osfmk/kern/s8_acpm.c b/osfmk/kern/s8_acpm.c
+index 92f4a50..9b939f1 100644
+--- a/osfmk/kern/s8_acpm.c
++++ b/osfmk/kern/s8_acpm.c
+@@ -422,6 +422,52 @@ s8t_read_max(uint32_t *rawmax)
+ 	return best;
+ }
+ 
++/*
++ * GPU temperature: second TMU block (DT tmuctrl_2, 0x10084000, GPU = sensor 0 of the block; ISP sensors 1,2 are in the
++ * same block), same register layout and calibration as the CPU block (analysis/tmu-gpu-sensors.md). Read only: nothing
++ * is throttled from it until a real reading has shown the block runs. -1000 = no valid code.
++ */
++#define S8T_GPU_PA      0x10084000UL
++static volatile uint8_t *s8t_gpu_base;
++static bool s8t_gpu_logged;
++
++static int
++s8t_gpu_read(uint32_t *rawp)
++{
++	uint32_t tri, e1, e2, two, code;
++	int temp;
++
++	if (s8t_gpu_base == NULL) {
++		s8t_gpu_base = (volatile uint8_t *)ml_io_map(S8T_GPU_PA, 0x1000);
++		if (s8t_gpu_base == NULL) {
++			return -1000;
++		}
++	}
++	tri = *(volatile uint32_t *)(s8t_gpu_base + 0x0);
++	two = (tri >> 23) & 1;
++	e1 = tri & 0x1ff;
++	e2 = (tri >> 9) & 0x1ff;
++	code = *(volatile uint32_t *)(s8t_gpu_base + 0x40) & 0x1ff;
++	if (!s8t_gpu_logged) {
++		printf("S8DVFS: gpu tmu trim=0x%x e1=%u e2=%u code=%u two_point=%u CONTROL=0x%x STATUS=0x%x\n", tri, e1, e2, code, two,
++		    *(volatile uint32_t *)(s8t_gpu_base + 0x20), *(volatile uint32_t *)(s8t_gpu_base + 0x28));
++		s8t_gpu_logged = true;
++	}
++	*rawp = code;
++	if (!e1) {
++		e1 = 0x37;
++	}
++	if (code == 0 || code == 0x1ff) {
++		return -1000;
++	}
++	if (two && e2 > e1) {
++		temp = ((int)code - (int)e1) * (85 - 25) / ((int)e2 - (int)e1) + 25;
++	} else {
++		temp = (int)code - (int)e1 + 25;
++	}
++	return temp;
++}
++
+ /* ---------------------------------------------------------------- governor */
+ 
+ #define S8G_FLOOR_IDX   7       /* 598 MHz: lowest load-driven step */
+@@ -554,6 +600,21 @@ s8g_thread(void *arg, wait_result_t result)
+ 			}
+ 		}
+ 
++		/* GPU temperature, log only, about every 10 s at the default 500 ms interval */
++		{
++			static uint32_t gcnt, gon = 2;
++			if (gon == 2) {
++				uint32_t v = 0;
++				/* boot-arg s8gputmu=1: read the GPU TMU block (its clock/power is unproven: off by default) */
++				gon = PE_parse_boot_argn("s8gputmu", &v, sizeof(v)) && v != 0;
++			}
++			if (gon && !s8g_therm_off && (gcnt++ % 20) == 0) {
++				uint32_t graw = 0;
++				int gt = s8t_gpu_read(&graw);
++				printf("S8DVFS: gpu temp=%d C raw=%u\n", gt, graw);
++			}
++		}
++
+ 		/* load */
+ 		want = cur;
+ 		if (load > S8G_UP_PCT) {
