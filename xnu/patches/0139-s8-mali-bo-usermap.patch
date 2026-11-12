@@ -1,0 +1,68 @@
+S8 Mali BO user mapping (0139): BO memory is no longer kernel_object.
+
+0138 allocated buffers with kmem_alloc(KMA_KOBJECT...). IOConnectMapMemory64 -> clientMemoryForType -> createMappingInTask
+builds a named entry from kernel_map (mach_make_memory_entry_internal -> vm_map_copy_extract -> vm_map_remap_extract), and
+vm_map.c refuses any entry whose object is kernel_object ("rejecting attempt to extract from kernel_object"), so every
+mapping failed. Now the pages are an anonymous VM object (KMA_PAGEABLE) wired with vm_map_wire_kernel: stable PAs for the
+Mali page tables, mappable into the program, released with vm_map_unwire + kmem_free when the last descriptor reference goes.
+The << PAGE_SHIFT audit of pmap.c / IOMemoryDescriptor.cpp / osfmk/vm found no further reachable 32 bit shifts (all cast to
+a 64 bit type first).
+
+diff --git a/osfmk/kern/s8_mali_drv.c b/osfmk/kern/s8_mali_drv.c
+--- a/osfmk/kern/s8_mali_drv.c
++++ b/osfmk/kern/s8_mali_drv.c
+@@ -194,15 +194,39 @@
+ s8mali_bo_alloc(uint64_t size, vm_offset_t *kva)
+ {
+ 	vm_offset_t va = 0;
++	kern_return_t kr;
+ 
+ 	if (size == 0 || (size & PAGE_MASK) != 0) {
+ 		return false;
+ 	}
+-	if (kmem_alloc(kernel_map, &va, (vm_size_t)size, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS ||
+-	    va == 0) {
++	/*
++	 * 0139: NOT kernel_object. vm_map_remap_extract (osfmk/vm/vm_map.c, "rejecting attempt to extract from kernel_object")
++	 * refuses to hand kernel_object pages to a memory entry that user space maps, so a KMA_KOBJECT buffer can never be
++	 * mapped by IOConnectMapMemory64. KMA_PAGEABLE gives a fresh anonymous VM object (vm_kern.c kmem_alloc_guard:
++	 * vm_object_allocate, not kernel_object); vm_map_wire_kernel then faults every page in and wires it, so the physical
++	 * addresses are stable until the unwire in s8mali_bo_free. The object is shareable: the kernel-task IOMemoryDescriptor
++	 * builds its named entry from it (mach_make_memory_entry_internal -> vm_map_copy_extract, allowed for this object).
++	 */
++	if (s8mali_trace_on()) {
++		printf("S8MALI: step bo_alloc kmem_alloc(PAGEABLE) size=0x%llx next\n", size);
++	}
++	kr = kmem_alloc(kernel_map, &va, (vm_size_t)size, KMA_PAGEABLE | KMA_DATA, VM_KERN_MEMORY_DIAG);
++	if (kr != KERN_SUCCESS || va == 0) {
++		printf("S8MALI: bo_alloc kmem_alloc(PAGEABLE) failed kr=%d\n", kr);
++		return false;
++	}
++	if (s8mali_trace_on()) {
++		printf("S8MALI: step bo_alloc kva=0x%llx vm_map_wire_kernel next\n", (uint64_t)va);
++	}
++	kr = vm_map_wire_kernel(kernel_map, va, va + size, VM_PROT_DEFAULT, VM_KERN_MEMORY_DIAG, FALSE);
++	if (kr != KERN_SUCCESS) {
++		printf("S8MALI: bo_alloc vm_map_wire_kernel failed kr=%d\n", kr);
++		kmem_free(kernel_map, va, (vm_size_t)size);
+ 		return false;
+ 	}
+-	/* zeroes to memory: no dirty kernel-side line may be evicted later over what the GPU or the program writes */
++	/* fresh pages are zero-filled by the VM; make sure, and push the zeroes to memory: no dirty kernel-side line may be
++	 * evicted later over what the GPU or the program writes */
++	bzero((void *)va, (size_t)size);
+ 	FlushPoC_DcacheRegion(va, (size_t)size);
+ 	*kva = va;
+ 	return true;
+@@ -214,6 +238,11 @@
+ {
+ 	if (kva != 0) {
+ 		FlushPoC_DcacheRegion(kva, (size_t)size);
++		if (s8mali_trace_on()) {
++			printf("S8MALI: step bo_free vm_map_unwire + kmem_free kva=0x%llx next\n", (uint64_t)kva);
++		}
++		/* wired by s8mali_bo_alloc (kernel wire, not user wire); the Mali tables are unmapped by the caller already */
++		(void)vm_map_unwire(kernel_map, kva, kva + size, FALSE);
+ 		kmem_free(kernel_map, kva, (vm_size_t)size);
+ 	}
+ }
