@@ -1,0 +1,109 @@
+S8 panic screen (0137): print the S8PANIC lines on the screen/serial console via consdebug_putc_unbuffered
+(same sink as paniclog_append_noflush), 4 frames per backtrace line, boot-arg s8panicwait=<s> busy-wait before reset.
+
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1098,6 +1098,33 @@
+ static unsigned s8p_len;
+ static char s8p_line[320];
+ static uintptr_t s8p_bt[S8P_MAX_FRAMES + 2];
++static unsigned s8p_col;
++
++/*
++ * Patch 0137: every S8PANIC line also goes to the screen / serial console. Function chosen: the character sink
++ * consdebug_putc_unbuffered() (osfmk/kern/printf.c), the very one paniclog_append_noflush() hands to _doprnt_log()
++ * for the "Please go to https://panic.apple.com ..." text and the panic log body that the stock path shows on the
++ * screen. It calls console_write_unbuffered() -> _cnputc(c, true), which bypasses the console ring and the console
++ * lock (documented as "bypasses all of the synchronization"; worst case is interleaved text from another CPU, but
++ * the other CPUs are stopped), then debug_putc() (appends to the panic log buffer, no lock) and PE_kputc() for
++ * non-serial consoles. We call it per character (own column counter, wrap at 98 columns) instead of through
++ * paniclog_append_noflush() so no vararg formatting, no paniclog_flush() and no allocation happens here.
++ */
++static void
++s8p_out(const char *s)
++{
++	s8_panic_puts(s);
++	for (; *s != '\0'; s++) {
++		if (*s == '\n') {
++			s8p_col = 0;
++		} else if (++s8p_col > 98) {
++			consdebug_putc_unbuffered('\n');
++			s8p_col = 1;
++		}
++		consdebug_putc_unbuffered(*s);
++	}
++}
++#define s8_panic_puts s8p_out   /* from here on every s8_panic_puts() in this file also prints to the screen */
+ 
+ static void
+ s8p_bufc(char c)
+@@ -1160,7 +1187,11 @@
+ 	}
+ 	while (i < n) {
+ 		len = snprintf(s8p_line, sizeof(s8p_line), "S8PANIC: %s", tag);
+-		while (i < n && len < 170) {
++		unsigned k = 0;
++
++		/* 4 frames per line: "S8PANIC: bt" + 4 * 19 characters = 87 columns */
++		while (i < n && k < 4) {
++			k++;
+ 			len += snprintf(s8p_line + len, sizeof(s8p_line) - (size_t)len, " 0x%lx", (unsigned long)bt[i]);
+ 			i++;
+ 		}
+@@ -1183,11 +1214,12 @@
+ 		return;
+ 	}
+ 	snprintf(s8p_line, sizeof(s8p_line),
+-	    "S8PANIC: %s esr=0x%x far=0x%llx pc=0x%llx lr=0x%llx fp=0x%llx sp=0x%llx cpsr=0x%x\n", tag,
++	    "S8PANIC: %s esr=0x%x far=0x%llx cpsr=0x%x\nS8PANIC: %s pc=0x%llx lr=0x%llx\n"
++	    "S8PANIC: %s fp=0x%llx sp=0x%llx\n", tag,
+ 	    (unsigned)get_saved_state_esr(ss), (unsigned long long)get_saved_state_far(ss),
+-	    (unsigned long long)get_saved_state_pc(ss), (unsigned long long)get_saved_state_lr(ss),
+-	    (unsigned long long)get_saved_state_fp(ss), (unsigned long long)get_saved_state_sp(ss),
+-	    (unsigned)get_saved_state_cpsr(ss));
++	    (unsigned)get_saved_state_cpsr(ss), tag,
++	    (unsigned long long)get_saved_state_pc(ss), (unsigned long long)get_saved_state_lr(ss), tag,
++	    (unsigned long long)get_saved_state_fp(ss), (unsigned long long)get_saved_state_sp(ss));
+ 	s8_panic_puts(s8p_line);
+ 	s8p_bt[0] = (uintptr_t)get_saved_state_pc(ss);
+ 	s8p_bt[1] = (uintptr_t)get_saved_state_lr(ss);
+@@ -1272,9 +1304,9 @@
+ 		}
+ 	}
+ 	snprintf(s8p_line, sizeof(s8p_line),
+-	    "S8PANIC: cpu=%u mpidr=0x%x thread=0x%llx task=%s pid=%d caller=0x%lx ctx=0x%llx\n",
+-	    (unsigned)(cpu & 0xff), (unsigned)cpu, (unsigned long long)(uintptr_t)th,
+-	    pname[0] != '\0' ? pname : "?", pid, caller, (unsigned long long)(uintptr_t)ctx);
++	    "S8PANIC: cpu=%u mpidr=0x%x task=%s pid=%d\nS8PANIC: thread=0x%llx caller=0x%lx ctx=0x%llx\n",
++	    (unsigned)(cpu & 0xff), (unsigned)cpu, pname[0] != '\0' ? pname : "?", pid,
++	    (unsigned long long)(uintptr_t)th, caller, (unsigned long long)(uintptr_t)ctx);
+ 	s8_panic_puts(s8p_line);
+ 
+ 	/* 2. backtrace of the panicking thread: frames after this one's own */
+@@ -1293,8 +1325,24 @@
+ 	s8_panic_puts("S8PANIC: flushing the log to USERDATA\n");
+ 	(void)sweet_log_panic_flush(S8P_FLUSH_MS);
+ 
+-	/* 4. reset into recovery */
++	/* 4. reset into recovery (patch 0137: optionally after boot-arg s8panicwait=<s> seconds of busy-wait) */
+ 	if (!s8p_noreset) {
++		uint32_t waits = 0;
++
++		if (PE_parse_boot_argn("s8panicwait", &waits, sizeof(waits)) && waits != 0) {
++			uint64_t t0, ticks, i, bound;
++
++			if (waits > 3600) {
++				waits = 3600;
++			}
++			snprintf(s8p_line, sizeof(s8p_line), "S8PANIC: resetting in %u s\n", (unsigned)waits);
++			s8_panic_puts(s8p_line);
++			nanoseconds_to_absolutetime((uint64_t)waits * NSEC_PER_SEC, &ticks);
++			bound = (uint64_t)waits * 400000000ULL;   /* never longer than ~ the intended time even if the timer is stuck */
++			t0 = mach_absolute_time();
++			for (i = 0; i < bound && mach_absolute_time() - t0 < ticks; i++) {
++			}
++		}
+ 		s8_panic_puts("S8PANIC: resetting into recovery\n");
+ 		if (s8_panic_reset_ready()) {
+ 			s8_reset_to_recovery("panic");
