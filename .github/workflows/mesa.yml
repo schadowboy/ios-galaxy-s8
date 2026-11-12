@@ -1,0 +1,67 @@
+name: mesa
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_labels:
+        description: 'runs-on labels as JSON, e.g. ["self-hosted","macOS","X64"] (default hosted macos-15)'
+        default: '["macos-15"]'
+  push:
+    branches: [s8-dreamlte]
+    paths:
+      - "userland/mesa/**"
+      - ".github/workflows/mesa.yml"
+
+concurrency:
+  group: mesa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ${{ fromJSON(inputs.runner_labels || '["macos-15"]') }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app /Applications/Xcode.app 2>/dev/null | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR="$XC/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Host tools
+        run: |
+          brew install bison flex ninja pkg-config
+          "$(brew --prefix bison)/bin/bison" --version | head -1
+
+      - name: Get ldid
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ldid"
+          if [ "$(uname -m)" = arm64 ]; then PAT='ldid_macosx_arm64'; else PAT='ldid_macosx_x86_64'; fi
+          gh release download -R ProcursusTeam/ldid --pattern "$PAT" -D "$RUNNER_TEMP/ldid" --clobber
+          mv "$RUNNER_TEMP/ldid/$PAT" "$RUNNER_TEMP/ldid/ldid"
+          chmod +x "$RUNNER_TEMP/ldid/ldid"
+          echo "LDID=$RUNNER_TEMP/ldid/ldid" >> "$GITHUB_ENV"
+
+      - name: Build Mesa
+        run: bash userland/mesa/build-mesa.sh "$PWD/mesa-out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mesa-ios-arm64
+          path: mesa-out/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: mesa-logs
+          path: |
+            userland/mesa/work/meson-setup.log
+            userland/mesa/work/ninja.log
+            userland/mesa/work/build/meson-logs/meson-log.txt
+          if-no-files-found: ignore

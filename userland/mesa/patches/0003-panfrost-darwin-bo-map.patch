@@ -1,0 +1,42 @@
+diff --git a/src/gallium/drivers/panfrost/pan_bo.c b/src/gallium/drivers/panfrost/pan_bo.c
+index 712987e..8c228b3 100644
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -355,10 +355,16 @@ panfrost_bo_munmap(struct panfrost_bo *bo)
+    if (!bo->ptr.cpu)
+       return;
+ 
++#ifdef __APPLE__
++   /* mapped by the kernel driver through the drm stand-in (src/s8-drm) */
++   hakios_drm_unmap(panfrost_device_fd(bo->dev), panfrost_bo_handle(bo),
++                    bo->ptr.cpu);
++#else
+    if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {
+       mesa_loge("munmap failed: %s", strerror(errno));
+       abort();
+    }
++#endif
+ 
+    bo->ptr.cpu = NULL;
+ }
+diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
+index 8b809d4..7ffebd3 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -615,8 +615,16 @@ pan_kmod_bo_mmap(struct pan_kmod_bo *bo, off_t bo_offset, size_t size, int prot,
+    if (mmap_offset < 0)
+       return MAP_FAILED;
+ 
++#ifdef __APPLE__
++   /* no mmap() on a device node here: the kernel driver maps the whole BO through
++    * the drm stand-in (src/s8-drm), which is what panfrost asks for */
++   host_addr = bo_offset == 0 && size == bo->size
++                  ? hakios_drm_map(bo->dev->fd, bo->handle, size)
++                  : MAP_FAILED;
++#else
+    host_addr = os_mmap(host_addr, size, prot, flags, bo->dev->fd,
+                        mmap_offset + bo_offset);
++#endif
+    if (host_addr == MAP_FAILED) {
+       mesa_loge("mmap(..., size=%zu, prot=%d, flags=0x%x) failed: %s",
+                 size, prot, flags, strerror(errno));
