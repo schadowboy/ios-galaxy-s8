@@ -53,3 +53,12 @@ jobs:
           name: userland-s8mali
           path: out/
           if-no-files-found: error
+
+      - name: Build and sign libhook_log
+        run: bash userland/hook/build-hook.sh "$PWD/out-hook"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: userland-hook
+          path: out-hook/
+          if-no-files-found: error
