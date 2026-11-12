@@ -1,0 +1,690 @@
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 5f9dc74..0e2f5ee 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -75,6 +75,7 @@ extern void s8_recov_init(void);
+ extern void s8prof_init(void);
+ extern void s8mali_init(void);
+ extern void s8mali_drv_init(void);
++extern void s8dvfs_init(void);
+ #endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -780,6 +781,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	s8prof_init();
+ 	s8mali_init();
+ 	s8mali_drv_init();
++	s8dvfs_init();
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
+ 	{
+diff --git a/osfmk/conf/files b/osfmk/conf/files
+index 09b41a9..10fac5b 100644
+--- a/osfmk/conf/files
++++ b/osfmk/conf/files
+@@ -198,6 +198,7 @@ osfmk/kern/zalloc_bounds.c	standard bound-checks
+ osfmk/kern/bsd_kern.c		optional mach_bsd
+ osfmk/kern/s8_mali.c		standard
+ osfmk/kern/s8_mali_drv.c	standard
++osfmk/kern/s8_acpm.c		standard
+ osfmk/kern/hibernate.c		optional hibernation
+ osfmk/kern/remote_time.c        standard
+ osfmk/kern/memset_s.c		standard
+diff --git a/osfmk/kern/s8_acpm.c b/osfmk/kern/s8_acpm.c
+new file mode 100644
+index 0000000..eb0f75f
+--- /dev/null
++++ b/osfmk/kern/s8_acpm.c
+@@ -0,0 +1,652 @@
++/*
++ * S8 (Exynos 8895) runtime DVFS + thermal protection.
++ *
++ *  (1) ACPM client: talks to the APM (Cortex-M power management firmware) over the ACPM IPC, polling only.
++ *      A faithful port of the queue branch of acpm_send() in the bare-metal loader (shim/dreamlte/acpm.c):
++ *        AP2APM mailbox 0x16440000 (INTGR0 +0x08 doorbell, INTCR1 +0x20, INTSR1 +0x28)
++ *        APM SRAM 0x16500000 (0xB400 bytes), struct acpm_framework at SRAM + 0x2850, u32[2] = ipc_channels offset,
++ *        u32[6] = ipc_ap_max; channel entry = 72 bytes (id @0, type @12, queue fields from +16, ap_poll @68).
++ *      AP->APM message: write the 16-byte element at tx_base + size*front, front = (front+1) % len, doorbell
++ *      INTGR0 = (1 << id) << 16, cmd[0] |= seq << 16 (seq 1..63). Reply: element in the APM->AP queue whose
++ *      (word0 >> 16) & 0x3f == seq; it is dequeued as Linux does (the element at 'rear' is moved into its slot,
++ *      rear++, INTCR1 acked when the queue became empty).
++ *      The channel is never initialised here: the queue pointers are read from the live SRAM state the loader
++ *      left behind, so the exchange simply continues from them.
++ *      DVFS request (channel 0, plugin 4): { domain, rate_kHz, FREQ_REQ = 0, 0 }, reply word1 = rate.
++ *
++ *  (2) TMU reader (Exynos 8895 "exynos8895-tmu", CPU sensors at 0x10080000), calibration as in Samsung's
++ *      drivers/thermal/samsung/exynos_tmu.c (code_to_temp_with_sensorinfo).
++ *
++ *  (3) Governor thread (boot-arg s8dvfs=1): A53 cluster (domain 3) frequency from CPU load, with thermal caps.
++ *
++ * Every line printed starts with "S8ACPM:" or "S8DVFS:".
++ */
++#include <mach/mach_types.h>
++#include <mach/kern_return.h>
++#include <kern/kern_types.h>
++#include <kern/thread.h>
++#include <kern/processor.h>
++#include <kern/recount.h>
++#include <kern/sched.h>
++#include <kern/sched_prim.h>
++#include <kern/clock.h>
++#include <kern/misc_protos.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++#include <stdint.h>
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++__attribute__((noreturn)) extern void s8_reset_to_recovery(const char *why);
++
++/* ---------------------------------------------------------------- ACPM client */
++
++#define S8A_MBOX_PA     0x16440000UL
++#define S8A_SRAM_PA     0x16500000UL
++#define S8A_SRAM_SZ     0xB400UL
++#define S8A_INITDATA    0x2850UL
++#define S8A_INTGR0      0x08
++#define S8A_INTCR1      0x20
++#define S8A_INTSR1      0x28
++#define S8A_SEQ_SHIFT   16
++#define S8A_TMO_MS      250
++#define S8A_SEQ_FIRST   40      /* the loader used seq 1..~10 on this channel; stay clear of any stale reply */
++#define S8A_DVFS_CH     0       /* boot-arg dvfsch=0 in the loader: queue channel 0 */
++
++#define S8A_ERR_INVAL   (-22)
++
++static LCK_GRP_DECLARE(s8a_lck_grp, "s8acpm");
++static LCK_MTX_DECLARE(s8a_lock, &s8a_lck_grp);
++
++static volatile uint8_t *s8a_mbox;
++static volatile uint8_t *s8a_sram;
++static uint32_t s8a_seq = S8A_SEQ_FIRST - 1;
++static bool s8a_first_done;
++static bool s8a_stale_possible;
++static uint32_t s8a_dvfs_ch = S8A_DVFS_CH;
++
++struct s8a_chan {
++	uint32_t id, type, len, size, ap_poll;
++	uint32_t tx_rear, tx_front, tx_base;    /* AP -> APM (APM's rx_*) */
++	uint32_t rx_rear, rx_front, rx_base;    /* APM -> AP (APM's tx_*) */
++};
++
++static inline uint32_t
++s8a_sram_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(s8a_sram + off);
++}
++
++static inline void
++s8a_sram_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(s8a_sram + off) = v;
++}
++
++static inline uint32_t
++s8a_mbox_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(s8a_mbox + off);
++}
++
++static inline void
++s8a_mbox_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(s8a_mbox + off) = v;
++}
++
++static int
++s8a_ok_off(uint32_t off, uint32_t len)
++{
++	return !(off & 3) && off < S8A_SRAM_SZ && len <= S8A_SRAM_SZ - off;
++}
++
++/* Parse channel table entry i (same checks as the loader's get_chan). */
++static int
++s8a_get_chan(uint32_t i, struct s8a_chan *c)
++{
++	uint32_t tab = s8a_sram_rd(S8A_INITDATA + 8);
++	uint32_t base;
++
++	if (!s8a_ok_off(tab, 72 * (i + 1))) {
++		return -1;
++	}
++	base = tab + 72 * i;
++	c->id = s8a_sram_rd(base + 0);
++	c->type = s8a_sram_rd(base + 12);
++	c->rx_rear = s8a_sram_rd(base + 16 + 24);
++	c->rx_front = s8a_sram_rd(base + 16 + 28);
++	c->rx_base = s8a_sram_rd(base + 16 + 32);
++	c->len = s8a_sram_rd(base + 16 + 36);
++	c->size = s8a_sram_rd(base + 16 + 40);
++	c->tx_rear = s8a_sram_rd(base + 16 + 0);
++	c->tx_front = s8a_sram_rd(base + 16 + 4);
++	c->tx_base = s8a_sram_rd(base + 16 + 8);
++	c->ap_poll = s8a_sram_rd(base + 68);
++	if (!c->len || c->len > 64 || c->size < 16 || c->size > 64 || (c->size & 3) ||
++	    !s8a_ok_off(c->tx_rear, 4) || !s8a_ok_off(c->tx_front, 4) ||
++	    !s8a_ok_off(c->rx_rear, 4) || !s8a_ok_off(c->rx_front, 4) ||
++	    !s8a_ok_off(c->tx_base, c->len * c->size) || !s8a_ok_off(c->rx_base, c->len * c->size)) {
++		return -2;
++	}
++	return 0;
++}
++
++static void
++s8a_log_ptrs(const char *tag, const struct s8a_chan *c)
++{
++	printf("S8ACPM: %s ch=%u txF=%u txR=%u rxF=%u rxR=%u len=%u INTSR1=0x%x\n", tag, c->id,
++	    s8a_sram_rd(c->tx_front), s8a_sram_rd(c->tx_rear), s8a_sram_rd(c->rx_front),
++	    s8a_sram_rd(c->rx_rear), c->len, s8a_mbox_rd(S8A_INTSR1));
++}
++
++static int
++s8a_map(void)
++{
++	if (s8a_sram != NULL && s8a_mbox != NULL) {
++		return 0;
++	}
++	s8a_mbox = (volatile uint8_t *)ml_io_map(S8A_MBOX_PA, 0x1000);
++	s8a_sram = (volatile uint8_t *)ml_io_map(S8A_SRAM_PA, 0x10000);
++	if (s8a_mbox == NULL || s8a_sram == NULL) {
++		printf("S8ACPM: ml_io_map failed\n");
++		s8a_mbox = NULL;
++		s8a_sram = NULL;
++		return -1;
++	}
++	return 0;
++}
++
++/* Called with s8a_lock held. Queue-type channels only. 0 = reply in cmd[]. */
++static int
++s8a_send(uint32_t chan_id, uint32_t cmd[4], uint32_t timeout_ms, bool verbose)
++{
++	uint32_t i, n, w, seq;
++	struct s8a_chan c;
++	int found = 0;
++
++	if (s8a_map()) {
++		return -9;
++	}
++	n = s8a_sram_rd(S8A_INITDATA + 24);
++	if (n > 16) {
++		n = 16;
++	}
++	for (i = 0; i < n; i++) {
++		if (s8a_get_chan(i, &c)) {
++			continue;
++		}
++		if (c.id == chan_id) {
++			found = 1;
++			break;
++		}
++	}
++	if (!found) {
++		return -10;
++	}
++	if (c.type == 2) {
++		return S8A_ERR_INVAL;   /* TYPE_BUFFER channels are not handled here */
++	}
++
++	uint32_t front = s8a_sram_rd(c.tx_front), rear = s8a_sram_rd(c.tx_rear);
++	uint32_t next = (front + 1) % c.len;
++
++	if (verbose) {
++		s8a_log_ptrs("before", &c);
++	}
++	if (front >= c.len || rear >= c.len) {
++		return -11;
++	}
++	if (next == rear) {
++		return -12;     /* queue full */
++	}
++
++	if (s8a_stale_possible) {
++		/* an earlier exchange timed out: its late reply may sit in the APM->AP queue. Drop what is queued now. */
++		uint32_t f = s8a_sram_rd(c.rx_front), r = s8a_sram_rd(c.rx_rear);
++		if (f < c.len && r < c.len && f != r) {
++			printf("S8ACPM: dropping stale rx entries rear=%u front=%u\n", r, f);
++			s8a_sram_wr(c.rx_rear, f);
++			s8a_mbox_wr(S8A_INTCR1, 1u << c.id);
++		}
++		s8a_stale_possible = false;
++	}
++
++	if (++s8a_seq >= 64) {
++		s8a_seq = S8A_SEQ_FIRST;
++	}
++	seq = s8a_seq;
++	cmd[0] |= seq << S8A_SEQ_SHIFT;
++	uint32_t slot = c.tx_base + c.size * front;
++	for (w = 0; w < c.size / 4; w++) {
++		s8a_sram_wr(slot + 4 * w, w < 4 ? cmd[w] : 0);
++	}
++	__builtin_arm_dsb(DSB_SY);
++	s8a_sram_wr(c.tx_front, next);
++	__builtin_arm_dsb(DSB_SY);
++	s8a_mbox_wr(S8A_INTGR0, (1u << c.id) << 16);
++	__builtin_arm_dsb(DSB_SY);
++
++	uint64_t now = mach_absolute_time(), end;
++	clock_interval_to_absolutetime_interval(timeout_ms, NSEC_PER_MSEC, &end);
++	end += now;
++	while (mach_absolute_time() < end) {
++		uint32_t f = s8a_sram_rd(c.rx_front), r = s8a_sram_rd(c.rx_rear), k;
++		if (f >= c.len || r >= c.len) {
++			return -13;
++		}
++		for (k = r; k != f; k = (k + 1) % c.len) {
++			uint32_t e = c.rx_base + c.size * k;
++			if (((s8a_sram_rd(e) >> S8A_SEQ_SHIFT) & 0x3f) == seq) {
++				for (w = 0; w < 4; w++) {
++					cmd[w] = s8a_sram_rd(e + 4 * w);
++				}
++				if (k != r) {
++					uint32_t er = c.rx_base + c.size * r;
++					for (w = 0; w < c.size / 4; w++) {
++						s8a_sram_wr(e + 4 * w, s8a_sram_rd(er + 4 * w));
++					}
++				}
++				r = (r + 1) % c.len;
++				s8a_sram_wr(c.rx_rear, r);
++				if (r == s8a_sram_rd(c.rx_front)) {
++					s8a_mbox_wr(S8A_INTCR1, 1u << c.id);
++				}
++				if (verbose) {
++					s8a_log_ptrs("after", &c);
++				}
++				return 0;
++			}
++		}
++		delay(10);
++	}
++	if (verbose) {
++		s8a_log_ptrs("TIMEOUT after", &c);
++	}
++	s8a_stale_possible = true;
++	return -14;
++}
++
++/*
++ * Request 'khz' for DVFS domain 'domain' (only domain 3 = CPUCL1/A53, and only rates of its OPP table <= 1690 MHz).
++ * *resp (may be NULL) receives reply word1 (the rate the APM echoes). 0 = APM replied; negative = failure.
++ */
++static const uint32_t s8dvfs_opp[] = { 1690000, 1456000, 1248000, 1053000, 949000, 832000, 715000, 598000, 455000 };
++#define S8DVFS_NOPP     ((int)(sizeof(s8dvfs_opp) / sizeof(s8dvfs_opp[0])))
++
++int s8_acpm_set_rate(uint32_t domain, uint32_t khz, uint32_t *resp);
++
++int
++s8_acpm_set_rate(uint32_t domain, uint32_t khz, uint32_t *resp)
++{
++	uint32_t cmd[4];
++	int rc, ok = 0;
++
++	for (int i = 0; i < S8DVFS_NOPP; i++) {
++		if (s8dvfs_opp[i] == khz) {
++			ok = 1;
++		}
++	}
++	if (domain != 3 || !ok) {
++		return S8A_ERR_INVAL;
++	}
++	cmd[0] = domain;
++	cmd[1] = khz;
++	cmd[2] = 0;     /* ACPM_FREQ_REQ */
++	cmd[3] = 0;
++	lck_mtx_lock(&s8a_lock);
++	bool first = !s8a_first_done;
++	rc = s8a_send(s8a_dvfs_ch, cmd, S8A_TMO_MS, first);
++	s8a_first_done = true;
++	lck_mtx_unlock(&s8a_lock);
++	if (first) {
++		printf("S8ACPM: first exchange rc=%d cmd(dom=%u khz=%u) resp0=0x%x resp1=%u resp2=0x%x resp3=0x%x\n", rc,
++		    domain, khz, cmd[0], cmd[1], cmd[2], cmd[3]);
++	}
++	if (resp != NULL) {
++		*resp = cmd[1];
++	}
++	if (rc == 0 && cmd[1] != khz) {
++		return -16;     /* APM answered with another rate */
++	}
++	return rc;
++}
++
++/* ---------------------------------------------------------------- CMU read-back (A53 PLL) */
++
++#define S8T_CL1_PLL_CON0_PA     0x16900000UL
++static volatile uint8_t *s8t_cmu;
++
++static uint32_t
++s8dvfs_pll_khz(uint32_t *con0)
++{
++	if (s8t_cmu == NULL) {
++		*con0 = 0;
++		return 0;
++	}
++	uint32_t c = *(volatile uint32_t *)(s8t_cmu + 0x120), m = (c >> 16) & 0x3ff, p = (c >> 8) & 0x3f, s = c & 7;
++	*con0 = c;
++	if (!p) {
++		return 0;
++	}
++	return (uint32_t)(((uint64_t)26000 * m) / ((uint64_t)p << s));
++}
++
++/* ---------------------------------------------------------------- TMU */
++
++/*
++ * Exynos 8895 TMU, CPU block at 0x10080000 (DT tmuctrl_0 MNGS sensors mask 61 = {0,2,3,4,5}, tmuctrl_1 APOLLO mask 2 = {1}).
++ * TRIMINFO0 +0x00 (bit 23 = calibration type, 1 = two-point), per-sensor trim at +4*sensor: e1 = [8:0], e2 = [17:9],
++ * CURRENT_TEMP regs from +0x40: sensors 0,1 in +0x40 at bits 0 and 9, then three sensors per word at +0x44, +0x48...
++ * (9 bits each). temp = (code - e1) * (85 - 25) / (e2 - e1) + 25 (two-point), code - e1 + 25 (one-point);
++ * e1 == 0 falls back to the DT efuse value 0x37.
++ */
++#define S8T_PA          0x10080000UL
++#define S8T_NSENS       6
++static volatile uint8_t *s8t_base;
++static bool s8t_logged_cal;
++
++static inline uint32_t
++s8t_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(s8t_base + off);
++}
++
++/* Max temperature (C) of the CPU sensors, or -1000 if no sensor gives a plausible code. *rawmax = the code of that sensor. */
++static int
++s8t_read_max(uint32_t *rawmax)
++{
++	uint32_t tri0 = s8t_rd(0x0);
++	uint32_t two = (tri0 >> 23) & 1;
++	int best = -1000;
++
++	*rawmax = 0;
++	for (uint32_t s = 0; s < S8T_NSENS; s++) {
++		uint32_t tri = s8t_rd(4 * s), e1 = tri & 0x1ff, e2 = (tri >> 9) & 0x1ff;
++		uint32_t reg, bit, code;
++		int temp;
++
++		if (!e1) {
++			e1 = 0x37;
++		}
++		if (s < 2) {
++			reg = 0x40;
++			bit = 9 * s;
++		} else {
++			reg = 0x40 + ((s - 2) / 3 + 1) * 4;
++			bit = 9 * ((s - 2) % 3);
++		}
++		code = (s8t_rd(reg) >> bit) & 0x1ff;
++		if (!s8t_logged_cal) {
++			printf("S8DVFS: tmu sensor %u trim=0x%x e1=%u e2=%u code=%u two_point=%u\n", s, tri, e1, e2, code, two);
++		}
++		if (code == 0 || code == 0x1ff) {
++			continue;       /* sensor off / invalid */
++		}
++		if (two && e2 > e1) {
++			temp = ((int)code - (int)e1) * (85 - 25) / ((int)e2 - (int)e1) + 25;
++		} else {
++			temp = (int)code - (int)e1 + 25;
++		}
++		if (temp > 125) {
++			temp = 125;
++		} else if (temp < -40) {
++			temp = -40;
++		}
++		if (temp > best) {
++			best = temp;
++			*rawmax = code;
++		}
++	}
++	if (!s8t_logged_cal) {
++		printf("S8DVFS: tmu CONTROL=0x%x STATUS=0x%x\n", s8t_rd(0x20), s8t_rd(0x28));
++		s8t_logged_cal = true;
++	}
++	return best;
++}
++
++/* ---------------------------------------------------------------- governor */
++
++#define S8G_FLOOR_IDX   7       /* 598 MHz: lowest load-driven step */
++#define S8G_UP_PCT      70
++#define S8G_DOWN_PCT    35
++#define S8G_MAXCPU      8
++
++static uint32_t s8g_ms = 200;
++static uint32_t s8g_therm_off;
++static int s8g_thr[3] = { 75, 85, 95 };
++static int s8g_reset_c = 105;
++static int s8g_event;
++static uint64_t s8g_last;
++static uint64_t s8g_idle[S8G_MAXCPU];
++
++/* Max over the CPUs of the busy % since the last call (idle time as in the s8prof thread). */
++static uint32_t
++s8g_load(void)
++{
++	uint64_t now = mach_absolute_time(), wall = now - s8g_last;
++	unsigned ncpu = processor_count;
++	uint32_t maxb = 0;
++
++	if (wall == 0) {
++		wall = 1;
++	}
++	s8g_last = now;
++	if (ncpu > S8G_MAXCPU) {
++		ncpu = S8G_MAXCPU;
++	}
++	for (unsigned i = 0; i < ncpu; i++) {
++		processor_t pr = processor_array[i];
++		struct recount_usage u = { 0 };
++		uint64_t idle = 0;
++		if (pr == PROCESSOR_NULL) {
++			continue;
++		}
++		recount_processor_usage(&pr->pr_recount, &u, &idle);
++		uint64_t didle = idle - s8g_idle[i];
++		if (didle > wall) {
++			didle = wall;
++		}
++		s8g_idle[i] = idle;
++		uint32_t busy = (uint32_t)(100 - didle * 100 / wall);
++		if (busy > maxb) {
++			maxb = busy;
++		}
++	}
++	return maxb;
++}
++
++/* Thermal level 0..3 for temp t: 0 none, 1 cap 1248, 2 cap 832, 3 cap 455. */
++static int
++s8g_level(int t)
++{
++	int l = 0;
++	for (int i = 0; i < 3; i++) {
++		if (t > s8g_thr[i]) {
++			l = i + 1;
++		}
++	}
++	return l;
++}
++
++static const int s8g_cap_idx[4] = { 0, 2, 5, 8 };       /* 1690, 1248, 832, 455 */
++
++static int
++s8g_idx_of(uint32_t khz)
++{
++	for (int i = 0; i < S8DVFS_NOPP; i++) {
++		if (khz * 100 >= s8dvfs_opp[i] * 98 && khz * 100 <= s8dvfs_opp[i] * 102) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++static void
++s8g_thread(void *arg, wait_result_t result)
++{
++	uint32_t con0, pllk, raw = 0, load, lowcnt = 0, hotcnt = 0, fails = 0;
++	int cur, level = 0, temp = -1000, last_logged_temp = -1000, forced = 0;
++	uint64_t log_every, last_log = 0;
++
++	(void)arg;
++	(void)result;
++	clock_interval_to_absolutetime_interval(5000, NSEC_PER_MSEC, &log_every);
++	pllk = s8dvfs_pll_khz(&con0);
++	cur = s8g_idx_of(pllk);
++	printf("S8DVFS: start interval=%u ms pll=%u kHz con0=0x%x idx=%d therm=%s thr=%d/%d/%d reset=%d\n", s8g_ms, pllk,
++	    con0, cur, s8g_therm_off ? "off" : "on", s8g_thr[0], s8g_thr[1], s8g_thr[2], s8g_reset_c);
++	if (cur < 0) {
++		printf("S8DVFS: PLL rate matches no OPP, will request a level on the first decision\n");
++		cur = 0;
++		forced = 1;
++	}
++	(void)s8g_load();       /* baseline */
++	for (;;) {
++		uint64_t deadline;
++		int want, tgt, newlevel;
++
++		clock_interval_to_deadline(s8g_ms, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&s8g_event, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++
++		load = s8g_load();
++
++		/* thermal */
++		if (s8t_base != NULL && !s8g_therm_off) {
++			temp = s8t_read_max(&raw);
++			if (temp > -1000) {
++				newlevel = s8g_level(temp);
++				if (newlevel < level) {
++					/* release only 3 C below the threshold */
++					int hl = s8g_level(temp + 3);
++					newlevel = hl > level ? level : hl;
++				}
++				if (newlevel != level) {
++					printf("S8DVFS: thermal level %d -> %d (temp=%d C raw=%u)\n", level, newlevel, temp, raw);
++					level = newlevel;
++				}
++				if (temp > s8g_reset_c) {
++					if (++hotcnt >= 3) {
++						printf("S8DVFS: OVERTEMP temp=%d C > %d, resetting to recovery\n", temp, s8g_reset_c);
++						s8_reset_to_recovery("overtemp");
++					}
++				} else {
++					hotcnt = 0;
++				}
++			}
++		}
++
++		/* load */
++		want = cur;
++		if (load > S8G_UP_PCT) {
++			want = 0;
++			lowcnt = 0;
++		} else if (load < S8G_DOWN_PCT) {
++			if (++lowcnt >= 2) {
++				want = cur + 1;
++				lowcnt = 0;
++			}
++		} else {
++			lowcnt = 0;
++		}
++		if (want > S8G_FLOOR_IDX) {
++			want = S8G_FLOOR_IDX;
++		}
++		tgt = want;
++		if (tgt < s8g_cap_idx[level]) {
++			tgt = s8g_cap_idx[level];
++		}
++		if (tgt >= S8DVFS_NOPP) {
++			tgt = S8DVFS_NOPP - 1;
++		}
++		if (tgt != cur || forced) {
++			uint32_t resp = 0, got, c0;
++			int rc = s8_acpm_set_rate(3, s8dvfs_opp[tgt], &resp);
++			delay(5000);
++			got = s8dvfs_pll_khz(&c0);
++			printf("S8DVFS: set %u kHz (idx %d->%d) rc=%d resp=%u pll=%u kHz load=%u temp=%d level=%d\n", s8dvfs_opp[tgt],
++			    cur, tgt, rc, resp, got, load, temp, level);
++			if (rc == 0) {
++				cur = tgt;
++				forced = 0;
++				fails = 0;
++			} else if (++fails >= 3) {
++				printf("S8DVFS: 3 consecutive ACPM failures, governor stops (frequency left as is)\n");
++				thread_terminate_self();
++			}
++		}
++		uint64_t now = mach_absolute_time();
++		if (now - last_log >= log_every) {
++			last_log = now;
++			printf("S8DVFS: load=%u freq=%u temp=%d (raw=%u)\n", load, s8dvfs_opp[cur], temp > -1000 ? temp : -1, raw);
++			last_logged_temp = temp;
++		}
++	}
++	(void)last_logged_temp;
++}
++
++void s8dvfs_init(void);
++
++void
++s8dvfs_init(void)
++{
++	uint32_t on = 0, v = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("s8dvfs", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	if (PE_parse_boot_argn("s8dvfs_ms", &v, sizeof(v)) && v >= 50 && v <= 5000) {
++		s8g_ms = v;
++	}
++	if (PE_parse_boot_argn("s8dvfsch", &v, sizeof(v)) && v < 16) {
++		s8a_dvfs_ch = v;
++	}
++	(void)PE_parse_boot_argn("s8therm_off", &s8g_therm_off, sizeof(s8g_therm_off));
++	if (PE_parse_boot_argn("s8therm_max", &v, sizeof(v)) && v >= 50 && v <= 90) {
++		int shift = (int)v - 75;
++		for (int i = 0; i < 3; i++) {
++			s8g_thr[i] += shift;
++		}
++		s8g_reset_c += shift;
++	}
++	if (s8a_map()) {
++		return;
++	}
++	s8t_cmu = (volatile uint8_t *)ml_io_map(S8T_CL1_PLL_CON0_PA, 0x1000);
++	if (!s8g_therm_off) {
++		s8t_base = (volatile uint8_t *)ml_io_map(S8T_PA, 0x1000);
++	}
++	if (s8t_cmu == NULL) {
++		printf("S8DVFS: CMU_CPUCL1 map failed, not starting\n");
++		return;
++	}
++	if (kernel_thread_start_priority(s8g_thread, NULL, BASEPRI_PREEMPT, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("S8DVFS: thread start failed\n");
++	}
++}
++
++#else /* !ARM64_BOARD_CONFIG_A5XELTE */
++
++int s8_acpm_set_rate(uint32_t domain, uint32_t khz, uint32_t *resp);
++void s8dvfs_init(void);
++
++int
++s8_acpm_set_rate(uint32_t domain, uint32_t khz, uint32_t *resp)
++{
++	(void)domain;
++	(void)khz;
++	(void)resp;
++	return -1;
++}
++
++void
++s8dvfs_init(void)
++{
++}
++
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
