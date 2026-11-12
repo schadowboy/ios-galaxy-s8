@@ -1,0 +1,108 @@
+Subject: [PATCH] 0140 GPU DVFS through the APM (DVFS domain 4)
+
+Boot-arg s8gpudvfs=<kHz> (1 = 546000): the Mali driver asks the APM for the busy rate while a client has the GPU open
+and 260000 after the last close (Samsung's governor start clock). Domain 4 accepts 546000/455000/338000/260000 only.
+Absent = no change. Log lines start with GPUDVFS:.
+---
+diff --git a/osfmk/kern/s8_acpm.c b/osfmk/kern/s8_acpm.c
+index eb0f75f..92f4a50 100644
+--- a/osfmk/kern/s8_acpm.c
++++ b/osfmk/kern/s8_acpm.c
+@@ -275,6 +275,14 @@ s8a_send(uint32_t chan_id, uint32_t cmd[4], uint32_t timeout_ms, bool verbose)
+ static const uint32_t s8dvfs_opp[] = { 1690000, 1456000, 1248000, 1053000, 949000, 832000, 715000, 598000, 455000 };
+ #define S8DVFS_NOPP     ((int)(sizeof(s8dvfs_opp) / sizeof(s8dvfs_opp[0])))
+ 
++/*
++ * Domain 4 = dvfs_g3d (acpm_dvfs_exynos8895.h: mif 0, int 1, cpucl0 2, cpucl1 3, g3d 4). Samsung's stock table
++ * (drivers/gpu/arm/tMIx/r2p0/platform/exynos/gpu_exynos8895.c: gpu_dvfs_table_default) lists 839..260 MHz but caps
++ * GPU_MAX_CLOCK and GPU_MAX_CLOCK_LIMIT at 546, so only 546 and below are accepted here.
++ */
++static const uint32_t s8dvfs_gpu_opp[] = { 546000, 455000, 338000, 260000 };
++#define S8DVFS_GPU_NOPP ((int)(sizeof(s8dvfs_gpu_opp) / sizeof(s8dvfs_gpu_opp[0])))
++
+ int s8_acpm_set_rate(uint32_t domain, uint32_t khz, uint32_t *resp);
+ 
+ int
+@@ -283,12 +291,20 @@ s8_acpm_set_rate(uint32_t domain, uint32_t khz, uint32_t *resp)
+ 	uint32_t cmd[4];
+ 	int rc, ok = 0;
+ 
+-	for (int i = 0; i < S8DVFS_NOPP; i++) {
+-		if (s8dvfs_opp[i] == khz) {
+-			ok = 1;
++	if (domain == 3) {
++		for (int i = 0; i < S8DVFS_NOPP; i++) {
++			if (s8dvfs_opp[i] == khz) {
++				ok = 1;
++			}
++		}
++	} else if (domain == 4) {
++		for (int i = 0; i < S8DVFS_GPU_NOPP; i++) {
++			if (s8dvfs_gpu_opp[i] == khz) {
++				ok = 1;
++			}
+ 		}
+ 	}
+-	if (domain != 3 || !ok) {
++	if (!ok) {
+ 		return S8A_ERR_INVAL;
+ 	}
+ 	cmd[0] = domain;
+diff --git a/osfmk/kern/s8_mali_drv.c b/osfmk/kern/s8_mali_drv.c
+index 96a3798..bb2c38f 100755
+--- a/osfmk/kern/s8_mali_drv.c
++++ b/osfmk/kern/s8_mali_drv.c
+@@ -603,6 +603,35 @@ fail:
+ 	return false;
+ }
+ 
++/*
++ * GPU clock through the APM (patch 0136's ACPM client, DVFS domain 4 = dvfs_g3d). Boot-arg s8gpudvfs=<kHz> turns it
++ * on: the busy rate, one of 546000 / 455000 / 338000 / 260000 (1 means 546000); absent or 0 = the GPU keeps whatever
++ * clock S-Boot left it at (no change from before). While a client has the GPU open it runs at the busy rate, after the
++ * last close at 260000 (Samsung's governor start clock). Called with s8d_lock held; the ACPM client has its own lock.
++ */
++extern int s8_acpm_set_rate(uint32_t domain, uint32_t khz, uint32_t *resp);
++
++static void
++gpu_clock(bool busy)
++{
++	static int armed = -1;
++	static uint32_t busy_khz = 546000;
++	uint32_t v = 0, resp = 0;
++	int rc;
++
++	if (armed < 0) {
++		armed = PE_parse_boot_argn("s8gpudvfs", &v, sizeof(v)) && v != 0;
++		if (armed && v > 1) {
++			busy_khz = v;
++		}
++	}
++	if (!armed) {
++		return;
++	}
++	rc = s8_acpm_set_rate(4, busy ? busy_khz : 260000, &resp);
++	P("GPUDVFS: %s -> %u kHz rc=%d apm_resp=%u", busy ? "busy" : "idle", busy ? busy_khz : 260000, rc, resp);
++}
++
+ bool s8mali_gpu_open(void);
+ bool
+ s8mali_gpu_open(void)
+@@ -612,6 +641,9 @@ s8mali_gpu_open(void)
+ 	lck_mtx_lock(&s8d_lock);
+ 	if (g_opens == 0) {
+ 		ok = bringup();
++		if (ok) {
++			gpu_clock(true);
++		}
+ 	}
+ 	if (ok) {
+ 		g_opens++;
+@@ -631,6 +663,7 @@ s8mali_gpu_close(void)
+ 		(void)gpu_reset();
+ 		tables_free();
+ 		g_up = false;
++		gpu_clock(false);
+ 		P("close: last client gone, GPU off (jobs=%u faults=%u)", g_jobs, g_faults);
+ 	} else {
+ 		P("close: clients=%u", g_opens);
