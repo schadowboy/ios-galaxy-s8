@@ -1,0 +1,232 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5568,10 +5568,117 @@
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * S8 bring-up aid (same idea as the S9+ port's kern.exec_inject, APSL): the sysctl
++ * kern.exec_inject holds "LIBRARY NAME NAME ..." and the boot-arg
++ * s8_inject=LIBRARY:NAME,NAME[;LIBRARY2:NAME,...] fills it at the first exec. Every program whose
++ * file name is one of the NAMEs is started with DYLD_INSERT_LIBRARIES=LIBRARY in its environment, so
++ * that dyld loads our library into it (the dyld policy question is answered by the "AMFI"
++ * stand-in in sweet_amfi.c). Several groups are separated by ";"; a program named in more than one
++ * group gets every one of those libraries joined with ":". launchd refuses to pass DYLD_ variables
++ * from a job description, which is why the kernel adds the variable. Boot-arg s8_inject_off=1
++ * switches the whole thing off. System binaries stay untouched, which keeps them platform binaries.
++ */
++static char exec_inject_conf[512];
++SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED, exec_inject_conf, sizeof(exec_inject_conf),
++    "LIBRARY NAME... [; LIBRARY NAME...]: programs started with the library inserted");
++
++static int exec_inject_state = 0;       /* 0: boot-arg not read yet, 1: read, 2: disabled */
++
++static void
++exec_inject_read_bootarg(void)
++{
++	char arg[256];
++	uint32_t off = 0;
++	size_t used = 0;
++	const char *p;
++
++	exec_inject_state = 1;
++	if (PE_parse_boot_argn("s8_inject_off", &off, sizeof(off)) && off) {
++		exec_inject_state = 2;
++		exec_inject_conf[0] = 0;
++		printf("S8INJECT: disabled by boot-arg s8_inject_off\n");
++		return;
++	}
++	if (exec_inject_conf[0] != 0 || !PE_parse_boot_argn("s8_inject", arg, sizeof(arg))) {
++		return;
++	}
++	/* LIBRARY:NAME,NAME;LIBRARY2:NAME2  ->  "LIBRARY NAME NAME;LIBRARY2 NAME2" */
++	for (p = arg; *p != 0 && used + 2 < sizeof(exec_inject_conf); p++) {
++		char c = *p;
++
++		if (c == ':' || c == ',') {
++			c = ' ';
++		}
++		exec_inject_conf[used++] = c;
++	}
++	exec_inject_conf[used] = 0;
++	printf("S8INJECT: rules \"%s\"\n", exec_inject_conf);
++}
++
++static bool
++exec_inject_env(struct image_params *imgp, char *env, size_t size)
++{
++	const char *name, *p;
++	size_t namelen, used;
++	bool any = false;
++
++	if (exec_inject_state == 0) {
++		exec_inject_read_bootarg();
++	}
++	p = exec_inject_conf;
++	if (exec_inject_state == 2 || *p == 0 || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	namelen = imgp->ip_ndp->ni_cnd.cn_namelen;
++	used = strlcpy(env, "DYLD_INSERT_LIBRARIES=", size);
++	while (*p != 0) {
++		const char *library;
++		size_t liblen;
++		bool matched = false;
++
++		while (*p == ' ' || *p == ';') {
++			p++;
++		}
++		library = p;
++		while (*p != 0 && *p != ' ' && *p != ';') {
++			p++;
++		}
++		liblen = (size_t)(p - library);
++		while (*p == ' ') {
++			const char *word = ++p;
++
++			while (*p != 0 && *p != ' ' && *p != ';') {
++				p++;
++			}
++			if (!matched && (size_t)(p - word) == namelen && namelen != 0 && liblen != 0 &&
++			    strncmp(word, name, namelen) == 0) {
++				matched = true;         /* this group names this program; its library is added once */
++			}
++		}
++		if (matched && liblen != 0 && used + 1 + liblen < size) {
++			if (any) {
++				env[used++] = ':';      /* dyld takes several libraries separated by ":" */
++			}
++			memcpy(env + used, library, liblen);
++			used += liblen;
++			env[used] = 0;
++			any = true;
++		}
++	}
++	return any;
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
++
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+ {
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	char            inject_env[512];
++#endif
+ 	int error = 0;
+ 	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
+ 	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
+@@ -5741,6 +5848,22 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* one more variable for the programs that get our library inside them (see exec_inject_env) */
++	if (exec_inject_env(imgp, inject_env, sizeof(inject_env))) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++	}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -33,6 +33,8 @@
+ #include <kern/startup.h>
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
+ #include <sys/codesign.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+@@ -385,6 +387,68 @@
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
+ 
++/*
++ * dyld asks the policy named "AMFI" what it may do for the process it is starting (policy
++ * request 0x5a, "check dyld policy"): the argument is { flags in, pointer to flags out }.
++ * This kernel enforces nothing, so everything is allowed (@paths, DYLD_* variables, inserted
++ * libraries, interposing); that is what lets our own libraries (S8 GL layer, log hooks) be
++ * loaded into system daemons through the s8_inject / kern.exec_inject mechanism of kern_exec.c.
++ * Request 0x60 ("query boot-arg state", libamfi) is answered "AMFI is not enforcing" (0x86).
++ * Everything else gets ENOPOLICY, as it did before there was a handler. The same two answers
++ * and values are what the S9+ port's stand-in gives (Apache/APSL-style prior art: HakiOS
++ * kern_minimac.c); the dyld side is dyld's ProcessConfig security check.
++ * Boot-arg s8_amfi_dyld=0 makes request 0x5a answer "nothing allowed" again.
++ */
++#define S8_AMFI_SYSCALL_CHECK_DYLD_POLICY  0x5a
++#define S8_AMFI_DYLD_OUTPUT_ALLOW_ALL      0xffULL
++#define S8_AMFI_SYSCALL_QUERY_BOOTARG      0x60
++#define S8_AMFI_BOOTARG_NOT_ENFORCING      0x86ULL
++
++static int
++sweet_amfi_dyld_syscall(struct proc *p __unused, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t input_flags;
++		user_addr_t output_flags;
++	} args;
++	uint64_t flags = S8_AMFI_DYLD_OUTPUT_ALLOW_ALL;
++	uint64_t state = S8_AMFI_BOOTARG_NOT_ENFORCING;
++	static int dyld_allow = -1;
++	int error;
++
++	if (call == S8_AMFI_SYSCALL_QUERY_BOOTARG) {
++		return copyout(&state, arg, sizeof(state));
++	}
++	if (call != S8_AMFI_SYSCALL_CHECK_DYLD_POLICY) {
++		return ENOPOLICY;
++	}
++	if (dyld_allow < 0) {
++		uint32_t v = 1;
++		(void)PE_parse_boot_argn("s8_amfi_dyld", &v, sizeof(v));
++		dyld_allow = v ? 1 : 0;
++	}
++	if (!dyld_allow) {
++		flags = 0;
++	}
++	error = copyin(arg, &args, sizeof(args));
++	if (error == 0) {
++		error = copyout(&flags, args.output_flags, sizeof(flags));
++	}
++	return error;
++}
++
++static const struct mac_policy_ops sweet_amfi_dyld_mac_ops = {
++	.mpo_policy_syscall = sweet_amfi_dyld_syscall,
++};
++
++static struct mac_policy_conf sweet_amfi_dyld_mac_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = PORT_NAME " AMFI dyld-policy stand-in",
++	.mpc_ops = &sweet_amfi_dyld_mac_ops,
++};
++
++static mac_policy_handle_t sweet_amfi_dyld_mac_handle;
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -397,5 +461,8 @@
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf(PORT_NAME " Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&sweet_amfi_dyld_mac_conf, &sweet_amfi_dyld_mac_handle, NULL);
++	printf(PORT_NAME " AMFI: dyld policy stand-in %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
+ }
+ #endif /* SWEET || A5XELTE */
