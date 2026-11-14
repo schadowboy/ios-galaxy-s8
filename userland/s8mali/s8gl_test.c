@@ -44,6 +44,8 @@
 #define GL_COLOR_ATTACHMENT0            0x8ce0
 #define GL_FRAMEBUFFER                  0x8d40
 
+extern int s8mali_wait_service(int seconds); /* s8mali_drm.c */
+
 typedef void *OSMesaContext;
 static OSMesaContext (*pCreateContextAttribs)(const int *attributes, OSMesaContext share);
 static unsigned char (*pMakeCurrent)(OSMesaContext context, void *buffer, unsigned type, int width, int height);
@@ -212,6 +214,8 @@ main(int argc, char **argv)
 	if (width < 16 || height < 16 || width > 4096 || height > 4096) {
 		width = height = 256;
 	}
+	/* started at boot, the S8Mali service may not be there yet; Mesa would fall back to softpipe without a word */
+	verdict("S8Mali service present (waited up to 90 s)", s8mali_wait_service(90));
 	lib = dlopen(path != NULL ? path : "/usr/local/lib/s8mesa/libOSMesa.8.dylib", RTLD_NOW | RTLD_GLOBAL);
 	if (lib == NULL) {
 		say("S8GL-TEST: dlopen failed: %s\n", dlerror());

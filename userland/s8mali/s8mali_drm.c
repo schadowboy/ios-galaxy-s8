@@ -88,6 +88,27 @@ drmOpenWithType(const char *name, const char *busid, int type)
 	return dup(connection_fd);
 }
 
+/*
+ * Wait up to `seconds` for the S8Mali service to be registered (the kernel brings it up some seconds after launchd starts
+ * its jobs; Mesa would silently fall back to the CPU if it looked too early). 1 = found, 0 = not there.
+ */
+int
+s8mali_wait_service(int seconds)
+{
+	for (int i = 0; i <= seconds; i++) {
+		io_service_t service = IOServiceGetMatchingService(0, IOServiceMatching(SERVICE_NAME));
+
+		if (service != 0) {
+			IOObjectRelease(service);
+			return 1;
+		}
+		if (i < seconds) {
+			sleep(1);
+		}
+	}
+	return 0;
+}
+
 void
 drmClose(int fd)
 {
