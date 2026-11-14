@@ -44,7 +44,72 @@
 #define GL_COLOR_ATTACHMENT0            0x8ce0
 #define GL_FRAMEBUFFER                  0x8d40
 
+#include "s8mali_drm.h"
+#include "../mesa/overlay/src/s8-drm/s8_drm_ops.h"
+
 extern int s8mali_wait_service(int seconds); /* s8mali_drm.c */
+
+/* the shim's DRM calls that s8mali_drm.h does not declare (s8mali_drm.c) */
+extern int drmCommandWrite(int fd, unsigned long index, const void *data, unsigned long size);
+extern int drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size);
+extern int drmGetCap(int fd, uint64_t capability, uint64_t *value);
+extern int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd);
+extern int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle);
+extern int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle);
+extern int drmSyncobjDestroy(int fd, uint32_t handle);
+extern int drmSyncobjReset(int fd, const uint32_t *handles, uint32_t count);
+extern int drmSyncobjWait(int fd, uint32_t *handles, unsigned count, int64_t timeout_nsec, unsigned flags,
+    uint32_t *first_signaled);
+extern int drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle);
+extern int drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd);
+extern int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd);
+extern int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd);
+extern int drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned count, int64_t timeout_nsec,
+    unsigned flags, uint32_t *first_signaled);
+extern int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle, uint64_t src_point,
+    uint32_t flags);
+
+/* the DRM table handed to Mesa: this program's own shim (s8mali_drm.c), called by Mesa's stand-in */
+static void *
+shim_get_version(int fd)
+{
+	return drmGetVersion(fd);
+}
+
+static void
+shim_free_version(void *version)
+{
+	drmFreeVersion(version);
+}
+
+static void
+fill_ops(struct s8_drm_ops *o)
+{
+	memset(o, 0, sizeof(*o));
+	o->size = sizeof(*o);
+	o->OpenWithType = drmOpenWithType;
+	o->Ioctl = drmIoctl;
+	o->CommandWrite = drmCommandWrite;
+	o->CommandWriteRead = drmCommandWriteRead;
+	o->GetVersion = shim_get_version;
+	o->FreeVersion = shim_free_version;
+	o->GetCap = drmGetCap;
+	o->CloseBufferHandle = drmCloseBufferHandle;
+	o->PrimeHandleToFD = drmPrimeHandleToFD;
+	o->PrimeFDToHandle = drmPrimeFDToHandle;
+	o->SyncobjCreate = drmSyncobjCreate;
+	o->SyncobjDestroy = drmSyncobjDestroy;
+	o->SyncobjReset = drmSyncobjReset;
+	o->SyncobjWait = drmSyncobjWait;
+	o->SyncobjFDToHandle = drmSyncobjFDToHandle;
+	o->SyncobjHandleToFD = drmSyncobjHandleToFD;
+	o->SyncobjImportSyncFile = drmSyncobjImportSyncFile;
+	o->SyncobjExportSyncFile = drmSyncobjExportSyncFile;
+	o->SyncobjTimelineWait = drmSyncobjTimelineWait;
+	o->SyncobjTransfer = drmSyncobjTransfer;
+	o->Map = hakios_drm_map;
+	o->Unmap = hakios_drm_unmap;
+}
 
 typedef void *OSMesaContext;
 static OSMesaContext (*pCreateContextAttribs)(const int *attributes, OSMesaContext share);
@@ -231,6 +296,14 @@ main(int argc, char **argv)
 		return 1;
 	}
 	verdict("load Mesa", 1);
+	{
+		/* give Mesa the real DRM layer: without it Mesa's stand-in fails every call and it draws on the CPU */
+		int (*set_ops)(const struct s8_drm_ops *) = (int (*)(const struct s8_drm_ops *))dlsym(lib, "s8_drm_set_ops");
+		struct s8_drm_ops table;
+
+		fill_ops(&table);
+		verdict("hand the DRM table to Mesa", set_ops != NULL && set_ops(&table) == 0);
+	}
 	context = pCreateContextAttribs(attributes, NULL);
 	if (context == NULL || !pMakeCurrent(context, window, GL_UNSIGNED_BYTE, 16, 16)) {
 		verdict("OpenGL ES context", 0);
