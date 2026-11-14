@@ -42,7 +42,10 @@ struct s8_drm_ops {
 	void (*Unmap)(int fd, uint32_t handle, void *address);
 };
 
-/* exported by libOSMesa (s8_drm_stub.c): returns 0 when the table was taken */
-int s8_drm_set_ops(const struct s8_drm_ops *ops);
+/*
+ * exported by libOSMesa (s8_drm_stub.c): returns 0 when the table was taken. Explicitly public: Mesa builds with hidden
+ * symbol visibility, and the host finds this function with dlsym().
+ */
+__attribute__((visibility("default"))) int s8_drm_set_ops(const struct s8_drm_ops *ops);
 
 #endif
