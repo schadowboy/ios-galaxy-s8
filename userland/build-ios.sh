@@ -34,4 +34,13 @@ xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall -We
 "$LDID" -e "$OUT/s8mali_test" | head -20
 file "$OUT/s8mali_test" || true
 xcrun --sdk iphoneos vtool -show-build "$OUT/s8mali_test" 2>/dev/null | head -8 || true
-(cd "$OUT" && shasum -a 256 s8mali_test | tee SHA256SUMS)
+
+# s8gl_test: a triangle through Mesa (libOSMesa.8.dylib, loaded at run time with dlopen). It links the same DRM shim, and
+# exports its symbols (-export_dynamic) so that the weak, failing drm* stand-ins inside libOSMesa are replaced by the
+# real ones when Mesa is loaded.
+xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall -Wextra \
+	-F"$FW" -framework IOKit -Wl,-export_dynamic \
+	-o "$OUT/s8gl_test" "$HERE/s8mali/s8gl_test.c" "$HERE/s8mali/s8mali_drm.c"
+"$LDID" -S"$HERE/s8mali/s8mali_test.entitlements" "$OUT/s8gl_test"
+file "$OUT/s8gl_test" || true
+(cd "$OUT" && shasum -a 256 s8mali_test s8gl_test | tee SHA256SUMS)

@@ -196,10 +196,19 @@ s8mali_wait_seq(uint64_t seq, int64_t deadline)
 	return error;
 }
 
+static uint64_t *syncobj(uint32_t handle);
+
+/*
+ * A job chain to the GPU. Linux's driver gives back nothing and puts the job's fence into the sync object out_sync;
+ * S8Mali gives back the job's number where the chain's address was (jc). The address is put back, as Linux leaves it,
+ * and the number goes into the sync object. The fences to wait for before the job (in_syncs) are looked at neither here
+ * nor by the kernel: they can only stand for jobs given before this one, which the queue has run by the time this one
+ * begins.
+ */
 static int
 submit(struct drm_panfrost_submit *request)
 {
-	uint64_t chain = request->jc, seq;
+	uint64_t chain = request->jc, seq, *fence;
 	int error = call(DRM_COMMAND_BASE + DRM_PANFROST_SUBMIT, request, sizeof(*request));
 
 	if (error != 0) {
@@ -209,6 +218,9 @@ submit(struct drm_panfrost_submit *request)
 	request->jc = chain;
 	pthread_mutex_lock(&lock);
 	submitted = seq > submitted ? seq : submitted;
+	if (request->out_sync != 0 && (fence = syncobj(request->out_sync)) != NULL) {
+		*fence = seq;
+	}
 	pthread_mutex_unlock(&lock);
 	return 0;
 }
@@ -291,6 +303,312 @@ drmCloseBufferHandle(int fd, uint32_t handle)
 	struct drm_gem_close request = { .handle = handle };
 
 	return drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &request);
+}
+
+/* As libdrm's: the driver-private request number is added to DRM_COMMAND_BASE; 0, or minus an errno. */
+int
+drmCommandWrite(int fd, unsigned long index, const void *data, unsigned long size)
+{
+	(void)fd;
+	return -call((unsigned)(DRM_COMMAND_BASE + index), (void *)(uintptr_t)data, size);
+}
+
+int
+drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size)
+{
+	(void)fd;
+	return -call((unsigned)(DRM_COMMAND_BASE + index), data, size);
+}
+
+/* No generic DRM capability (syncobj, prime, ...) is offered: every one reads 0. */
+int
+drmGetCap(int fd, uint64_t capability, uint64_t *value)
+{
+	(void)fd;
+	(void)capability;
+	*value = 0;
+	return 0;
+}
+
+static int
+none(void)
+{
+	errno = ENOSYS;
+	return -1;
+}
+
+/* ---- sync objects (after the S9+ project's emulation, MIT) ------------------------------------------------------ */
+
+/*
+ * Linux's fences that a program holds by a handle. Here, for panfrost, each is the number of the job it waits for, kept
+ * in this process: the kernel has no fences, it has numbers. 0 is no job, nothing to wait for (a sync object made
+ * signalled, or without a fence). Waiting for several is waiting for the highest of their numbers (all of them) or the
+ * lowest (any), since the jobs end in order.
+ */
+#ifndef DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
+#define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL (1 << 0)
+#endif
+#define SYNCOBJ_FREE UINT64_MAX
+static uint64_t *syncobjs; /* handle n is syncobjs[n - 1]: its job, or SYNCOBJ_FREE */
+static uint32_t syncobj_count;
+
+/* (with the lock held) NULL: no such sync object */
+static uint64_t *
+syncobj(uint32_t handle)
+{
+	if (handle == 0 || handle > syncobj_count || syncobjs[handle - 1] == SYNCOBJ_FREE) {
+		return NULL;
+	}
+	return &syncobjs[handle - 1];
+}
+
+int
+drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
+{
+	uint32_t i;
+
+	(void)fd;
+	(void)flags; /* (signalled or without a fence: no job either way) */
+	if (!opened) {
+		return none();
+	}
+	pthread_mutex_lock(&lock);
+	for (i = 0; i < syncobj_count && syncobjs[i] != SYNCOBJ_FREE; i++) {
+	}
+	if (i == syncobj_count) {
+		uint32_t count = syncobj_count != 0 ? 2 * syncobj_count : 64;
+		uint64_t *grown = realloc(syncobjs, count * sizeof(*grown));
+
+		if (grown == NULL) {
+			pthread_mutex_unlock(&lock);
+			errno = ENOMEM;
+			return -1;
+		}
+		for (uint32_t k = syncobj_count; k < count; k++) {
+			grown[k] = SYNCOBJ_FREE;
+		}
+		syncobjs = grown;
+		syncobj_count = count;
+	}
+	syncobjs[i] = 0;
+	*handle = i + 1;
+	pthread_mutex_unlock(&lock);
+	return 0;
+}
+
+int
+drmSyncobjDestroy(int fd, uint32_t handle)
+{
+	uint64_t *fence;
+
+	(void)fd;
+	if (!opened) {
+		return none();
+	}
+	pthread_mutex_lock(&lock);
+	if ((fence = syncobj(handle)) != NULL) {
+		*fence = SYNCOBJ_FREE;
+	}
+	pthread_mutex_unlock(&lock);
+	if (fence == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	return 0;
+}
+
+int
+drmSyncobjReset(int fd, const uint32_t *handles, uint32_t count)
+{
+	uint64_t *fence;
+
+	(void)fd;
+	if (!opened) {
+		return none();
+	}
+	pthread_mutex_lock(&lock);
+	for (uint32_t i = 0; i < count; i++) {
+		if ((fence = syncobj(handles[i])) != NULL) {
+			*fence = 0;
+		}
+	}
+	pthread_mutex_unlock(&lock);
+	return 0;
+}
+
+/* As libdrm's: 0, or minus an errno (ETIME: not done by the deadline, a moment of Mesa's clock). */
+int
+drmSyncobjWait(int fd, uint32_t *handles, unsigned count, int64_t timeout_nsec, unsigned flags,
+    uint32_t *first_signaled)
+{
+	bool all = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) != 0;
+	uint64_t seq = 0, *fence;
+	unsigned first = 0;
+	int error;
+
+	(void)fd;
+	if (!opened) {
+		return -ENOSYS;
+	}
+	pthread_mutex_lock(&lock);
+	for (unsigned i = 0; i < count; i++) {
+		if ((fence = syncobj(handles[i])) == NULL) {
+			pthread_mutex_unlock(&lock);
+			return -EINVAL;
+		}
+		if (i == 0 || (all ? *fence > seq : *fence < seq)) {
+			seq = *fence;
+			first = i;
+		}
+	}
+	pthread_mutex_unlock(&lock);
+	error = s8mali_wait_seq(seq, timeout_nsec);
+	if (error != 0) {
+		return error == ETIMEDOUT ? -ETIME : -error;
+	}
+	if (first_signaled != NULL) {
+		*first_signaled = first;
+	}
+	return 0;
+}
+
+/*
+ * A sync object's fence as a file descriptor (a "sync file"): panfrost makes one of its context's sync object for every
+ * fence it hands out, and takes it into a new sync object at once. Here it is another descriptor of /dev/null, with the
+ * job number kept beside its number. A number that comes back that was not made here is taken for the last job given to
+ * the GPU so far: later than the one meant, if anything, never earlier.
+ */
+#define SYNC_FILES 64
+static struct {
+	bool used;
+	int fd;
+	uint64_t seq;
+} sync_files[SYNC_FILES];
+static unsigned sync_file_next;
+
+int
+drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
+{
+	uint64_t *fence;
+	int file;
+
+	(void)fd;
+	if (!opened) {
+		return none();
+	}
+	if ((file = fcntl(connection_fd, F_DUPFD_CLOEXEC, 0)) < 0) {
+		return -1;
+	}
+	pthread_mutex_lock(&lock);
+	if ((fence = syncobj(handle)) == NULL) {
+		pthread_mutex_unlock(&lock);
+		close(file);
+		errno = EINVAL;
+		return -1;
+	}
+	for (unsigned i = 0; i < SYNC_FILES; i++) {
+		if (sync_files[i].used && sync_files[i].fd == file) {
+			sync_files[i].used = false; /* (a number made here before, closed since) */
+		}
+	}
+	sync_files[sync_file_next % SYNC_FILES].used = true;
+	sync_files[sync_file_next % SYNC_FILES].fd = file;
+	sync_files[sync_file_next % SYNC_FILES].seq = *fence;
+	sync_file_next++;
+	pthread_mutex_unlock(&lock);
+	*sync_file_fd = file;
+	return 0;
+}
+
+int
+drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
+{
+	uint64_t *fence, seq;
+
+	(void)fd;
+	if (!opened) {
+		return none();
+	}
+	pthread_mutex_lock(&lock);
+	if ((fence = syncobj(handle)) == NULL) {
+		pthread_mutex_unlock(&lock);
+		errno = EINVAL;
+		return -1;
+	}
+	seq = submitted;
+	for (unsigned i = 0; i < SYNC_FILES; i++) {
+		if (sync_files[i].used && sync_files[i].fd == sync_file_fd) {
+			seq = sync_files[i].seq;
+		}
+	}
+	*fence = seq;
+	pthread_mutex_unlock(&lock);
+	return 0;
+}
+
+/* Buffers and sync objects as file descriptors for other programs and drivers, and timelines: none of that here. */
+int
+drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
+{
+	(void)fd;
+	(void)handle;
+	(void)flags;
+	(void)prime_fd;
+	return none();
+}
+
+int
+drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
+{
+	(void)fd;
+	(void)prime_fd;
+	(void)handle;
+	return none();
+}
+
+int
+drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle)
+{
+	(void)fd;
+	(void)obj_fd;
+	(void)handle;
+	return none();
+}
+
+int
+drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd)
+{
+	(void)fd;
+	(void)handle;
+	(void)obj_fd;
+	return none();
+}
+
+int
+drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned count, int64_t timeout_nsec,
+    unsigned flags, uint32_t *first_signaled)
+{
+	(void)fd;
+	(void)handles;
+	(void)points;
+	(void)count;
+	(void)timeout_nsec;
+	(void)flags;
+	(void)first_signaled;
+	return none();
+}
+
+int
+drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle, uint64_t src_point,
+    uint32_t flags)
+{
+	(void)fd;
+	(void)dst_handle;
+	(void)dst_point;
+	(void)src_handle;
+	(void)src_point;
+	(void)flags;
+	return none();
 }
 
 void *
