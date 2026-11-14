@@ -532,6 +532,74 @@ void wifi_link(void (*kv)(const char *, uint64_t), void (*out)(const char *), vo
 		kv("WIFI: EP BAR3", wifi_rd_traced(kv, flush, "WIFI: EP +0x1c", CFG + 0x1c));
 		kv("WIFI: EP subsystem", wifi_rd_traced(kv, flush, "WIFI: EP +0x2c", CFG + 0x2c));
 		kv("WIFI: EP capabilities pointer", wifi_rd_traced(kv, flush, "WIFI: EP +0x34", CFG + 0x34));
+
+		if (stage >= 5) {
+			/*
+			 * wifiprobe=5 (W1): outbound MEM window (ATU region 1, 0x11800000 up to the config window, PCI address = CPU
+			 * address), size the chip's two 64-bit BARs, assign them inside that window, enable memory space, then point
+			 * the chip's BAR0 backplane window (Broadcom config register 0x80) at ChipCommon (0x18000000) and read its
+			 * chip-id register through BAR0. Expected chip id 0x4361.
+			 */
+			static const uintptr_t MEMWIN = 0x11800000UL;
+			uint32_t orig[4], got[4], size0, size2, base0, base2, id;
+
+			out("WIFI: stage 5, outbound MEM window + BAR sizing\n");
+			fl(flush);
+			wifi_wr_traced(kv, flush, DBI + 0x900, 0x00000001u); /* outbound, region 1 */
+			wr(DBI + 0x90C, (uint32_t)MEMWIN);
+			wr(DBI + 0x910, 0x0);
+			wr(DBI + 0x914, (uint32_t)MEMWIN + 0x3FF000 - 1);    /* up to the configuration window */
+			wr(DBI + 0x918, (uint32_t)MEMWIN);                  /* PCI address = CPU address */
+			wr(DBI + 0x91C, 0x0);
+			wr(DBI + 0x904, 0x0);                               /* type MEM */
+			wr(DBI + 0x908, 0x80000000u);                       /* enable */
+			kv("WIFI: ATU region 1 CR2", rd(DBI + 0x908));
+
+			for (unsigned i = 0; i < 4; i++)
+				orig[i] = rd(CFG + 0x10 + 4 * i);
+			for (unsigned i = 0; i < 4; i++)
+				wr(CFG + 0x10 + 4 * i, 0xffffffffu);
+			for (unsigned i = 0; i < 4; i++)
+				got[i] = rd(CFG + 0x10 + 4 * i);
+			for (unsigned i = 0; i < 4; i++)
+				wr(CFG + 0x10 + 4 * i, orig[i]);
+			for (unsigned i = 0; i < 4; i++) {
+				kv("WIFI: BAR original", orig[i]);
+				kv("WIFI: BAR size-probe readback", got[i]);
+			}
+			size0 = ~(got[0] & ~0xfu) + 1;
+			size2 = ~(got[2] & ~0xfu) + 1;
+			kv("WIFI: BAR0 size", size0);
+			kv("WIFI: BAR2 size", size2);
+			base0 = (uint32_t)MEMWIN;
+			base2 = size2 ? ((base0 + size0 + size2 - 1) & ~(size2 - 1)) : 0;
+			kv("WIFI: BAR0 base", base0);
+			kv("WIFI: BAR2 base", base2);
+			if (size0 != 0 && size0 <= 0x100000) {
+				wifi_wr_traced(kv, flush, CFG + 0x10, base0 | (got[0] & 0xfu));
+				wr(CFG + 0x14, 0x0);
+				if (size2 != 0 && size2 <= 0x800000 && base2 + size2 <= (uint32_t)MEMWIN + 0x3FF000) {
+					wr(CFG + 0x18, base2 | (got[2] & 0xfu));
+					wr(CFG + 0x1c, 0x0);
+				} else {
+					out("WIFI: BAR2 (4 MiB) does not fit beside BAR0 in the 4 MiB outbound window: left unassigned\n");
+				}
+				kv("WIFI: BAR0 now", rd(CFG + 0x10));
+				kv("WIFI: BAR2 now", rd(CFG + 0x18));
+				wr(CFG + 0x04, (rd(CFG + 0x04) & 0xffffu) | 0x6u); /* memory space + bus master */
+				kv("WIFI: EP command now", rd(CFG + 0x04) & 0xffffu);
+				wifi_wr_traced(kv, flush, CFG + 0x80, 0x18000000u); /* BAR0 window -> ChipCommon */
+				kv("WIFI: BAR0 window readback", rd(CFG + 0x80));
+				id = wifi_rd_traced(kv, flush, "WIFI: ChipCommon[0] chip id register", base0 + 0x0);
+				kv("WIFI: CHIP ID", id & 0xffff);
+				kv("WIFI: chip revision", (id >> 16) & 0xf);
+				kv("WIFI: packaging option", (id >> 20) & 0xf);
+				kv("WIFI: core count", (id >> 24) & 0xf);
+				kv("WIFI: ChipCommon[4] capabilities", wifi_rd_traced(kv, flush, "WIFI: ChipCommon[4]", base0 + 0x4));
+			} else {
+				out("WIFI: BAR sizes not plausible, BARs left alone\n");
+			}
+		}
 	}
 	out("WIFI link stage done\n");
 	fl(flush);
