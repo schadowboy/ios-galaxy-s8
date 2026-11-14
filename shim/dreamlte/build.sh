@@ -16,7 +16,11 @@ $CC $CFLAGS -c smp_probe.c -o out/smp_probe.o
 $CC $CFLAGS -c touch_probe.c -o out/touch_probe.o
 $CC $CFLAGS -c pmic.c -o out/pmic.o
 $CC $CFLAGS -c display_probe.c -o out/display_probe.o
-objs="out/loader.o out/fdt.o out/ufs_probe.o out/smp_probe.o out/touch_probe.o out/pmic.o out/display_probe.o"
+$CC $CFLAGS -c mngs_clk.c -o out/mngs_clk.o
+$CC $CFLAGS -c acpm.c -o out/acpm.o
+$CC $CFLAGS -I. -c acpm_fw.S -o out/acpm_fw.o
+$CC $CFLAGS -c gpu0.c -o out/gpu0.o
+objs="out/gpu0.o out/loader.o out/fdt.o out/ufs_probe.o out/smp_probe.o out/touch_probe.o out/pmic.o out/display_probe.o out/mngs_clk.o out/acpm.o out/acpm_fw.o"
 # Runs wherever S-Boot puts it with no relocation pass.
 abs=$(aarch64-linux-gnu-readelf -r $objs | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations" >&2; exit 1; }

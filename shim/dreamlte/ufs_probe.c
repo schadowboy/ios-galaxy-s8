@@ -57,6 +57,10 @@ static uintptr_t dma;
 static uint32_t prdt_stride = 16;
 static uint8_t tag;
 static uint8_t cmd_lun;		/* UPIU LUN of the next command */
+static int cmd_out;		/* next command moves data host -> device */
+static int ufs_ready;
+static uint64_t ud_first, ud_last;
+static uint32_t log_seq;
 
 static void bzero_dev(uintptr_t a, uint32_t n)
 {
@@ -89,7 +93,7 @@ static int scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, uint32_t *oc
 	bzero_dev(ucd, 1024 + 16 * 128);
 	/* COMMAND UPIU */
 	*(volatile uint8_t *)(ucd + 0) = 0x01;
-	*(volatile uint8_t *)(ucd + 1) = len ? 0x40 : 0x00;	/* R: data in */
+	*(volatile uint8_t *)(ucd + 1) = len ? (cmd_out ? 0x20 : 0x40) : 0x00;	/* W: data out / R: data in */
 	*(volatile uint8_t *)(ucd + 2) = cmd_lun;
 	*(volatile uint8_t *)(ucd + 3) = ++tag;
 	*(volatile uint8_t *)(ucd + 12) = (uint8_t)(len >> 24);
@@ -107,8 +111,9 @@ static int scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, uint32_t *oc
 		wr(e + 4, (uint32_t)((data_pa + done) >> 32));
 		wr(e + 12, chunk - 1);
 	}
-	/* CT=1 (UFS storage), DD=2 (device to memory) when reading, I=1. */
-	wr(utrd + 0, (1u << 28) | ((len ? 2u : 0u) << 25) | (1u << 24));
+	/* CT=1 (UFS storage), DD=2 (device to memory) when reading, DD=1 (memory to
+	 * device) when writing, I=1. */
+	wr(utrd + 0, (1u << 28) | ((len ? (cmd_out ? 1u : 2u) : 0u) << 25) | (1u << 24));
 	wr(utrd + 8, 0x0f);					/* OCS: invalid until done */
 	wr(utrd + 16, (uint32_t)ucd_pa);
 	wr(utrd + 20, (uint32_t)(ucd_pa >> 32));
@@ -139,6 +144,53 @@ static int read_blocks(uint32_t lba, uint32_t count, uint32_t *st)
 	uint8_t cdb[10] = { 0x28, 0, (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
 			    (uint8_t)(lba >> 8), (uint8_t)lba, 0, 0, (uint8_t)count, 0 };
 	return scsi(cdb, 10, count * 4096, st);
+}
+
+static int write_blocks(uint32_t lba, uint32_t count, uint32_t *st)
+{
+	uint8_t cdb[10] = { 0x2a, 0, (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
+			    (uint8_t)(lba >> 8), (uint8_t)lba, 0, 0, (uint8_t)count, 0 };
+	cmd_out = 1;
+	int rc = scsi(cdb, 10, count * 4096, st);
+	cmd_out = 0;
+	return rc;
+}
+
+#define LOG_BLOCKS	16
+#define XNU_RING_BLOCKS	1025
+
+/* Persist loader log text: 16 blocks right before XNU's console ring at the
+ * end of USERDATA. Block 0 header, blocks 1..15 text (60 KiB). */
+int ufs_write_log(const void *buf, uint32_t len)
+{
+	uint32_t st = 0;
+	if (!ufs_ready || !ud_last)
+		return -100;
+	if (len > (LOG_BLOCKS - 1) * 4096)
+		len = (LOG_BLOCKS - 1) * 4096;
+	uint64_t start = ud_last - XNU_RING_BLOCKS - LOG_BLOCKS + 1;
+	if (start <= ud_first)
+		return -101;
+	uintptr_t d = dma + D_DATA;
+	bzero_dev(d, LOG_BLOCKS * 4096);
+	static const char magic[8] = "S8LOGv1";
+	for (int i = 0; i < 8; i++)
+		*(volatile uint8_t *)(d + i) = (uint8_t)magic[i];
+	log_seq++;
+	for (int i = 0; i < 4; i++) {
+		*(volatile uint8_t *)(d + 8 + i) = (uint8_t)(len >> (8 * i));
+		*(volatile uint8_t *)(d + 12 + i) = (uint8_t)(log_seq >> (8 * i));
+	}
+	const uint8_t *s = buf;
+	for (uint32_t i = 0; i < len; i++)
+		*(volatile uint8_t *)(d + 4096 + i) = s[i];
+	__asm__ volatile("dsb sy" ::: "memory");
+	cmd_lun = 0;
+	int rc = write_blocks((uint32_t)start, LOG_BLOCKS, &st);
+	if (rc)
+		return rc * 10 - 1;
+	static const uint8_t sync[10] = { 0x35 };
+	return scsi(sync, 10, 0, &st);
 }
 
 static int name_is(uintptr_t e, const char *want)
@@ -311,6 +363,11 @@ void ufs_probe(void (*kv)(const char *, uint64_t), void (*out)(const char *),
 			out(": ");
 			kv("first", le64(e + 32));
 			kv("last", le64(e + 40));
+			if (name_is(e, "USERDATA")) {
+				ud_first = le64(e + 32);
+				ud_last = le64(e + 40);
+				ufs_ready = 1;
+			}
 			out("\n");
 		}
 	}

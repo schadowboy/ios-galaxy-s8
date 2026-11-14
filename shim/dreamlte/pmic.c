@@ -83,6 +83,17 @@ static int speedy(unsigned slave, unsigned reg, int write, uint8_t val)
 	return -1;
 }
 
+/* GPU0 helpers: raw PMIC byte access for gpu0.c (returns byte, or < 0 on timeout). */
+int pmic_read8(unsigned reg)
+{
+	return speedy(SLAVE_PMIC, reg, 0, 0);
+}
+
+int pmic_write8(unsigned reg, uint8_t val)
+{
+	return speedy(SLAVE_PMIC, reg, 1, val);
+}
+
 static void show(const char *k, unsigned slave, unsigned reg)
 {
 	int v = speedy(slave, reg, 0, 0);
@@ -90,6 +101,22 @@ static void show(const char *k, unsigned slave, unsigned reg)
 }
 
 /* Cycles of this core per 10 ms of the 26 MHz system timer. */
+void pmic_rails(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const char *), const char *tag)
+{
+	(void)kv_fn;
+	(void)out_fn;
+	out("PMIC rails ");
+	out(tag);
+	out("\n");
+	show("B1CTRL", SLAVE_PMIC, 0x19);
+	show("B1OUT", SLAVE_PMIC, 0x1a);
+	show("B2CTRL", SLAVE_PMIC, 0x1b);
+	show("B2OUT", SLAVE_PMIC, 0x1c);
+	show("B3CTRL", SLAVE_PMIC, 0x1d);
+	show("B3OUT", SLAVE_PMIC, 0x1e);
+	out("\n");
+}
+
 static void cpu_freq(void)
 {
 	uint64_t pmcr;

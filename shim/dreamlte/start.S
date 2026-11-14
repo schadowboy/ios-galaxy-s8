@@ -82,11 +82,45 @@ smp_entry:
 6:	wfe
 	b	6b
 
+/*
+ * mngsexp=3 stub (Mongoose core 0). Records MIDR_EL1 / CurrentEL / MPIDR_EL1 in smp_flags[8..10],
+ * then the flag smp_flags[0] last, cleans both lines, then spins (no wfe, no PSCI) until the loader
+ * sets smp_flags[11] (release) and only then does PSCI CPU_OFF, so no core is left running in
+ * memory that XNU reuses.
+ */
+	.globl smp_entry3
+smp_entry3:
+	msr	daifset, #0xf
+	adr	x13, smp_flags
+	add	x16, x13, #64
+	mrs	x15, midr_el1
+	str	x15, [x16, #0]
+	mrs	x15, currentel
+	str	x15, [x16, #8]
+	mrs	x15, mpidr_el1
+	str	x15, [x16, #16]
+	dsb	sy
+	mov	x14, #1
+	str	x14, [x13]
+	dsb	sy
+	dc	civac, x13
+	dc	civac, x16
+	dsb	sy
+7:	dc	civac, x16
+	dsb	sy
+	ldr	x14, [x16, #24]
+	cbz	x14, 7b
+	movz	x0, #0x8400, lsl #16	/* PSCI CPU_OFF 0x84000002 */
+	movk	x0, #0x0002
+	smc	#0
+8:	wfe
+	b	8b
+
 	.data
-	.balign	8
+	.balign	64
 	.globl smp_flags
 smp_flags:
-	.space	64
+	.space	128
 	.text
 
 .macro vent slot

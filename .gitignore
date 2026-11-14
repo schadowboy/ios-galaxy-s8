@@ -14,3 +14,6 @@ shim/a5xelte/out4k/
 shim/a5xelte/outxnu/
 shim/dreamlte/out/
 logs/
+
+# Samsung ACPM firmware taken from the phone: proprietary, local only
+shim/dreamlte/fw/

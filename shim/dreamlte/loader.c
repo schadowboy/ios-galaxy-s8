@@ -20,6 +20,9 @@
 #include "touch_probe.h"
 #include "pmic.h"
 #include "display_probe.h"
+#include "mngs_clk.h"
+#include "acpm.h"
+#include "gpu0.h"
 
 #define UFS_PROBE_DMA		0x8f0000000UL	/* high bank, outside XNU's window */
 
@@ -414,7 +417,166 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 	touch_probe(kv, out);
 	battery_probe(kv, out);
 	display_probe(kv, out);
-	mngs_probe(kv, out);
+	mngs_clk_dump(kv, out, "before");
+	pmic_rails(kv, out, "before acpm");
+	acpm_dump(kv, out);
+	acpm_plugins_dump(kv, out);
+	{
+		uint32_t lb[4] = { (1u << 23) | (3u << 26), 0, 0, 0 };	/* ACPM framework loopback test on channel 4 */
+		int lbrc = acpm_send(4, lb, 150);
+		out("ACPM loopback ch4\n");
+		kv("rc", (uint64_t)(int64_t)lbrc);
+		kv("r0", lb[0]);
+		kv("r1", lb[1]);
+		kv("r2", lb[2]);
+		kv("r3", lb[3]);
+		out("\n");
+	}
+	uint32_t a53_mhz = 0;	/* boot-arg a53freq=<MHz> from the payload cmdline */
+	for (int i = 0; i + 9 < BOOT_LINE_LENGTH && p->cmdline[i]; i++) {
+		const char *k = "a53freq=";
+		int m = 0;
+		while (k[m] && p->cmdline[i + m] == k[m])
+			m++;
+		if (k[m] || (i && p->cmdline[i - 1] != ' '))
+			continue;
+		for (int d = i + 8; d < BOOT_LINE_LENGTH && p->cmdline[d] >= '0' && p->cmdline[d] <= '9'; d++)
+			a53_mhz = a53_mhz * 10 + (uint32_t)(p->cmdline[d] - '0');
+		if (a53_mhz > 3000)
+			a53_mhz = 0;
+		break;
+	}
+	kv("a53freq arg MHz", a53_mhz);
+	out("\n");
+	int dvfsch_set = 0;	/* boot-arg dvfsch=<n>: DVFS channel override (absent = unchanged behaviour) */
+	for (int i = 0; i + 8 < BOOT_LINE_LENGTH && p->cmdline[i]; i++) {
+		const char *k = "dvfsch=";
+		int m = 0;
+		while (k[m] && p->cmdline[i + m] == k[m])
+			m++;
+		if (k[m] || (i && p->cmdline[i - 1] != ' '))
+			continue;
+		uint32_t v = 0;
+		int d = i + 7;
+		while (d < BOOT_LINE_LENGTH && p->cmdline[d] >= '0' && p->cmdline[d] <= '9')
+			v = v * 10 + (uint32_t)(p->cmdline[d++] - '0');
+		if (d > i + 7 && v < 16) {
+			acpm_set_dvfs_channel(v);
+			dvfsch_set = 1;
+		}
+		break;
+	}
+	int arc = acpm_attach_dvfs(kv, out);
+	kv("attach rc", (uint64_t)(int64_t)arc);
+	out("\n");
+	acpm_plugins_dump(kv, out);
+	acpm_log_dump(kv, out);
+	if (dvfsch_set && !arc)
+		acpm_ch0_experiment(kv, out, gpu0_flush);
+	if (!arc) {
+		acpm_fvmap_dump(kv, out);
+		if (!a53_mhz)
+			acpm_dvfs_rate(kv, out, ACPM_DVFS_IDX_CPUCL1, 1690000);
+	}
+	pmic_rails(kv, out, "after dvfs req");
+	acpm_log_dump(kv, out);
+	{
+		uint32_t mngs_mhz = 0;	/* boot-arg mngsfreq=<MHz> (needs dvfsch=0); absent = no change */
+		for (int i = 0; i + 10 < BOOT_LINE_LENGTH && p->cmdline[i]; i++) {
+			const char *k = "mngsfreq=";
+			int m = 0;
+			while (k[m] && p->cmdline[i + m] == k[m])
+				m++;
+			if (k[m] || (i && p->cmdline[i - 1] != ' '))
+				continue;
+			for (int d = i + 9; d < BOOT_LINE_LENGTH && p->cmdline[d] >= '0' && p->cmdline[d] <= '9'; d++)
+				mngs_mhz = mngs_mhz * 10 + (uint32_t)(p->cmdline[d] - '0');
+			if (mngs_mhz > 3000)
+				mngs_mhz = 0;
+			break;
+		}
+		if (mngs_mhz && !arc)
+			(void)mngs_set_freq(kv, out, mngs_mhz, gpu0_flush);
+		else if (mngs_mhz)
+			out("MNGS: DVFS plugin not attached, unchanged\n");
+	}
+	mngs_clk_dump(kv, out, "after acpm");
+	gpu0_flush();
+	uint32_t mexp = 0;	/* boot-arg mngsexp=<1|2|3>: Mongoose bring-up experiments; absent = no change */
+	for (int i = 0; i + 9 < BOOT_LINE_LENGTH && p->cmdline[i]; i++) {
+		const char *k = "mngsexp=";
+		int m = 0;
+		while (k[m] && p->cmdline[i + m] == k[m])
+			m++;
+		if (k[m] || (i && p->cmdline[i - 1] != ' '))
+			continue;
+		for (int d = i + 8; d < BOOT_LINE_LENGTH && p->cmdline[d] >= '0' && p->cmdline[d] <= '9'; d++)
+			mexp = mexp * 10 + (uint32_t)(p->cmdline[d] - '0');
+		if (mexp > 6)
+			mexp = 0;
+		break;
+	}
+	if (mexp) {
+		kv("MEXP: mngsexp", mexp);
+		gpu0_flush();
+	}
+	if (mexp == 1)
+		mngs_exp1(kv, out, gpu0_flush);
+	mngs_probe_x(kv, out, gpu0_flush, mexp);
+	gpu0_flush();
+	mngs_clk_dump(kv, out, "after");
+	pmic_rails(kv, out, "after probe");
+	if (mexp)
+		mngs_exp_restore(kv, out, gpu0_flush);
+	if (a53_mhz && !arc)
+		(void)a53_set_freq(kv, out, a53_mhz);	/* A53FREQ: lines; never leaves a half state */
+	else if (a53_mhz)
+		out("A53FREQ: DVFS plugin not attached, unchanged\n");
+	{
+		int lrc = ufs_write_log((const void *)prz->data, log_len);
+		kv("LOG flushed to USERDATA rc", (uint64_t)(int64_t)lrc);
+		out("\n");
+	}
+	/* wifiprobe=1: read-only dump of the Wi-Fi PCIe link state (smp_probe.c wifi_probe; default off, no change) */
+	{
+		int wp = 0;
+		extern void wifi_probe(void (*)(const char *, uint64_t), void (*)(const char *), void (*)(void));
+		extern void wifi_bringup(void (*)(const char *, uint64_t), void (*)(const char *), void (*)(void), unsigned);
+		for (int i = 0; i + 11 < BOOT_LINE_LENGTH && p->cmdline[i]; i++) {
+			const char *k = "wifiprobe=";
+			int m = 0;
+			while (k[m] && p->cmdline[i + m] == k[m])
+				m++;
+			if (k[m] || (i && p->cmdline[i - 1] != ' '))
+				continue;
+			wp = p->cmdline[i + 10] >= '1' && p->cmdline[i + 10] <= '9' ? p->cmdline[i + 10] - '0' : 0;
+			break;
+		}
+		if (wp == 1)
+			wifi_probe(kv, out, gpu0_flush);
+		else if (wp == 2)
+			wifi_bringup(kv, out, gpu0_flush, (unsigned)wp);
+		else if (wp >= 3) {
+			extern void wifi_link(void (*)(const char *, uint64_t), void (*)(const char *), void (*)(void), unsigned);
+			wifi_link(kv, out, gpu0_flush, (unsigned)wp);
+		}
+	}
+	/* gpuprobe=1: Stage 0 GPU identity probe (default off, no behaviour change) */
+	{
+		int gp = 0;
+		for (int i = 0; i + 9 < BOOT_LINE_LENGTH && p->cmdline[i]; i++) {
+			const char *k = "gpuprobe=";
+			int m = 0;
+			while (k[m] && p->cmdline[i + m] == k[m])
+				m++;
+			if (k[m] || (i && p->cmdline[i - 1] != ' '))
+				continue;
+			gp = p->cmdline[i + 9] == '1';
+			break;
+		}
+		if (gp)
+			gpu0_probe(kv, out, gpu0_flush);
+	}
 	/* smp_probe(kv, out) proved the PMU power-up (boot 19); it leaves the
 	 * probed cores' PMU power on, which hid the 0 -> 0xF edge XNU needs. */
 	(void)smp_probe;
@@ -423,7 +585,29 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 	reserve_marker();
 	clean(RAMOOPS_CONSOLE, RAMOOPS_CONSOLE + RAMOOPS_CONSOLE_SIZE);
 	clean(RAMOOPS_PMSG, RAMOOPS_PMSG + RAMOOPS_CONSOLE_SIZE);
+	(void)ufs_write_log((const void *)prz->data, log_len);
 	return entry_pa;
+}
+
+/* GPU0: flush the whole log to USERDATA before each risky step */
+void gpu0_flush(void)
+{
+	(void)ufs_write_log((const void *)prz->data, log_len);
+}
+
+/* Reset into TWRP recovery: Samsung INFORM2/INFORM3 + PMU SWRESET recipe.
+ * Only used on fatal paths. PMU base as in smp_probe.c. */
+#define S8_PMU_BASE		0x16480000UL
+static void s8_reset_recovery(void)
+{
+	__asm__ volatile("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(S8_PMU_BASE + 0x808) = 0x12345678U;	/* INFORM2 */
+	*(volatile uint32_t *)(S8_PMU_BASE + 0x80c) = 0x12345674U;	/* INFORM3 'recovery' */
+	__asm__ volatile("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(S8_PMU_BASE + 0x400) = 1;		/* SWRESET */
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (;;)
+		__asm__ volatile("wfe");
 }
 
 void dl_exception(uint64_t slot)
@@ -438,9 +622,11 @@ void dl_exception(uint64_t slot)
 	kv("ESR", esr);
 	kv("ELR", elr);
 	kv("FAR", far);
-	out("\n");
-	for (;;)
-		__asm__ volatile("wfe");
+	out("\nS8RECOV: resetting to recovery\n");
+	/* push the ramoops copies of this log out of the caches first */
+	clean(RAMOOPS_CONSOLE, RAMOOPS_CONSOLE + RAMOOPS_CONSOLE_SIZE);
+	clean(RAMOOPS_PMSG, RAMOOPS_PMSG + RAMOOPS_CONSOLE_SIZE);
+	s8_reset_recovery();
 }
 
 /* gcc may emit calls for struct copies; keep the image self-contained. */
