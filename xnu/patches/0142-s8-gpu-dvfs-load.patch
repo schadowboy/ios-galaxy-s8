@@ -1,0 +1,247 @@
+Subject: [PATCH] 0142 load-based GPU DVFS and GPU thermal cap
+
+With s8gpudvfs=<kHz>: the Mali driver boosts to the busy rate (lowered by the thermal cap) on every job submit, drops to
+260 MHz after 400 ms without a job, and follows a thermal cap from the GPU temperature (s8gputmu=1: 546 MHz below
+85 C, 455/338/260 MHz from 85/95/105 C, released 3 C lower). Log lines: GPUDVFS:, S8DVFS: gpu temp=... cap=...
+---
+diff --git a/osfmk/kern/s8_acpm.c b/osfmk/kern/s8_acpm.c
+index 9b939f1..00e249d 100644
+--- a/osfmk/kern/s8_acpm.c
++++ b/osfmk/kern/s8_acpm.c
+@@ -468,6 +468,37 @@ s8t_gpu_read(uint32_t *rawp)
+ 	return temp;
+ }
+ 
++/*
++ * GPU thermal cap for the Mali driver's clock (s8_mali_drv.c): the latest GPU temperature (set by the governor thread
++ * when s8gputmu=1, -1000 = unknown) and the highest GPU rate allowed at that temperature. 546 MHz below 85 C, then
++ * 455 / 338 / 260 MHz from 85 / 95 / 105 C, released 3 C lower. Without a reading there is no cap.
++ */
++volatile int s8_gpu_temp_c = -1000;
++
++uint32_t s8_gpu_cap_khz(void);
++
++uint32_t
++s8_gpu_cap_khz(void)
++{
++	static const int trip[3] = { 85, 95, 105 };
++	static const uint32_t rate[4] = { 546000, 455000, 338000, 260000 };
++	static int level;
++	int t = s8_gpu_temp_c;
++
++	if (t > -1000) {
++		int want = 0;
++		while (want < 3 && t >= trip[want]) {
++			want++;
++		}
++		if (want >= level) {
++			level = want;
++		} else if (t < trip[level - 1] - 3) {
++			level--;
++		}
++	}
++	return rate[level];
++}
++
+ /* ---------------------------------------------------------------- governor */
+ 
+ #define S8G_FLOOR_IDX   7       /* 598 MHz: lowest load-driven step */
+@@ -600,7 +631,7 @@ s8g_thread(void *arg, wait_result_t result)
+ 			}
+ 		}
+ 
+-		/* GPU temperature, log only, about every 10 s at the default 500 ms interval */
++		/* GPU temperature: read every round (feeds s8_gpu_cap_khz), logged about every 10 s at the default 500 ms interval */
+ 		{
+ 			static uint32_t gcnt, gon = 2;
+ 			if (gon == 2) {
+@@ -608,10 +639,13 @@ s8g_thread(void *arg, wait_result_t result)
+ 				/* boot-arg s8gputmu=1: read the GPU TMU block (its clock/power is unproven: off by default) */
+ 				gon = PE_parse_boot_argn("s8gputmu", &v, sizeof(v)) && v != 0;
+ 			}
+-			if (gon && !s8g_therm_off && (gcnt++ % 20) == 0) {
++			if (gon && !s8g_therm_off) {
+ 				uint32_t graw = 0;
+ 				int gt = s8t_gpu_read(&graw);
+-				printf("S8DVFS: gpu temp=%d C raw=%u\n", gt, graw);
++				s8_gpu_temp_c = gt;
++				if ((gcnt++ % 20) == 0) {
++					printf("S8DVFS: gpu temp=%d C raw=%u cap=%u kHz\n", gt, graw, s8_gpu_cap_khz());
++				}
+ 			}
+ 		}
+ 
+@@ -711,6 +745,7 @@ s8dvfs_init(void)
+ 
+ int s8_acpm_set_rate(uint32_t domain, uint32_t khz, uint32_t *resp);
+ void s8dvfs_init(void);
++uint32_t s8_gpu_cap_khz(void);
+ 
+ int
+ s8_acpm_set_rate(uint32_t domain, uint32_t khz, uint32_t *resp)
+@@ -721,6 +756,12 @@ s8_acpm_set_rate(uint32_t domain, uint32_t khz, uint32_t *resp)
+ 	return -1;
+ }
+ 
++uint32_t
++s8_gpu_cap_khz(void)
++{
++	return 546000;
++}
++
+ void
+ s8dvfs_init(void)
+ {
+diff --git a/osfmk/kern/s8_mali_drv.c b/osfmk/kern/s8_mali_drv.c
+index bb2c38f..74bf2cb 100755
+--- a/osfmk/kern/s8_mali_drv.c
++++ b/osfmk/kern/s8_mali_drv.c
+@@ -610,26 +610,112 @@ fail:
+  * last close at 260000 (Samsung's governor start clock). Called with s8d_lock held; the ACPM client has its own lock.
+  */
+ extern int s8_acpm_set_rate(uint32_t domain, uint32_t khz, uint32_t *resp);
++extern uint32_t s8_gpu_cap_khz(void);
+ 
++#define GPU_IDLE_KHZ    260000
++#define GPU_IDLE_MS     400     /* no job for this long while open: back to the idle rate */
++
++static int g_dvfs = -1;                 /* -1 = boot-arg not read yet, 0 = off, 1 = on */
++static uint32_t g_busy_khz = 546000;    /* s8gpudvfs value */
++static uint32_t g_cur_khz;              /* last rate the APM accepted, 0 = unknown */
++static uint64_t g_last_submit;          /* mach_absolute_time of the last job, 0 = none */
++
++static bool
++gpu_dvfs_on(void)
++{
++	uint32_t v = 0;
++
++	if (g_dvfs < 0) {
++		g_dvfs = PE_parse_boot_argn("s8gpudvfs", &v, sizeof(v)) && v != 0;
++		if (g_dvfs && v > 1) {
++			g_busy_khz = v;
++		}
++	}
++	return g_dvfs == 1;
++}
++
++/* Request 'khz' if it is not the current rate. Called with s8d_lock held; the ACPM client has its own lock. */
+ static void
+-gpu_clock(bool busy)
++gpu_set(uint32_t khz, const char *why)
+ {
+-	static int armed = -1;
+-	static uint32_t busy_khz = 546000;
+-	uint32_t v = 0, resp = 0;
++	uint32_t resp = 0;
+ 	int rc;
+ 
+-	if (armed < 0) {
+-		armed = PE_parse_boot_argn("s8gpudvfs", &v, sizeof(v)) && v != 0;
+-		if (armed && v > 1) {
+-			busy_khz = v;
+-		}
++	if (khz == g_cur_khz) {
++		return;
+ 	}
+-	if (!armed) {
++	rc = s8_acpm_set_rate(4, khz, &resp);
++	P("GPUDVFS: %s -> %u kHz rc=%d apm_resp=%u", why, khz, rc, resp);
++	if (rc == 0) {
++		g_cur_khz = khz;
++	}
++}
++
++/* The rate wanted while jobs run: the s8gpudvfs value, lowered by the thermal cap. */
++static uint32_t
++gpu_busy_khz(void)
++{
++	uint32_t cap = s8_gpu_cap_khz();
++
++	return g_busy_khz < cap ? g_busy_khz : cap;
++}
++
++/* A job is about to start (s8d_lock held): boost at once. */
++static void
++gpu_note_job(void)
++{
++	if (!gpu_dvfs_on()) {
+ 		return;
+ 	}
+-	rc = s8_acpm_set_rate(4, busy ? busy_khz : 260000, &resp);
+-	P("GPUDVFS: %s -> %u kHz rc=%d apm_resp=%u", busy ? "busy" : "idle", busy ? busy_khz : 260000, rc, resp);
++	g_last_submit = mach_absolute_time();
++	gpu_set(gpu_busy_khz(), "busy");
++}
++
++/* Open/close of the first/last client (s8d_lock held). */
++static void
++gpu_clock(bool busy)
++{
++	if (!gpu_dvfs_on()) {
++		return;
++	}
++	if (busy) {
++		g_last_submit = mach_absolute_time();
++		gpu_set(gpu_busy_khz(), "open");
++	} else {
++		gpu_set(GPU_IDLE_KHZ, "close");
++	}
++}
++
++/*
++ * Idle/thermal thread (only with s8gpudvfs): every 200 ms, while the GPU is up, drop to the idle rate when no job ran for
++ * GPU_IDLE_MS, and follow the thermal cap down when the temperature has called for a lower rate.
++ */
++static void
++s8mali_dvfs_thread(void *arg, wait_result_t result)
++{
++	static int ev;
++
++	(void)arg;
++	(void)result;
++	for (;;) {
++		uint64_t deadline, idle_abs;
++
++		clock_interval_to_deadline(200, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&ev, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		lck_mtx_lock(&s8d_lock);
++		if (g_up && gpu_dvfs_on()) {
++			uint32_t cap = s8_gpu_cap_khz();
++
++			nanoseconds_to_absolutetime((uint64_t)GPU_IDLE_MS * NSEC_PER_MSEC, &idle_abs);
++			if (g_last_submit != 0 && mach_absolute_time() - g_last_submit > idle_abs) {
++				gpu_set(GPU_IDLE_KHZ, "idle");
++			} else if (g_cur_khz > cap) {
++				gpu_set(cap, "thermal cap");
++			}
++		}
++		lck_mtx_unlock(&s8d_lock);
++	}
+ }
+ 
+ bool s8mali_gpu_open(void);
+@@ -839,6 +925,7 @@ s8mali_gpu_submit(uint64_t chain, bool fragment, uint64_t *seq)
+ 		lck_mtx_unlock(&s8d_lock);
+ 		return 0xfe;
+ 	}
++	gpu_note_job();
+ 	wr(JOB_INT_MASK, 0);
+ 	wr(JOB_INT_CLEAR, done | fail);
+ 	wr(MMU_INT_CLEAR, 0xffffffffu);
+@@ -939,6 +1026,15 @@ s8mali_drv_init(void)
+ 	} else {
+ 		P("thread start failed");
+ 	}
++	if (gpu_dvfs_on()) {
++		if (kernel_thread_start_priority(s8mali_dvfs_thread, NULL, BASEPRI_DEFAULT, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			P("GPUDVFS: idle/thermal thread started (busy %u kHz, idle %u kHz after %u ms)", g_busy_khz, GPU_IDLE_KHZ,
++			    GPU_IDLE_MS);
++		} else {
++			P("GPUDVFS: thread start failed");
++		}
++	}
+ }
+ 
+ #else /* !ARM64_BOARD_CONFIG_A5XELTE */
