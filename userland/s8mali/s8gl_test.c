@@ -11,6 +11,7 @@
  * "S8GL-TEST: <what> PASS|FAIL" lines; the last line is "S8GL-TEST: all passed" or "S8GL-TEST: N failures".
  */
 #include <dlfcn.h>
+#include <errno.h>
 #include <mach/mach_time.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -48,6 +49,20 @@
 #include "../mesa/overlay/src/s8-drm/s8_drm_ops.h"
 
 extern int s8mali_wait_service(int seconds); /* s8mali_drm.c */
+
+/*
+ * Mesa's GLSL built-in library alone takes tens of MB when the first shader is compiled, and a launchd daemon gets a small
+ * fatal per-task memory limit (jetsam "per-process limit", kill reason 1/7). The kernel's memorystatus_control() lets a
+ * root process set its own limit: command 7 = SET_MEMLIMIT_PROPERTIES (bsd/sys/kern_memorystatus.h), MB, attribute 0 = soft.
+ */
+extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t buffersize);
+struct memlimit_props {
+	int32_t active;
+	uint32_t active_attr;
+	int32_t inactive;
+	uint32_t inactive_attr;
+};
+#define S8_MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES 7
 
 /* the shim's DRM calls that s8mali_drm.h does not declare (s8mali_drm.c) */
 extern int drmCommandWrite(int fd, unsigned long index, const void *data, unsigned long size);
@@ -278,6 +293,14 @@ main(int argc, char **argv)
 	say("S8GL-TEST: start pid %d uid %d\n", (int)getpid(), (int)getuid());
 	if (width < 16 || height < 16 || width > 4096 || height > 4096) {
 		width = height = 256;
+	}
+	{
+		struct memlimit_props limit = { 1800, 0, 1800, 0 };
+		int rc = memorystatus_control(S8_MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES, (int32_t)getpid(), 0, &limit,
+		    sizeof(limit));
+
+		say("S8GL-TEST: memorystatus_control(SET_MEMLIMIT_PROPERTIES 1800 MB soft) rc %d errno %d\n", rc, rc ? errno : 0);
+		verdict("memory limit raised", rc == 0);
 	}
 	/* started at boot, the S8Mali service may not be there yet; Mesa would fall back to softpipe without a word */
 	verdict("S8Mali service present (waited up to 90 s)", s8mali_wait_service(90));
