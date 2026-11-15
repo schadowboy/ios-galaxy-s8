@@ -1,6 +1,6 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..1204a99
+index 0000000..501c8e9
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
 @@ -0,0 +1,825 @@
@@ -425,7 +425,7 @@ index 0000000..1204a99
 +	uint32_t lines = 0;
 +	uint8_t * shadow;
 +
-+	if (fDumpLines >= 2500 || fShadow == NULL || region >= kShmemMax) {
++	if (fDumpLines >= 9000 || fShadow == NULL || region >= kShmemMax) {
 +		return;
 +	}
 +	shadow = fShadow[region];
@@ -450,7 +450,7 @@ index 0000000..1204a99
 +		}
 +		IOLog("S8AGX: D %u %s %u type %u va 0x%llx len 0x%zx\n", (unsigned)fSubmitDumps, what, (unsigned)id, (unsigned)type, (unsigned long long)va, len);
 +	}
-+	for (size_t k = 0; k + 64 <= len && lines < 400; k += 64) {
++	for (size_t k = 0; k + 64 <= len && lines < 1100; k += 64) {
 +		bool nz = false;
 +		char hex[64 * 2 + 1];
 +
