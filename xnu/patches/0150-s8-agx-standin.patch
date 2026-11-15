@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..15d6878
+index 0000000..fbc0824
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,684 @@
+@@ -0,0 +1,681 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -567,8 +567,7 @@ index 0000000..15d6878
 +		bzero(o, args->structureOutputSize);
 +		*(uint64_t *)o = (uint64_t)map->getVirtualAddress();
 +		*(uint32_t *)(o + 8) = ++fNqId;
-+		IOLog("S8AGX: notification queue %u created: %llu x %llu bytes at 0x%llx
-+", (unsigned)fNqId, entries, esize,
++		IOLog("S8AGX: notification queue %u created: %llu x %llu bytes at 0x%llx\n", (unsigned)fNqId, entries, esize,
 +		    (unsigned long long)map->getVirtualAddress());
 +		return kIOReturnSuccess;
 +	}
@@ -579,8 +578,7 @@ index 0000000..15d6878
 +		if (cq >= 1 && cq <= kNqMax && nq >= 1 && nq <= kNqMax) {
 +			fCqNq[cq - 1] = (uint32_t)nq;
 +		}
-+		IOLog("S8AGX: command queue %llu -> notification queue %llu
-+", cq, nq);
++		IOLog("S8AGX: command queue %llu -> notification queue %llu\n", cq, nq);
 +		return kIOReturnSuccess;
 +	}
 +	if (selector == 0x1a && args->scalarInputCount >= 4 && args->structureInput != NULL) {
@@ -607,8 +605,7 @@ index 0000000..15d6878
 +				posted++;
 +			}
 +		}
-+		IOLog("S8AGX: submit on command queue %llu: %llu command buffer(s), %u completion record(s) posted
-+", cq, count, (unsigned)posted);
++		IOLog("S8AGX: submit on command queue %llu: %llu command buffer(s), %u completion record(s) posted\n", cq, count, (unsigned)posted);
 +		return kIOReturnSuccess;
 +	}
 +	if (selector == 0x100 && args->structureOutput != NULL && args->structureOutputSize >= 0x78) {
