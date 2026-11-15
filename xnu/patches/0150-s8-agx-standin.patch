@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..fbc0824
+index 0000000..0d3014e
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,681 @@
+@@ -0,0 +1,693 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -173,6 +173,8 @@ index 0000000..fbc0824
 +	IOSharedDataQueue * fNq[kNqMax];        /* notification queue n (id n) at [n - 1]: completion notifications for userland */
 +	IOMemoryMap * fNqMap[kNqMax];           /* its mapping in the client's task */
 +	uint32_t fCqNq[kNqMax];                 /* command queue id n -> notification queue id (selector 0x19) */
++	bool fNqPortSet[kNqMax];                /* a notification port was registered for queue n */
++	uint32_t fCompletionLogs;
 +
 +	bool postCompletion(uint32_t cmdQueue, uint64_t cookie, uint64_t t1, uint64_t t2, uint32_t status);
 +	uint32_t * fSelCount;           /* 0x200 entries: calls per selector of THIS client (the log shows the first few of each) */
@@ -368,6 +370,10 @@ index 0000000..fbc0824
 +	if (agx_log_ok()) {
 +		IOLog("S8AGX: registerNotificationPort port %p type %u refCon 0x%x\n", (void *)port,(unsigned)type, (unsigned)refCon);
 +	}
++	if (type == 0 && refCon >= 1 && refCon <= kNqMax && fNq[refCon - 1] != NULL) {
++		fNq[refCon - 1]->setNotificationPort(port);    /* the queue's data-available messages go to this port */
++		fNqPortSet[refCon - 1] = true;
++	}
 +	return kIOReturnSuccess;
 +}
 +
@@ -390,7 +396,13 @@ index 0000000..fbc0824
 +	*(uint64_t *)(rec + 8) = t1;
 +	*(uint64_t *)(rec + 0x10) = t2;
 +	*(uint32_t *)(rec + 0x18) = status;
-+	return fNq[nq - 1]->enqueue(rec, sizeof(rec));
++	bool ok = fNq[nq - 1]->enqueue(rec, sizeof(rec));
++
++	if (fCompletionLogs++ < 8) {
++		IOLog("S8AGX: completion record cookie 0x%llx status %u -> notification queue %u: enqueue %s%s\n", (unsigned long long)cookie, (unsigned)status, (unsigned)nq,
++		    ok ? "ok" : "FAILED", fNqPortSet[nq - 1] ? ", port bound" : ", NO PORT");
++	}
++	return ok;
 +}
 +
 +/* Stage A: every shared-memory type is a zeroed 64 KiB buffer, so the userland mapping succeeds and the next call shows up. */
