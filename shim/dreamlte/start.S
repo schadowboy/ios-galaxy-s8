@@ -58,13 +58,22 @@ _start:
 	dsb	sy
 	isb
 	br	x16
-	/* dl_main returned 0: either the failure path, or the kernel was handed to a Mongoose core (mongoose_handoff). Power this core off
-	 * (PSCI CPU_OFF) so XNU can start it later as an ordinary secondary; if that returns, park. */
-4:	movz	x0, #0x8400, lsl #16
-	movk	x0, #0x0002		/* PSCI CPU_OFF 0x84000002 */
-	smc	#0
+	/* dl_main returned 0: either the failure path, or the kernel was handed to a Mongoose core (mongoose_handoff). This firmware does not
+	 * restart its boot core after PSCI CPU_OFF (the kernel's start sequence never brought core 0x100 back), so park instead: wait on the
+	 * mailbox at 0x8f000200. SweetCPU::startCPU (DREAMLTE, MPIDR 0x100) writes the physical address of the secondary entry trampoline
+	 * there and sends an event; this core is already at EL1 with the MMU off, which is what that entry expects. */
+4:	movz	x1, #0x0200
+	movk	x1, #0x8f00, lsl #16
+	str	xzr, [x1]
+	dsb	sy
 5:	wfe
-	b	5b
+	ldr	x2, [x1]
+	cbz	x2, 5b
+	ic	iallu
+	dsb	sy
+	isb
+	mov	x0, xzr
+	br	x2
 
 /*
  * mongoose_handoff (smp_probe.c) starts this on Mongoose core 0 with PSCI CPU_ON: the loader's own jump to XNU, performed by that core.

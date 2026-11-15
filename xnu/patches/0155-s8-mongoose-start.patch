@@ -131,7 +131,7 @@ index 1c17ab4..93f9670 100644
  int sweet_ufs_rootdev(dev_t *dev);
  
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 5bd24a7..d5cf670 100644
+index 5bd24a7..fead48b 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -22,6 +22,13 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -319,7 +319,7 @@ index 5bd24a7..d5cf670 100644
  		}
  		volatile uint32_t *t = (volatile uint32_t *)tramp;
  		t[0] = 0x58000041;              /* ldr x1, #8 */
-@@ -318,6 +422,24 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+@@ -318,6 +422,35 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
  		IOLog(CPU_PORT_NAME " CPU: cpu=%u entry 0x%llx via low trampoline 0x%llx\n",
  		    getCPUNumber(), (uint64_t)entry, tramp_pa);
  		entry = (vm_offset_t)tramp_pa;
@@ -340,11 +340,22 @@ index 5bd24a7..d5cf670 100644
 +				__builtin_arm_dsb(DSB_SY);
 +			}
 +			IOLog(CPU_PORT_NAME " CPU: cpu=%u Mongoose: plain CPU_ON, GICD_CTLR=0x%x\n", getCPUNumber(), *ctl);
++		} else if (cpu->phys_id == 0x100) {
++			/*
++			 * The loader's own core (S-Boot starts the loader on A53 0x100; the loader hands XNU to Mongoose core 0). EL3 does not
++			 * restart that core after CPU_OFF, so the loader parks it on a mailbox (start.S): release it by writing the entry PA there.
++			 */
++			volatile uint64_t *mb = (volatile uint64_t *)(tramp + 0x200);
++			*mb = (uint64_t)tramp_pa;
++			__builtin_arm_dsb(DSB_SY);
++			__asm__ volatile ("sev" ::: "memory");
++			IOLog(CPU_PORT_NAME " CPU: cpu=%u released the parked loader core (mailbox)\n", getCPUNumber());
++			return KERN_SUCCESS;
 +		} else {
  		static vm_offset_t pmu;
  		if (pmu == 0) {
  			pmu = ml_io_map(0x16480000, 0x10000);
-@@ -343,6 +465,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+@@ -343,6 +476,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
  		}
  		IOLog(CPU_PORT_NAME " CPU: cpu=%u first CPU_ON rc=%d, PMU power-up cfg=0x%x status=0x%x\n",
  		    getCPUNumber(), rc0, cfg[0], cfg[1]);
