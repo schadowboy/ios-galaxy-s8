@@ -71,41 +71,41 @@ main(void)
 		id<MTLBuffer> buf2 = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
 		LOG("S8MTL: buffer %p contents %p\n", (__bridge void *)buf, buf ? [buf contents] : NULL);
 		/*
-		 * A family of tiny kernels with known meaning: ONE boot captures the program heap of all of them, so the AGX machine code can be decoded by
-		 * comparing them (differential reverse engineering). Each is compiled, dispatched over 64 threads with buffers 0 (output) and 1 (input,
-		 * filled with 0..63), committed and waited for (up to 5 s); the kernel side dumps what changed in memory at every submit.
+		 * A family of tiny kernels, each differing from its neighbours in ONE thing, so the AGX machine code can be decoded by comparing the
+		 * binaries (one line of the program heap per kernel, captured by the kernel side at every submit). Dispatched over 64 threads with
+		 * buffer 0 = output, buffer 1 = input (0..63). The kernel NUMBER n is logged with its source; session n+1 of the capture is kernel n.
 		 */
-		static const char *names[] = { "k_mul2", "k_add1", "k_mul3add7", "k_shl2", "k_fmul", "k_copy_add1", "k_loop", "k_select" };
 		static const char *bodies[] = {
-			"a[i] = i * 2;",
-			"a[i] = i + 1;",
-			"a[i] = i * 3 + 7;",
-			"a[i] = i << 2;",
-			"device float *f = (device float *)a; f[i] = float(i) * 0.5f;",
-			"a[i] = b[i] + 1;",
-			"uint s = 0; for (uint j = 0; j < i; j++) { s += j; } a[i] = s;",
-			"a[i] = (i & 1) ? 5u : 9u;",
+			"a[i] = i + 0;", "a[i] = i + 1;", "a[i] = i + 2;", "a[i] = i + 3;", "a[i] = i + 4;", "a[i] = i + 7;", "a[i] = i + 100;",
+			"a[i] = i + 255;", "a[i] = i + 256;", "a[i] = i + 65535;",
+			"a[i] = i * 1;", "a[i] = i * 2;", "a[i] = i * 3;", "a[i] = i * 4;", "a[i] = i * 5;", "a[i] = i * 6;", "a[i] = i * 7;", "a[i] = i * 10;",
+			"a[i] = i << 1;", "a[i] = i << 3;", "a[i] = i >> 1;", "a[i] = i >> 2;",
+			"a[i] = i & 15;", "a[i] = i | 16;", "a[i] = i ^ 255;",
+			"a[i] = 100 - i;", "a[i] = i - 1;",
+			"device float *f = (device float *)a; f[i] = float(i) * 2.0f;", "device float *f = (device float *)a; f[i] = float(i) + 1.0f;",
+			"a[i] = b[i];", "a[i] = b[i] + b[i];",
 		};
-		for (int n = 0; n < 8 && q != nil && buf != nil; n++) {
+		int count = (int)(sizeof(bodies) / sizeof(bodies[0]));
+		for (int n = 0; n < count && q != nil && buf != nil; n++) {
 			NSError *err = nil;
 			uint32_t *in = (uint32_t *)[buf2 contents];
 			for (uint32_t t = 0; t < 64; t++) {
 				in[t] = t;
 			}
 			NSString *src = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\n"
-			    "kernel void %s(device uint *a [[buffer(0)]], device const uint *b [[buffer(1)]], uint i [[thread_position_in_grid]]) { %s }\n",
-			    names[n], bodies[n]];
-			LOG("S8MTL: ==== kernel %d %s: %s\n", n, names[n], bodies[n]);
+			    "kernel void kk(device uint *a [[buffer(0)]], device const uint *b [[buffer(1)]], uint i [[thread_position_in_grid]]) { %s }\n",
+			    bodies[n]];
+			LOG("S8MTL: ==== kernel %d: %s\n", n, bodies[n]);
 			id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
-			LOG("S8MTL: library %p error %s\n", (__bridge void *)lib, err ? [[err description] UTF8String] : "none");
 			if (lib == nil) {
+				LOG("S8MTL: library failed: %s\n", err ? [[err description] UTF8String] : "?");
 				continue;
 			}
-			id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:names[n]]];
+			id<MTLFunction> fn = [lib newFunctionWithName:@"kk"];
 			err = nil;
 			id<MTLComputePipelineState> ps = fn ? [dev newComputePipelineStateWithFunction:fn error:&err] : nil;
-			LOG("S8MTL: pipeline %p error %s\n", (__bridge void *)ps, err ? [[err description] UTF8String] : "none");
 			if (ps == nil) {
+				LOG("S8MTL: pipeline failed: %s\n", err ? [[err description] UTF8String] : "?");
 				continue;
 			}
 			id<MTLCommandBuffer> cb = [q commandBuffer];
@@ -115,14 +115,12 @@ main(void)
 			[enc setBuffer:buf2 offset:0 atIndex:1];
 			[enc dispatchThreads:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 			[enc endEncoding];
-			LOG("S8MTL: committing kernel %d\n", n);
 			[cb commit];
 			for (int w = 0; w < 5 && [cb status] < MTLCommandBufferStatusCompleted; w++) {
 				sleep(1);
 			}
 			uint32_t *p = (uint32_t *)[buf contents];
-			LOG("S8MTL: kernel %d status %ld error %s; a[0..7] = %u %u %u %u %u %u %u %u\n", n, (long)[cb status],
-			    [cb error] ? [[[cb error] description] UTF8String] : "none", p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+			LOG("S8MTL: kernel %d status %ld a[0..5] = %u %u %u %u %u %u\n", n, (long)[cb status], p[0], p[1], p[2], p[3], p[4], p[5]);
 		}
 		LOG("S8MTL: done\n");
 	}
