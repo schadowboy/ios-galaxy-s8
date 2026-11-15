@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..952d339
+index 0000000..dd0540f
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,410 @@
+@@ -0,0 +1,473 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -164,7 +164,11 @@ index 0000000..952d339
 +	IOMemoryMap * fShmemMap[kShmemMax];
 +	UInt32 fShmemCount;
 +
++	UInt32 fQueueId;                /* last command queue id handed out (selector 7) */
++	UInt32 fNqId;                   /* last notification queue id handed out (selector 15) */
++
 +	IOReturn createShmem(IOExternalMethodArguments * args);
++	IOReturn allocShmem(uint64_t size, uint64_t * userAddress);
 +	void releaseShmem(void);
 +
 +public:
@@ -209,6 +213,34 @@ index 0000000..952d339
 +		}
 +	}
 +	fShmemCount = 0;
++}
++
++/* Zeroed kernel memory mapped into the client's task, kept until the client closes. */
++IOReturn
++AGXDeviceUserClient::allocShmem(uint64_t size, uint64_t * userAddress)
++{
++	IOBufferMemoryDescriptor * buf;
++	IOMemoryMap * map;
++
++	if (size == 0 || size > (64ULL << 20) || fShmemCount >= kShmemMax) {
++		return kIOReturnNoResources;
++	}
++	size = (size + 0x3fffULL) & ~0x3fffULL;
++	buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, (vm_size_t)size, 0x4000);
++	if (buf == NULL) {
++		return kIOReturnNoMemory;
++	}
++	bzero(buf->getBytesNoCopy(), (size_t)size);
++	map = buf->createMappingInTask(fTask, 0, kIOMapAnywhere);
++	if (map == NULL) {
++		buf->release();
++		return kIOReturnVMError;
++	}
++	fShmemBuf[fShmemCount] = buf;
++	fShmemMap[fShmemCount] = map;
++	fShmemCount++;
++	*userAddress = (uint64_t)map->getVirtualAddress();
++	return kIOReturnSuccess;
 +}
 +
 +/*
@@ -336,6 +368,37 @@ index 0000000..952d339
 +	}
 +	if (args->scalarOutput != NULL) {
 +		bzero(args->scalarOutput, args->scalarOutputCount * sizeof(uint64_t));
++	}
++	if (selector == 7 && args->structureOutput != NULL && args->structureOutputSize >= 16) {
++		/* IOGPUCommandQueueCreateWithQoS: in 0x408 B (process name 0x400, qos u32, flag byte), out { queue id (must be non-zero), shared state } */
++		uint8_t * o = (uint8_t *)args->structureOutput;
++		uint64_t state = 0;
++		IOReturn r = allocShmem(0x4000, &state);
++
++		if (r != kIOReturnSuccess) {
++			return r;
++		}
++		bzero(o, args->structureOutputSize);
++		*(uint64_t *)o = ++fQueueId;
++		*(uint64_t *)(o + 8) = state;
++		IOLog("S8AGX: command queue %u created (state page 0x%llx)\n", (unsigned)fQueueId, (unsigned long long)state);
++		return kIOReturnSuccess;
++	}
++	if (selector == 0xf && args->structureOutput != NULL && args->structureOutputSize >= 16 && args->scalarInputCount >= 2) {
++		/* IOGPUNotificationQueueCreate: scalars { entries, entry size }, out { user address of the queue memory, queue id (u32, non-zero) } */
++		uint8_t * o = (uint8_t *)args->structureOutput;
++		uint64_t addr = 0;
++		uint64_t entries = args->scalarInput[0] & 0xffffffffULL, esize = args->scalarInput[1] & 0xffffffffULL;
++		IOReturn r = allocShmem(entries * esize + 0x4000, &addr);
++
++		if (r != kIOReturnSuccess) {
++			return r;
++		}
++		bzero(o, args->structureOutputSize);
++		*(uint64_t *)o = addr;
++		*(uint32_t *)(o + 8) = ++fNqId;
++		IOLog("S8AGX: notification queue %u created: %llu x %llu bytes at 0x%llx\n", (unsigned)fNqId, entries, esize, (unsigned long long)addr);
++		return kIOReturnSuccess;
 +	}
 +	if (selector == 0x100 && args->structureOutput != NULL && args->structureOutputSize >= 0x78) {
 +		/*
