@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..e9ff1d3
+index 0000000..029184d
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,1307 @@
+@@ -0,0 +1,1315 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -644,8 +644,9 @@ index 0000000..e9ff1d3
 +		uint64_t nd = fShmemBuf[r]->getLength() / 4;
 +
 +		for (uint64_t i = 0; i + 4 < nd; i++) {
-+			bool vtx = (d[i] == 0x0001001fu || d[i] == 0x0001002fu) && d[i + 2] == 0x108u;
-+			bool frg = (d[i] == 0x0009051fu || d[i] == 0x0009851fu || d[i] == 0x0009011fu) && (d[i + 2] == 0x108u || d[i + 3] == 0x108u);
++			uint32_t hi = d[i] >> 16, lo = d[i] & 0xffff;
++			bool vtx = hi == 0x0001u && (lo & 0xf) == 0xf && d[i + 2] == 0x108u;
++			bool frg = hi == 0x0009u && (lo & 0xf) == 0xf && (d[i + 2] == 0x108u || d[i + 3] == 0x108u) && d[i + 1] != 0;
 +
 +			if (!vtx && !frg) {
 +				continue;
@@ -680,7 +681,14 @@ index 0000000..e9ff1d3
 +					hex[k * 2 + 1] = "0123456789abcdef"[base[o + k] & 15];
 +				}
 +				hex[64] = 0;
-+				IOLog("S8AGX: P %c 0x%llx entry %u start %u o %u %s\n", vtx ? 'v' : 'f', (unsigned long long)va, (unsigned)off, start, o, hex);
++				IOLog("S8AGX: P %c 0x%llx entry %u start %u o %u %s hdr %08x\n", vtx ? 'v' : 'f', (unsigned long long)va, (unsigned)off, start, o, hex,
++				    (unsigned)d[i]);
++			}
++			/* the state record and its neighbourhood (the uniform-push record sits just before it) */
++			if (i >= 8 && i + 8 < nd) {
++				IOLog("S8AGX: R %c 0x%llx res %u idx %llu %08x %08x %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x %08x %08x %08x %08x\n", vtx ? 'v' : 'f',
++				    (unsigned long long)va, (unsigned)n, (unsigned long long)i, d[i - 8], d[i - 7], d[i - 6], d[i - 5], d[i - 4], d[i - 3], d[i - 2], d[i - 1],
++				    d[i], d[i + 1], d[i + 2], d[i + 3], d[i + 4], d[i + 5], d[i + 6], d[i + 7]);
 +			}
 +		}
 +	}
