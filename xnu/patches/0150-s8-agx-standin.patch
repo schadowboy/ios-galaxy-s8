@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..0d54133
+index 0000000..2698537
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,992 @@
+@@ -0,0 +1,1186 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -44,6 +44,9 @@ index 0000000..0d54133
 +#include <IOKit/IOBufferMemoryDescriptor.h>
 +#include <IOKit/IOSharedDataQueue.h>
 +#include <pexpert/pexpert.h>
++#include "s8gfx_sf.h"           /* integer-only float, rasteriser and shader interpreter of the software executor (host-tested in scratch/agx) */
++#include "s8gfx_rast.h"
++#include "s8gfx_frag.h"
 +
 +#define S8AGX_LOG_LIMIT 800
 +
@@ -194,6 +197,8 @@ index 0000000..0d54133
 +	IOReturn createShmem(IOExternalMethodArguments * args);
 +	void executePasses(void);
 +	bool findResMem(uint64_t va, uint8_t ** mem, uint64_t * avail);
++	bool findResRegion(uint64_t va, const uint8_t ** base, uint64_t * off, uint64_t * len);
++	void executeDraws(uint32_t * target, uint64_t npx, uint64_t vtxVa, uint64_t vbVa, const uint32_t * vp, uint64_t fragVa, const uint32_t * dr, int ndraws);
 +	void dumpSparse(const char * what, uint32_t region, uint32_t id, uint32_t type, uint64_t va, const uint8_t * m, size_t len);
 +	IOReturn allocShmem(uint64_t size, uint64_t * userAddress);
 +	void releaseShmem(void);
@@ -537,13 +542,198 @@ index 0000000..0d54133
 +	return false;
 +}
 +
++/* the resource containing va: its base pointer, the offset of va inside it and its length */
++bool
++AGXDeviceUserClient::findResRegion(uint64_t va, const uint8_t ** base, uint64_t * off, uint64_t * len)
++{
++	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
++		uint32_t r = fResShm[n - 1];
++
++		if (r != 0xffffffffu && r < fShmemCount && fShmemBuf[r] != NULL) {
++			uint64_t b = fResVa[n - 1], l = fShmemBuf[r]->getLength();
++
++			if (va >= b && va < b + l) {
++				*base = (const uint8_t *)fShmemBuf[r]->getBytesNoCopy();
++				*off = va - b;
++				*len = l;
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++/* per-pixel callback of the rasteriser: run the fragment program on the interpolated varyings and store the colour (BGRA8) */
++struct agx_draw_ctx {
++	const uint8_t * frag;
++	uint32_t fraglen;
++	uint32_t * target;
++	int w;
++	uint32_t pixels;
++	uint32_t unknown;
++};
++
++static void
++agx_emit_pixel(void * vctx, int px, int py, const f32b * v)
++{
++	struct agx_draw_ctx * dc = (struct agx_draw_ctx *)vctx;
++	struct s8f_ctx fc;
++
++	bzero(&fc, sizeof(fc));
++	fc.varying = v;
++	if (s8f_run(&fc, dc->frag, dc->fraglen) && fc.stored) {
++		dc->target[py * dc->w + px] = (uint32_t)sf_to_unorm8(fc.out[2]) | ((uint32_t)sf_to_unorm8(fc.out[1]) << 8) |
++		    ((uint32_t)sf_to_unorm8(fc.out[0]) << 16) | ((uint32_t)sf_to_unorm8(fc.out[3]) << 24);
++		dc->pixels++;
++	} else if (fc.unknown != 0) {
++		dc->unknown = fc.unknown;
++	}
++}
++
++/*
++ * MILESTONE 2: vertex program -> viewport transform -> triangle rasteriser -> fragment program, all software, integer-only floats. The vertex buffer is
++ * read as float4 vertices (stride 16), triangle lists (prim 6) and strips (prim 9) only; target is assumed square.
++ */
++void
++AGXDeviceUserClient::executeDraws(uint32_t * target, uint64_t npx, uint64_t vtxVa, uint64_t vbVa, const uint32_t * vp, uint64_t fragVa,
++    const uint32_t * dr, int ndraws)
++{
++	static volatile SInt32 logged;
++	const uint8_t * vbase;
++	const uint8_t * fbase;
++	const uint8_t * vbuf;
++	uint64_t voff, vlen, foff, flen, vbavail;
++	uint8_t * vbm;
++	unsigned vstart;
++	int w = 1;
++	struct agx_draw_ctx dc;
++
++	while ((uint64_t)w * w < npx) {
++		w++;
++	}
++	if ((uint64_t)w * w != npx || !findResRegion(vtxVa, &vbase, &voff, &vlen) || !findResRegion(fragVa, &fbase, &foff, &flen) ||
++	    !findResMem(vbVa, &vbm, &vbavail)) {
++		if (OSIncrementAtomic((SInt32 *)&logged) < 60) {
++			IOLog("S8AGX: exec: draw skipped (target %llu px not square or program/vertex buffer not found)\n", (unsigned long long)npx);
++		}
++		return;
++	}
++	vbuf = vbm;
++	vstart = s8v_find_start(vbase, (unsigned)(vlen > 0xffffffffULL ? 0xffffffffU : vlen), (unsigned)voff);
++	dc.frag = fbase + foff;
++	dc.fraglen = (uint32_t)(flen - foff > 0x400 ? 0x400 : flen - foff);
++	dc.target = target;
++	dc.w = w;
++	dc.pixels = 0;
++	dc.unknown = 0;
++	for (int di = 0; di < ndraws; di++) {
++		uint32_t prim = dr[di * 3], count = dr[di * 3 + 1];
++		struct s8r_vtx vt[64];
++		bool vok[64];
++		uint32_t nvar = 0, unknownOp = 0;
++
++		if ((prim != 6 && prim != 9) || count < 3 || count > 64 || (uint64_t)count * 16 > vbavail) {
++			if (OSIncrementAtomic((SInt32 *)&logged) < 60) {
++				IOLog("S8AGX: exec: draw %d prim %u count %u not handled\n", di, (unsigned)prim, (unsigned)count);
++			}
++			continue;
++		}
++		for (uint32_t vid = 0; vid < count; vid++) {
++			struct s8f_ctx c;
++			f32b fetch[4];
++
++			bzero(&c, sizeof(c));
++			memcpy(fetch, vbuf + vid * 16, 16);
++			c.fetch = fetch;
++			c.nfetch = 4;
++			vok[vid] = false;
++			if (!s8f_run(&c, vbase + vstart, (unsigned)(vlen - vstart > 0x400 ? 0x400 : vlen - vstart)) || (c.expmask & 0xf) != 0xf) {
++				unknownOp = c.unknown ? c.unknown : 0xff;
++				continue;
++			}
++			f32b iw = sf_div(SF_ONE, c.exp[3]);
++
++			vt[vid].x = sf_fma(vp[1], sf_mul(c.exp[0], iw), vp[0]);
++			vt[vid].y = sf_fma(vp[3], sf_mul(c.exp[1], iw), vp[2]);
++			vt[vid].iw = iw;
++			nvar = 0;
++			while (nvar < S8R_MAXV && (c.expmask & (1u << (4 + nvar)))) {
++				vt[vid].v[nvar] = c.exp[4 + nvar];
++				nvar++;
++			}
++			for (uint32_t k = nvar; k < S8R_MAXV; k++) {
++				vt[vid].v[k] = 0;
++			}
++			vok[vid] = true;
++		}
++		if (unknownOp != 0 && OSIncrementAtomic((SInt32 *)&logged) < 60) {
++			IOLog("S8AGX: exec: vertex program has an instruction the interpreter does not know (0x%02x)\n", (unsigned)unknownOp);
++		}
++		uint32_t before = dc.pixels;
++
++		for (uint32_t t = 0; prim == 6 ? t + 3 <= count : t + 3 <= count; t = (prim == 6 ? t + 3 : t + 1)) {
++			uint32_t a = t, b = t + 1, cc2 = t + 2;
++
++			if (prim == 9 && (t & 1)) {
++				b = t + 2;
++				cc2 = t + 1;
++			}
++			if (vok[a] && vok[b] && vok[cc2]) {
++				s8r_tri(&vt[a], &vt[b], &vt[cc2], (int)nvar, 0, 0, w, w, agx_emit_pixel, &dc);
++			}
++			if (prim == 9 && t + 3 >= count) {
++				break;
++			}
++		}
++		if (OSIncrementAtomic((SInt32 *)&logged) < 60) {
++			IOLog("S8AGX: exec: draw %d prim %u count %u: %u pixels written (fragment unknown op 0x%02x)\n", di, (unsigned)prim, (unsigned)count,
++			    (unsigned)(dc.pixels - before), (unsigned)dc.unknown);
++		}
++	}
++}
++
 +void
 +AGXDeviceUserClient::executePasses(void)
 +{
 +	static volatile SInt32 logged;
 +	uint64_t fragVa = 0;
++	uint64_t vtxVa = 0, vbVa = 0;
++	uint32_t vp[4] = { 0, 0, 0, 0 };
++	struct { uint32_t prim, count, inst; } draws[8];
++	int ndraws = 0;
 +	uint32_t color = 0;
 +	bool haveColor = false;
++
++	/* vertex state records {0x0001001f|0x0001002f, program VA low, 0x108}, the vertex buffer / viewport table (0xc00, VA lo, 1, 0xc00, 0x80000001, ..,
++	 * tx, sx, ty, sy floats) and the draw packets {0x001b0000, 0x6e44pp00 (pp = primitive), count, instances - 1} (analysis/agx-kernel-interface.md 19) */
++	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
++		uint32_t r = fResShm[n - 1];
++
++		if (r == 0xffffffffu || r >= fShmemCount || fShmemBuf[r] == NULL) {
++			continue;
++		}
++		const uint32_t * d = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
++		uint64_t nd = fShmemBuf[r]->getLength() / 4;
++
++		for (uint64_t i = 1; i + 10 < nd; i++) {
++			if ((d[i] == 0x0001001fu || d[i] == 0x0001002fu) && d[i + 2] == 0x108u) {
++				vtxVa = 0x100000000ULL | (d[i + 1] & ~1u);
++			}
++			if (d[i - 1] == 0xc00u && d[i + 1] == 1u && d[i + 2] == 0xc00u && d[i + 3] == 0x80000001u) {
++				vbVa = 0x100000000ULL | d[i];
++				vp[0] = d[i + 5];
++				vp[1] = d[i + 6];
++				vp[2] = d[i + 7];
++				vp[3] = d[i + 8];
++			}
++			if (d[i] == 0x001b0000u && (d[i + 1] >> 16) == 0x6e44u && ndraws < 8) {
++				draws[ndraws].prim = (d[i + 1] >> 8) & 0xff;
++				draws[ndraws].count = d[i + 2];
++				draws[ndraws].inst = d[i + 3] + 1;
++				ndraws++;
++			}
++		}
++	}
 +
 +	/* the user fragment-state record {0x0009051f, program VA low (bit 0 = flag), [extra], 0x108}: the last one wins */
 +	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
@@ -610,7 +800,8 @@ index 0000000..0d54133
 +				uint64_t tva = (uint64_t)d[i + 0x14] << 4;
 +				uint32_t cc = agx_f32_unorm8(d[i + 14]) << 16 | agx_f32_unorm8(d[i + 15]) << 8 | agx_f32_unorm8(d[i + 16]) |
 +				    ((uint32_t)agx_f32_unorm8(d[i + 17]) << 24);      /* BGRA8: B = bits 0-7 */
-+				uint32_t fill = haveColor ? color : cc;
++				bool drawable = vtxVa != 0 && vbVa != 0 && ndraws > 0 && fragVa != 0;
++				uint32_t fill = (haveColor && !drawable) ? color : cc;
 +				uint8_t * t;
 +				uint64_t tavail;
 +
@@ -620,6 +811,9 @@ index 0000000..0d54133
 +
 +					for (uint64_t k = 0; k < tavail / 4; k++) {
 +						px[k] = fill;
++					}
++					if (drawable) {
++						executeDraws(px, tavail / 4, vtxVa, vbVa, vp, fragVa, (const uint32_t *)draws, ndraws);
 +					}
 +					if (OSIncrementAtomic((SInt32 *)&logged) < 60) {
 +						IOLog("S8AGX: exec: pass target 0x%llx (0x%llx B) clear %08x%s -> pixel %08x\n", (unsigned long long)tva,
@@ -996,6 +1190,697 @@ index 0000000..0d54133
 +}
 +
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
+diff --git a/iokit/Kernel/arm/s8gfx_frag.h b/iokit/Kernel/arm/s8gfx_frag.h
+new file mode 100755
+index 0000000..703c34b
+--- /dev/null
++++ b/iokit/Kernel/arm/s8gfx_frag.h
+@@ -0,0 +1,188 @@
++/*
++ * Fragment program interpreter for the A11 (G10) shader subset decoded so far (tools/agx-emu.py is its Python twin, validated on the render scenes).
++ * Integer-only (s8gfx_sf.h), no libc, so it builds into the kernel and into the host test (scratch/agx/frag_test.c).
++ *
++ *   iter 0x51   (8 B  51 <dst> <ch|..> .. ) channel count = byte2 >> 6 (0 = 4), dst byte1 = size32 bit1, reg (half units) = byte1 >> 2; values come from
++ *               the caller-supplied varyings (the executor interpolates them per pixel)
++ *   iter_short  (4 B  51 03 81 00) + texture_sample (10 B 21 ..): the texture path, handled by the caller (callback)
++ *   fmul 0x4A / fadd 0x8A (6 B), ffma 0xCA (8 B)
++ *   mov_imm 0x52 / 0xD2 (6 B)   wait_pix 0x48 (4 B)   wait 0x38 (2 B)   st_tile 0x09 / 0x89 (8 B)   end 08 01 00 00
++ */
++#ifndef S8GFX_FRAG_H
++#define S8GFX_FRAG_H
++
++#include "s8gfx_sf.h"
++
++#define S8F_REGS 64
++
++struct s8f_ctx {
++	f32b r[S8F_REGS];               /* 32-bit registers, index = half-register index / 2 */
++	f32b h[S8F_REGS * 2];           /* half registers (iter 0x10 form): kept as float bits (precision of a half is ignored) */
++	f32b out[4];                    /* st_tile result */
++	int stored;
++	const f32b * varying;           /* the interpolated varyings of this pixel: varying[0..3] */
++	int unknown;                    /* opcode byte of an instruction the interpreter does not know (0 = none) */
++	int discard;
++	/* vertex stage: the fetched vertex (up to 4 floats), and the exports by slot (0x40..0x4f -> exp[0..15]) */
++	const f32b * fetch;
++	f32b exp[16];
++	uint32_t expmask;
++	int nfetch;
++};
++
++static inline f32b
++s8f_src(struct s8f_ctx * c, const uint8_t * b, int i, int src_is_half)
++{
++	uint8_t v = b[i];
++	uint8_t idx = v & 0x3f;
++
++	if (src_is_half) {
++		return c->h[idx];
++	}
++	return c->r[idx / 2];
++}
++
++/* run a fragment program of at most len bytes; returns 1 when a st_tile ran (out[] valid) */
++static inline int
++s8f_run(struct s8f_ctx * c, const uint8_t * p, unsigned len)
++{
++	unsigned pc = 0;
++
++	c->stored = 0;
++	c->unknown = 0;
++	c->discard = 0;
++	while (pc + 2 <= len) {
++		const uint8_t * b = p + pc;
++		uint8_t op = b[0];
++
++		if (op == 0x51) {
++			if (b[1] & 1) {                                 /* short iter (the texture path): the caller supplies the sample */
++				pc += 4;
++				continue;
++			}
++			int nch = (b[2] >> 6) ? (b[2] >> 6) : 4;
++			int dreg = b[1] >> 2;
++
++			for (int k = 0; k < nch; k++) {
++				if (b[1] & 2) {
++					c->r[(dreg / 2 + k) & (S8F_REGS - 1)] = c->varying[k];
++				} else {
++					c->h[(dreg + k) & (S8F_REGS * 2 - 1)] = c->varying[k];
++				}
++			}
++			pc += 8;
++		} else if (op == 0x4A || op == 0x8A) {                  /* fmul / fadd */
++			int d = (b[1] - 1) / 8;
++			int half_a = !(b[4] & 0x04) && (b[2] & 0x3f) >= 4;
++			f32b a = s8f_src(c, b, 2, half_a);
++			f32b s1;
++
++			if (b[4] & 0x20) {
++				s1 = s8f_src(c, b, 3, 0);
++			} else {
++				s1 = sf_minifloat((uint8_t)(b[3] | ((b[4] >> 6) << 6)));
++			}
++			if (b[4] & 0x02) {
++				a = sf_neg(a);
++			}
++			c->r[d & (S8F_REGS - 1)] = (op == 0x4A) ? sf_mul(a, s1) : sf_add(a, s1);
++			pc += 6;
++		} else if (op == 0xCA) {                                /* ffma, saturate in byte 7 bit 4, negate src2 bit 7 */
++			int d = (b[1] - 1) / 8;
++			f32b a = s8f_src(c, b, 2, 0);
++			f32b s1, s2, v;
++
++			if (b[4] & 0x20) {
++				s1 = s8f_src(c, b, 3, 0);
++			} else {
++				s1 = sf_minifloat((uint8_t)(b[3] | ((b[4] >> 6) << 6)));
++			}
++			s2 = sf_minifloat(b[5]);
++			if (b[7] & 0x80) {
++				s2 = sf_neg(s2);
++			}
++			v = sf_fma(a, s1, s2);
++			if (b[7] & 0x10) {
++				v = sf_sat(v);
++			}
++			c->r[d & (S8F_REGS - 1)] = v;
++			pc += 8;
++		} else if (op == 0x52 || op == 0xD2) {                  /* mov_imm */
++			c->r[(b[1] / 2) & (S8F_REGS - 1)] = (uint32_t)b[2] | ((uint32_t)b[3] << 8) | ((uint32_t)b[4] << 16) | ((uint32_t)b[5] << 24);
++			pc += 6;
++		} else if (op == 0x48) {
++			pc += 4;
++		} else if (op == 0x38) {
++			pc += 2;
++		} else if (op == 0x09 || op == 0x89) {                  /* st_tile: r0..r3 */
++			c->out[0] = c->r[0];
++			c->out[1] = c->r[1];
++			c->out[2] = c->r[2];
++			c->out[3] = c->r[3];
++			c->stored = 1;
++			pc += 8;
++		} else if (op == 0x01 || op == 0x81) {                  /* export (vertex stage): 01 <8*reg+1> <slot> 80 */
++			unsigned slot = b[2];
++			unsigned reg = (b[1] - 1) / 8;
++
++			if (slot >= 0x40 && slot < 0x50) {
++				c->exp[slot - 0x40] = c->r[reg & (S8F_REGS - 1)];
++				c->expmask |= 1u << (slot - 0x40);
++			}
++			pc += 4;
++		} else if (op == 0xc2 && pc + 20 <= len && b[1] == 0x02 && b[4] == 0x0e && b[10] == 0x05 && b[18] == 0x38) {
++			/* vertex fetch prologue (20 B): c2 02 02 00 | 0e 00 c0 ca 1a 04 | 05 01 00 05 00 cX NN 00 | 38 00; components loaded = 2 + bit6 + bit7 of NN */
++			int n = 2 + ((b[16] >> 6) & 1) + ((b[16] >> 7) & 1);
++
++			for (int k = 0; k < n && k < c->nfetch; k++) {
++				c->r[k] = c->fetch[k];
++			}
++			pc += 20;
++		} else if (op == 0xc2 && pc + 4 <= len && b[1] == 0x00 && b[2] == 0x00 && b[3] == 0x00) {
++			pc += 4;                                        /* the extra 4-byte filler that sometimes precedes the prologue */
++		} else if (op == 0x08 && pc + 4 <= len && b[1] == 0x01) {
++			return c->stored || c->expmask != 0;
++		} else {
++			c->unknown = op;
++			return 0;
++		}
++	}
++	return c->stored;
++}
++
++/*
++ * Find the real start of a vertex program from the entry pointer of its state record: the pointer can land in the middle of a constant-setup
++ * instruction. Anchor on the fetch prologue (c2 02 02 00 0e 00 c0 ca 1a 04 05 01) within [off-8, off+0x40], then take the optional filler
++ * (c2 00 00 00) and the contiguous run of mov_imm (52 .. 6 bytes) before it. Without a prologue the entry is used as is.
++ * m = memory of the region, len = its length, off = pointer offset in it; returns the start offset.
++ */
++static inline unsigned
++s8v_find_start(const uint8_t * m, unsigned len, unsigned off)
++{
++	static const uint8_t sig[12] = { 0xc2, 0x02, 0x02, 0x00, 0x0e, 0x00, 0xc0, 0xca, 0x1a, 0x04, 0x05, 0x01 };
++	unsigned lo = off >= 8 ? off - 8 : 0;
++	unsigned q;
++
++	for (q = lo; q <= off + 0x40 && q + 12 <= len; q++) {
++		unsigned k;
++
++		for (k = 0; k < 12 && m[q + k] == sig[k]; k++) {
++		}
++		if (k == 12) {
++			unsigned s = q;
++			int n = 0;
++
++			if (s >= 4 && m[s - 4] == 0xc2 && m[s - 3] == 0 && m[s - 2] == 0 && m[s - 1] == 0) {
++				s -= 4;
++			}
++			while (s >= 6 && m[s - 6] == 0x52 && n < 16) {
++				s -= 6;
++				n++;
++			}
++			return s;
++		}
++	}
++	return off;
++}
++
++#endif /* S8GFX_FRAG_H */
+diff --git a/iokit/Kernel/arm/s8gfx_rast.h b/iokit/Kernel/arm/s8gfx_rast.h
+new file mode 100755
+index 0000000..36012e9
+--- /dev/null
++++ b/iokit/Kernel/arm/s8gfx_rast.h
+@@ -0,0 +1,100 @@
++/*
++ * Triangle rasteriser of the kernel-side AGX executor. Integer coverage (28.8 fixed point subpixel positions, top-left fill rule), perspective-correct
++ * varyings in the integer-only soft-float (s8gfx_sf.h). No libc: builds into the kernel and into the host test (scratch/agx/rast_test.c).
++ *
++ * Input vertices are already transformed to framebuffer coordinates: x, y in pixels (float bits), iw = 1 / w (float bits), z unused here.
++ * s8r_tri calls emit(ctx, px, py, varyings) for every covered pixel centre, varyings interpolated for that pixel.
++ */
++#ifndef S8GFX_RAST_H
++#define S8GFX_RAST_H
++
++#include "s8gfx_sf.h"
++
++#define S8R_MAXV 8              /* varying components per vertex */
++
++struct s8r_vtx {
++	f32b x, y;              /* framebuffer position in pixels */
++	f32b iw;                /* 1 / w */
++	f32b v[S8R_MAXV];       /* varyings (not yet divided by w) */
++};
++
++typedef void (*s8r_emit)(void * ctx, int px, int py, const f32b * varying);
++
++/* scissor: pixels [x0,x1) x [y0,y1) only */
++static inline void
++s8r_tri(const struct s8r_vtx * a, const struct s8r_vtx * b, const struct s8r_vtx * c, int nv, int x0, int y0, int x1, int y1, s8r_emit emit, void * ctx)
++{
++	int32_t ax = sf_to_fixed(a->x, 8), ay = sf_to_fixed(a->y, 8);
++	int32_t bx = sf_to_fixed(b->x, 8), by = sf_to_fixed(b->y, 8);
++	int32_t cx = sf_to_fixed(c->x, 8), cy = sf_to_fixed(c->y, 8);
++	int64_t area = (int64_t)(bx - ax) * (cy - ay) - (int64_t)(by - ay) * (cx - ax);   /* twice the signed area, 16 fractional bits */
++	int32_t minx, maxx, miny, maxy;
++	f32b farea;
++	int swap = 0;
++	int32_t px, py;
++
++	if (area == 0) {
++		return;
++	}
++	if (area < 0) {                 /* back-facing / clockwise: rasterise anyway (no culling here), by swapping b and c */
++		int32_t t;
++
++		t = bx; bx = cx; cx = t;
++		t = by; by = cy; cy = t;
++		area = -area;
++		swap = 1;
++	}
++	{
++		const struct s8r_vtx * vb = swap ? c : b;
++		const struct s8r_vtx * vc = swap ? b : c;
++		minx = ax < bx ? (ax < cx ? ax : cx) : (bx < cx ? bx : cx);
++		maxx = ax > bx ? (ax > cx ? ax : cx) : (bx > cx ? bx : cx);
++		miny = ay < by ? (ay < cy ? ay : cy) : (by < cy ? by : cy);
++		maxy = ay > by ? (ay > cy ? ay : cy) : (by > cy ? by : cy);
++		minx = (minx >> 8) - 1;
++		maxx = (maxx >> 8) + 1;
++		miny = (miny >> 8) - 1;
++		maxy = (maxy >> 8) + 1;
++		if (minx < x0) minx = x0;
++		if (miny < y0) miny = y0;
++		if (maxx >= x1) maxx = x1 - 1;
++		if (maxy >= y1) maxy = y1 - 1;
++		farea = sf_from_i64(area);
++
++		for (py = miny; py <= maxy; py++) {
++			for (px = minx; px <= maxx; px++) {
++				int32_t sx = px * 256 + 128, sy = py * 256 + 128;       /* pixel centre */
++				/* edge functions: e0 opposite a (edge b->c), e1 opposite b (edge c->a), e2 opposite c (edge a->b) */
++				int64_t e0 = (int64_t)(cx - bx) * (sy - by) - (int64_t)(cy - by) * (sx - bx);
++				int64_t e1 = (int64_t)(ax - cx) * (sy - cy) - (int64_t)(ay - cy) * (sx - cx);
++				int64_t e2 = (int64_t)(bx - ax) * (sy - ay) - (int64_t)(by - ay) * (sx - ax);
++				/* top-left rule: an edge that is not top/left excludes the samples exactly on it */
++				int tl0 = (cy < by) || (cy == by && cx < bx);       /* "left" edges go up in a y-down system with counter-clockwise order */
++				int tl1 = (ay < cy) || (ay == cy && ax < cx);
++				int tl2 = (by < ay) || (by == ay && bx < ax);
++				f32b w0, w1, w2, sum, out[S8R_MAXV] = { 0, 0, 0, 0, 0, 0, 0, 0 };
++
++				if (e0 < 0 || e1 < 0 || e2 < 0) {
++					continue;
++				}
++				if ((e0 == 0 && !tl0) || (e1 == 0 && !tl1) || (e2 == 0 && !tl2)) {
++					continue;
++				}
++				/* perspective-correct barycentrics: weights e_i * iw_i, normalised by their sum */
++				w0 = sf_mul(sf_from_i64(e0), a->iw);
++				w1 = sf_mul(sf_from_i64(e1), vb->iw);
++				w2 = sf_mul(sf_from_i64(e2), vc->iw);
++				sum = sf_add(sf_add(w0, w1), w2);
++				for (int k = 0; k < nv && k < S8R_MAXV; k++) {
++					f32b num = sf_fma(w2, vc->v[k], sf_fma(w1, vb->v[k], sf_mul(w0, a->v[k])));
++
++					out[k] = sf_div(num, sum);
++				}
++				emit(ctx, px, py, out);
++			}
++		}
++	}
++	(void)farea;
++}
++
++#endif /* S8GFX_RAST_H */
+diff --git a/iokit/Kernel/arm/s8gfx_sf.h b/iokit/Kernel/arm/s8gfx_sf.h
+new file mode 100755
+index 0000000..33319b4
+--- /dev/null
++++ b/iokit/Kernel/arm/s8gfx_sf.h
+@@ -0,0 +1,385 @@
++/*
++ * Integer-only IEEE-754 single precision (round to nearest even) for the kernel-side AGX executor: the XNU kernel is built without floating point.
++ * Floats are bit patterns (uint32_t). Denormal inputs are treated as zero and denormal results flush to zero (what the GPU does, too).
++ * sf_mul, sf_add, sf_sub, sf_fma (single rounding), sf_neg, sf_abs, sf_sat, sf_to_unorm8; tested bit-exact against the host FPU: tools in scratch/agx/sf_test.c.
++ */
++#ifndef S8GFX_SF_H
++#define S8GFX_SF_H
++
++#include <stdint.h>
++
++typedef uint32_t f32b;
++
++#define SF_ONE   0x3f800000u
++#define SF_ZERO  0x00000000u
++#define SF_QNAN  0x7fc00000u
++#define SF_INF   0x7f800000u
++
++static inline int sf_isnan(f32b a) { return ((a >> 23) & 0xff) == 0xff && (a & 0x7fffff); }
++static inline int sf_isinf(f32b a) { return ((a >> 23) & 0xff) == 0xff && !(a & 0x7fffff); }
++static inline f32b sf_neg(f32b a) { return a ^ 0x80000000u; }
++static inline f32b sf_abs(f32b a) { return a & 0x7fffffffu; }
++
++/* unpack: returns 0 for a zero or denormal (value flushed), exponent field in *e (1..254), 24-bit mantissa with the implicit bit in *m */
++static inline int
++sf_unpack(f32b a, uint32_t * s, int32_t * e, uint32_t * m)
++{
++	*s = a >> 31;
++	*e = (int32_t)((a >> 23) & 0xff);
++	if (*e == 0) {
++		*m = 0;
++		return 0;
++	}
++	*m = (a & 0x7fffff) | 0x800000;
++	return 1;
++}
++
++/* round-to-nearest-even pack of sign * mant * 2^(exp - 150): mant is any 64-bit value (sticky already folded into bit 0 by the caller if needed) */
++static inline f32b
++sf_pack64(uint32_t s, int32_t exp, unsigned __int128 mant)
++{
++	int msb;
++	int shift;
++	uint64_t keep;
++	uint64_t rest;
++	uint64_t half;
++
++	if (mant == 0) {
++		return s << 31;
++	}
++	msb = 127;
++	while (!((mant >> msb) & 1)) {
++		msb--;
++	}
++	/* value = mant * 2^(exp-150); we want 24 significant bits: shift right by (msb - 23) */
++	shift = msb - 23;
++	exp += shift;       /* exponent field of the result before rounding: value = (mant >> shift) * 2^(exp-150) */
++	if (shift > 0) {
++		unsigned __int128 mask = (((unsigned __int128)1) << shift) - 1;
++		rest = (uint64_t)0;
++		keep = (uint64_t)(mant >> shift);
++		unsigned __int128 low = mant & mask;
++		unsigned __int128 hf = ((unsigned __int128)1) << (shift - 1);
++		if (low > hf || (low == hf && (keep & 1))) {
++			keep++;
++			if (keep == 0x1000000) {
++				keep >>= 1;
++				exp++;
++			}
++		}
++		(void)rest;
++		(void)half;
++	} else {
++		keep = (uint64_t)(mant << (-shift));
++	}
++	/* now value = keep * 2^(exp-150), keep in [2^23, 2^24): exponent field = exp */
++	if (exp >= 255) {
++		return (s << 31) | SF_INF;
++	}
++	if (exp <= 0) {
++		return s << 31;     /* flush denormals */
++	}
++	return (s << 31) | ((uint32_t)exp << 23) | ((uint32_t)keep & 0x7fffff);
++}
++
++static inline f32b
++sf_mul(f32b a, f32b b)
++{
++	uint32_t sa, sb, ma, mb;
++	int32_t ea, eb;
++	int za = !sf_unpack(a, &sa, &ea, &ma), zb = !sf_unpack(b, &sb, &eb, &mb);
++
++	if (sf_isnan(a) || sf_isnan(b)) {
++		return SF_QNAN;
++	}
++	if (sf_isinf(a) || sf_isinf(b)) {
++		if (za || zb) {
++			return SF_QNAN;
++		}
++		return ((sa ^ sb) << 31) | SF_INF;
++	}
++	if (za || zb) {
++		return (sa ^ sb) << 31;
++	}
++	/* (ma * 2^(ea-150)) * (mb * 2^(eb-150)) = (ma*mb) * 2^(ea+eb-300) = P * 2^((ea+eb-150) - 150) */
++	return sf_pack64(sa ^ sb, ea + eb - 150, (unsigned __int128)((uint64_t)ma * (uint64_t)mb));
++}
++
++/* a + b where both are finite; magnitudes aligned with 128-bit arithmetic and a sticky bit */
++static inline f32b
++sf_add_core(uint32_t sa, int32_t ea, unsigned __int128 ma, uint32_t sb, int32_t eb, unsigned __int128 mb)
++{
++	/* value a = ma * 2^(ea-150), b = mb * 2^(eb-150); bring both to the smaller exponent with headroom */
++	int32_t e;
++	int d;
++	unsigned __int128 big, small;
++	uint32_t sbig, ssmall;
++	int32_t ebig;
++	unsigned __int128 sum;
++	int sticky = 0;
++
++	if (ma == 0) {
++		return sf_pack64(sb, eb, mb);
++	}
++	if (mb == 0) {
++		return sf_pack64(sa, ea, ma);
++	}
++	if (ea >= eb) {
++		big = ma; small = mb; sbig = sa; ssmall = sb; ebig = ea; d = ea - eb;
++	} else {
++		big = mb; small = ma; sbig = sb; ssmall = sa; ebig = eb; d = eb - ea;
++	}
++	/* big has at most 49 bits (fma product) so shifting it left by 64 keeps it below 2^113 */
++	big <<= 64;
++	e = ebig - 64;
++	if (d >= 120) {
++		small = 0;
++		sticky = 1;
++	} else {
++		small <<= 64;
++		if (d > 0) {
++			unsigned __int128 lost = small & ((((unsigned __int128)1) << d) - 1);
++			small >>= d;
++			if (lost) {
++				sticky = 1;
++			}
++		}
++	}
++	if (sbig == ssmall) {
++		sum = big + small;
++	} else if (big >= small) {
++		sum = big - small;
++		if (sticky) {
++			sum--;           /* the true subtrahend is slightly larger than the truncated one */
++		}
++	} else {
++		sum = small - big;
++	}
++	if (sum == 0 && !sticky) {
++		return 0;
++	}
++	if (sticky) {
++		sum = (sum << 1) | 1;   /* keep the sticky information below the rounding bit */
++		e -= 1;
++	}
++	return sf_pack64(big >= small || sbig == ssmall ? sbig : ssmall, e, sum);
++}
++
++static inline f32b
++sf_add(f32b a, f32b b)
++{
++	uint32_t sa, sb, ma, mb;
++	int32_t ea, eb;
++	int za = !sf_unpack(a, &sa, &ea, &ma), zb = !sf_unpack(b, &sb, &eb, &mb);
++
++	if (sf_isnan(a) || sf_isnan(b)) {
++		return SF_QNAN;
++	}
++	if (sf_isinf(a)) {
++		return (sf_isinf(b) && sa != sb) ? SF_QNAN : a;
++	}
++	if (sf_isinf(b)) {
++		return b;
++	}
++	if (za && zb) {
++		return (sa & sb) << 31;
++	}
++	if (za) {
++		return b;
++	}
++	if (zb) {
++		return a;
++	}
++	return sf_add_core(sa, ea, ma, sb, eb, mb);
++}
++
++static inline f32b sf_sub(f32b a, f32b b) { return sf_add(a, sf_neg(b)); }
++
++/* fused multiply-add: a * b + c with a single rounding */
++static inline f32b
++sf_fma(f32b a, f32b b, f32b c)
++{
++	uint32_t sa, sb, sc, ma, mb, mc;
++	int32_t ea, eb, ec;
++	int za = !sf_unpack(a, &sa, &ea, &ma), zb = !sf_unpack(b, &sb, &eb, &mb), zc = !sf_unpack(c, &sc, &ec, &mc);
++
++	if (sf_isnan(a) || sf_isnan(b) || sf_isnan(c)) {
++		return SF_QNAN;
++	}
++	if (sf_isinf(a) || sf_isinf(b)) {
++		if (za || zb) {
++			return SF_QNAN;
++		}
++		f32b p = ((sa ^ sb) << 31) | SF_INF;
++		return (sf_isinf(c) && ((c >> 31) != (p >> 31))) ? SF_QNAN : p;
++	}
++	if (sf_isinf(c)) {
++		return c;
++	}
++	if (za || zb) {
++		return zc ? ((((sa ^ sb) & sc)) << 31) : c;
++	}
++	{
++		unsigned __int128 p = (unsigned __int128)((uint64_t)ma * (uint64_t)mb);
++		int32_t ep = ea + eb - 150;       /* product = p * 2^(ep - 150) */
++
++		if (zc) {
++			return sf_pack64(sa ^ sb, ep, p);
++		}
++		return sf_add_core(sa ^ sb, ep, p, sc, ec, mc);
++	}
++}
++
++/* a / b, correctly rounded */
++static inline f32b
++sf_div(f32b a, f32b b)
++{
++	uint32_t sa, sb, ma, mb;
++	int32_t ea, eb;
++	int za = !sf_unpack(a, &sa, &ea, &ma), zb = !sf_unpack(b, &sb, &eb, &mb);
++	uint32_t s = sa ^ sb;
++
++	if (sf_isnan(a) || sf_isnan(b)) {
++		return SF_QNAN;
++	}
++	if (sf_isinf(a)) {
++		return sf_isinf(b) ? SF_QNAN : ((s << 31) | SF_INF);
++	}
++	if (sf_isinf(b)) {
++		return s << 31;
++	}
++	if (zb) {
++		return za ? SF_QNAN : ((s << 31) | SF_INF);
++	}
++	if (za) {
++		return s << 31;
++	}
++	{
++		uint64_t num = (uint64_t)ma << 32;
++		uint64_t q = num / mb;
++		uint64_t rem = num % mb;
++
++		return sf_pack64(s, ea - eb + 117, (((unsigned __int128)q) << 1) | (rem ? 1 : 0));
++	}
++}
++
++/* integer -> float, correctly rounded */
++static inline f32b
++sf_from_i64(int64_t v)
++{
++	uint32_t s = v < 0;
++	uint64_t mag = s ? (uint64_t)(-(v + 1)) + 1 : (uint64_t)v;
++
++	if (mag == 0) {
++		return 0;
++	}
++	return sf_pack64(s, 150, (unsigned __int128)mag);
++}
++
++/* float -> signed fixed point with `frac` fractional bits, rounded half away from zero, saturating to int32 (the rasteriser's subpixel positions) */
++static inline int32_t
++sf_to_fixed(f32b a, int frac)
++{
++	uint32_t s = a >> 31;
++	int32_t e = (int32_t)((a >> 23) & 0xff);
++	uint64_t m;
++	int sh;
++	uint64_t r;
++
++	if (e == 0 || sf_isnan(a)) {
++		return 0;
++	}
++	if (e == 0xff) {
++		return s ? INT32_MIN : INT32_MAX;
++	}
++	m = (a & 0x7fffff) | 0x800000;
++	sh = e - 150 + frac;                    /* value = m * 2^sh */
++	if (sh >= 0) {
++		if (sh > 8) {
++			return s ? INT32_MIN : INT32_MAX;
++		}
++		r = m << sh;
++	} else if (-sh >= 40) {
++		return 0;
++	} else {
++		r = (m + (1ULL << (-sh - 1))) >> -sh;
++	}
++	if (r > 0x7fffffffULL) {
++		return s ? INT32_MIN : INT32_MAX;
++	}
++	return s ? -(int32_t)r : (int32_t)r;
++}
++
++/* clamp to [0, 1] (NaN -> 0) */
++static inline f32b
++sf_sat(f32b a)
++{
++	if (sf_isnan(a) || (a >> 31)) {
++		return SF_ZERO;
++	}
++	if (a >= SF_ONE) {
++		return SF_ONE;
++	}
++	return a;
++}
++
++/* float -> 8-bit unorm, round half up (the conversion the tile store uses) */
++static inline uint8_t
++sf_to_unorm8(f32b b)
++{
++	uint32_t e = (b >> 23) & 0xff;
++	uint64_t mant;
++	uint32_t shift;
++	uint64_t r;
++
++	if (b >> 31) {
++		return 0;
++	}
++	if (e == 0xff) {
++		return (b & 0x7fffff) ? 0 : 255;
++	}
++	if (e >= 127) {
++		return 255;
++	}
++	if (e == 0) {
++		return 0;
++	}
++	mant = (b & 0x7fffff) | 0x800000;
++	shift = 23 + (127 - e);
++	if (shift >= 62) {
++		return 0;
++	}
++	r = (mant * 255 + (1ULL << (shift - 1))) >> shift;
++	return r > 255 ? 255 : (uint8_t)r;
++}
++
++/* Mesa's 8-bit float immediate (agx_minifloat.h) as float bits */
++static inline f32b
++sf_minifloat(uint8_t imm)
++{
++	uint32_t sign = (imm & 0x80) ? 0x80000000u : 0;
++	int exp = (imm & 0x70) >> 4;
++	uint32_t man = imm & 0xF;
++	uint32_t m;
++	int e;
++
++	if (exp) {
++		m = man | 0x10;                 /* 1.xxxx * 16 = value mant * 2^(exp-7) */
++		e = exp - 7;
++	} else {
++		m = man;
++		e = -6;
++		if (m == 0) {
++			return sign;
++		}
++	}
++	/* value = m * 2^e with m in [1, 31]: normalise */
++	int msb = 4;
++	while (msb >= 0 && !((m >> msb) & 1)) {
++		msb--;
++	}
++	/* m = 1.xxx * 2^msb  =>  value = (m << (23 - msb)) * 2^(e + msb - 23) */
++	return sign | ((uint32_t)(e + msb + 127) << 23) | (((m << (23 - msb)) & 0x7fffff));
++}
++
++#endif /* S8GFX_SF_H */
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
 index 1563949..98a92d5 100644
 --- a/iokit/conf/files.arm64
