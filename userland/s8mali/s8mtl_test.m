@@ -199,6 +199,94 @@ main(void)
 				[tex getBytes:px bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0];
 				LOG("S8MTL: render %d status %ld; pixels (0,0) %08x (1,0) %08x\n", r, (long)[rcb status], px[0], px[1]);
 			}
+			/*
+			 * Round 4, draw-packet scenes (vertex buffers, topologies, viewport, scissor, uniforms, instancing, indexed, two draws): CoreAnimation draws
+			 * quads from vertex buffers with these states, the executor needs their encodings. Vertex data: position xy + colour-varying zw.
+			 */
+			if (tex != nil && q != nil) {
+				NSError *e4 = nil;
+				NSString *s4 = @"#include <metal_stdlib>\nusing namespace metal;\n"
+				    "struct V { float4 pos [[position]]; float4 col; };\n"
+				    "vertex V vsb(uint vid [[vertex_id]], uint iid [[instance_id]], constant float4 *vb [[buffer(0)]]) { V o; o.pos = float4(vb[vid].xy + float2(float(iid) * 0.5, 0.0), 0.0, 1.0); o.col = float4(vb[vid].zw, 0.25, 1.0); return o; }\n"
+				    "fragment float4 fsc(V in [[stage_in]]) { return in.col; }\n"
+				    "fragment float4 fsu(V in [[stage_in]], constant float4 &u [[buffer(0)]]) { return u; }\n";
+				id<MTLLibrary> l4 = [dev newLibraryWithSource:s4 options:nil error:&e4];
+				id<MTLRenderPipelineState> pc = nil, pu = nil;
+
+				if (l4 != nil) {
+					MTLRenderPipelineDescriptor *p4 = [[MTLRenderPipelineDescriptor alloc] init];
+					p4.vertexFunction = [l4 newFunctionWithName:@"vsb"];
+					p4.fragmentFunction = [l4 newFunctionWithName:@"fsc"];
+					p4.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+					pc = [dev newRenderPipelineStateWithDescriptor:p4 error:&e4];
+					p4.fragmentFunction = [l4 newFunctionWithName:@"fsu"];
+					pu = [dev newRenderPipelineStateWithDescriptor:p4 error:&e4];
+				} else {
+					LOG("S8MTL: round 4 library failed: %s\n", e4 ? [[e4 description] UTF8String] : "?");
+				}
+				float quad[6][4] = { { -0.5f, -0.5f, 0.0f, 0.0f }, { 0.5f, -0.5f, 1.0f, 0.0f }, { -0.5f, 0.5f, 0.0f, 1.0f },
+				                     { 0.5f, -0.5f, 1.0f, 0.0f }, { 0.5f, 0.5f, 1.0f, 1.0f }, { -0.5f, 0.5f, 0.0f, 1.0f } };
+				float strip[4][4] = { { -0.5f, -0.5f, 0.0f, 0.0f }, { 0.5f, -0.5f, 1.0f, 0.0f }, { -0.5f, 0.5f, 0.0f, 1.0f }, { 0.5f, 0.5f, 1.0f, 1.0f } };
+				float shifted[6][4];
+				uint16_t idx[6] = { 0, 1, 2, 3, 4, 5 };
+				float ucol[4] = { 0.2f, 0.4f, 0.6f, 1.0f };
+				id<MTLBuffer> idxbuf = [dev newBufferWithBytes:idx length:sizeof(idx) options:MTLResourceStorageModeShared];
+
+				for (int i = 0; i < 6; i++) {
+					shifted[i][0] = quad[i][0] * 0.5f + 0.3f; shifted[i][1] = quad[i][1] * 0.5f + 0.3f; shifted[i][2] = quad[i][2]; shifted[i][3] = quad[i][3];
+				}
+				const char *names[] = { "quad 6 verts", "triangle strip 4", "viewport 16,16,32,32", "scissor 8,8,16,16", "uniform colour (fragment bytes)",
+				    "instanced x2", "two draws", "indexed quad" };
+				for (int k = 0; k < 8 && pc != nil && pu != nil; k++) {
+					MTLRenderPassDescriptor *rp4 = [MTLRenderPassDescriptor renderPassDescriptor];
+
+					rp4.colorAttachments[0].texture = tex;
+					rp4.colorAttachments[0].loadAction = MTLLoadActionClear;
+					rp4.colorAttachments[0].storeAction = MTLStoreActionStore;
+					rp4.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+					id<MTLCommandBuffer> cb4 = [q commandBuffer];
+					id<MTLRenderCommandEncoder> en4 = [cb4 renderCommandEncoderWithDescriptor:rp4];
+
+					LOG("S8MTL: ==== draw scene %d: %s\n", k, names[k]);
+					[en4 setRenderPipelineState:(k == 4 ? pu : pc)];
+					if (k == 1) {
+						[en4 setVertexBytes:strip length:sizeof(strip) atIndex:0];
+						[en4 drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+					} else {
+						[en4 setVertexBytes:quad length:sizeof(quad) atIndex:0];
+						if (k == 2) {
+							MTLViewport vp = { 16, 16, 32, 32, 0, 1 };
+							[en4 setViewport:vp];
+						}
+						if (k == 3) {
+							MTLScissorRect sr = { 8, 8, 16, 16 };
+							[en4 setScissorRect:sr];
+						}
+						if (k == 4) {
+							[en4 setFragmentBytes:ucol length:sizeof(ucol) atIndex:0];
+						}
+						if (k == 7) {
+							[en4 drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16 indexBuffer:idxbuf indexBufferOffset:0];
+						} else if (k == 5) {
+							[en4 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6 instanceCount:2];
+						} else {
+							[en4 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+						}
+						if (k == 6) {
+							[en4 setVertexBytes:shifted length:sizeof(shifted) atIndex:0];
+							[en4 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+						}
+					}
+					[en4 endEncoding];
+					[cb4 commit];
+					for (int w = 0; w < 5 && [cb4 status] < MTLCommandBufferStatusCompleted; w++) {
+						sleep(1);
+					}
+					uint32_t p4px[4] = { 0, 0, 0, 0 };
+					[tex getBytes:p4px bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(32, 32, 2, 2) mipmapLevel:0];
+					LOG("S8MTL: draw scene %d status %ld; centre pixels %08x %08x\n", k, (long)[cb4 status], p4px[0], p4px[1]);
+				}
+			}
 		}
 		struct fam { const char *src; int gx, gy, tx, ty; } fams[] = {
 			{ "kernel void kk(device uint *z [[buffer(0)]], device uint *a [[buffer(1)]], uint i [[thread_position_in_grid]]) { a[i] = i; }", 64, 1, 32, 1 },
