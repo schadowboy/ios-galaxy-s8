@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..fed8971
+index 0000000..bc5bee4
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,568 @@
+@@ -0,0 +1,583 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -166,6 +166,7 @@ index 0000000..fed8971
 +	UInt32 fQueueId;                /* last command queue id handed out (selector 7) */
 +	UInt32 fNqId;                   /* last notification queue id handed out (selector 15) */
 +	UInt32 fResId;                  /* last resource id handed out (selector 9) */
++	uint64_t fTraceNext;            /* next global trace id range (selector 5) */
 +	uint32_t * fSelCount;           /* 0x200 entries: calls per selector of THIS client (the log shows the first few of each) */
 +	enum { kResMax = 1024 };
 +	uint64_t * fResVa;                /* kResMax entries: GPU virtual address of resource id n at [n - 1] */
@@ -196,6 +197,7 @@ index 0000000..fed8971
 +	fType = type;
 +	fTask = owningTask;
 +	fGpuVa = 0x100000000ULL;
++	fTraceNext = 1;
 +	fShmemBuf = IONewZero(IOBufferMemoryDescriptor *, kShmemMax);
 +	fShmemMap = IONewZero(IOMemoryMap *, kShmemMax);
 +	fResVa = IONewZero(uint64_t, kResMax);
@@ -406,6 +408,19 @@ index 0000000..fed8971
 +	}
 +	if (args->scalarOutput != NULL) {
 +		bzero(args->scalarOutput, args->scalarOutputCount * sizeof(uint64_t));
++	}
++	if (selector == 5 && args->structureOutput != NULL && args->structureOutputSize >= 16) {
++		/*
++		 * IOGPUDeviceGetNextGlobalTraceID: out { first id (must be non-zero; zero aborts userland), end of the range }. Userland counts from the
++		 * first id up to the end and asks again; when the call fails it uses { 1, 0x100000000 }, so ranges of that size are what it expects.
++		 */
++		uint8_t * o = (uint8_t *)args->structureOutput;
++
++		bzero(o, args->structureOutputSize);
++		*(uint64_t *)o = fTraceNext;
++		*(uint64_t *)(o + 8) = fTraceNext + 0xffffffffULL;
++		fTraceNext += 0xffffffffULL;
++		return kIOReturnSuccess;
 +	}
 +	if (selector == 9 && args->structureInput != NULL && args->structureInputSize >= 0x68 && args->structureOutput != NULL &&
 +	    args->structureOutputSize >= 0x50) {
