@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..0d3014e
+index 0000000..0f88ad7
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,693 @@
+@@ -0,0 +1,732 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -163,6 +163,8 @@ index 0000000..0d3014e
 +	enum { kShmemMax = 512 };
 +	IOBufferMemoryDescriptor ** fShmemBuf;       /* kShmemMax entries, allocated in initWithTask (the object itself may be at most 16 KiB) */
 +	IOMemoryMap ** fShmemMap;
++	uint8_t * fShmemType;                       /* IOGPU shmem type of region i (0xff: a plain mapping) */
++	uint32_t fSubmitDumps;                      /* command-list dumps done so far (the first few submits are dumped) */
 +	UInt32 fShmemCount;
 +
 +	UInt32 fQueueId;                /* last command queue id handed out (selector 7) */
@@ -211,8 +213,9 @@ index 0000000..0d3014e
 +	fShmemBuf = IONewZero(IOBufferMemoryDescriptor *, kShmemMax);
 +	fShmemMap = IONewZero(IOMemoryMap *, kShmemMax);
 +	fResVa = IONewZero(uint64_t, kResMax);
++	fShmemType = IONewZero(uint8_t, kShmemMax);
 +	fSelCount = IONewZero(uint32_t, 0x200);
-+	if (fShmemBuf == NULL || fShmemMap == NULL || fResVa == NULL || fSelCount == NULL) {
++	if (fShmemBuf == NULL || fShmemMap == NULL || fResVa == NULL || fSelCount == NULL || fShmemType == NULL) {
 +		return false;
 +	}
 +	if (agx_log_ok()) {
@@ -263,6 +266,7 @@ index 0000000..0d3014e
 +	}
 +	fShmemBuf[fShmemCount] = buf;
 +	fShmemMap[fShmemCount] = map;
++	fShmemType[fShmemCount] = 0xff;
 +	fShmemCount++;
 +	*userAddress = (uint64_t)map->getVirtualAddress();
 +	return kIOReturnSuccess;
@@ -304,6 +308,7 @@ index 0000000..0d3014e
 +	}
 +	fShmemBuf[fShmemCount] = buf;
 +	fShmemMap[fShmemCount] = map;
++	fShmemType[fShmemCount] = (uint8_t)type;
 +	fShmemCount++;
 +	out = (uint8_t *)args->structureOutput;
 +	bzero(out, args->structureOutputSize);
@@ -347,6 +352,10 @@ index 0000000..0d3014e
 +	if (fSelCount != NULL) {
 +		IODelete(fSelCount, uint32_t, 0x200);
 +		fSelCount = NULL;
++	}
++	if (fShmemType != NULL) {
++		IODelete(fShmemType, uint8_t, kShmemMax);
++		fShmemType = NULL;
 +	}
 +	IOUserClient::free();
 +}
@@ -615,6 +624,36 @@ index 0000000..0d3014e
 +			}
 +			if (postCompletion((uint32_t)cq, *(const uint64_t *)(e + 0x18), t, mach_absolute_time(), 0)) {
 +				posted++;
++			}
++		}
++		if (fSubmitDumps < 3 && fShmemType != NULL) {
++			/* what userland wrote for the GPU: the non-zero part of every device shared-memory region (type 0 segment list, 1 kernel commands, ...) */
++			fSubmitDumps++;
++			for (uint32_t r = 0; r < fShmemCount && r < kShmemMax; r++) {
++				const uint8_t * m;
++				size_t len, ext = 0;
++
++				if (fShmemType[r] == 0xff || fShmemBuf[r] == NULL) {
++					continue;
++				}
++				m = (const uint8_t *)fShmemBuf[r]->getBytesNoCopy();
++				len = fShmemBuf[r]->getLength();
++				for (size_t k = len; k > 0; k--) {
++					if (m[k - 1] != 0) {
++						ext = k;
++						break;
++					}
++				}
++				IOLog("S8AGX: dump %u: shmem region %u type %u, %zu bytes, non-zero extent %zu\n", (unsigned)fSubmitDumps, (unsigned)r, (unsigned)fShmemType[r], len, ext);
++				for (size_t k = 0; k < ext && k < 192; k += 32) {
++					char hex[32 * 2 + 1];
++					size_t n = ext - k < 32 ? ext - k : 32;
++
++					for (size_t b = 0; b < n; b++) {
++						snprintf(hex + 2 * b, 3, "%02x", m[k + b]);
++					}
++					IOLog("S8AGX:   +%03zx %s\n", k, hex);
++				}
 +			}
 +		}
 +		IOLog("S8AGX: submit on command queue %llu: %llu command buffer(s), %u completion record(s) posted\n", cq, count, (unsigned)posted);
