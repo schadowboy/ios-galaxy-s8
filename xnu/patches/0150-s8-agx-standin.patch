@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..8eab217
+index 0000000..63b93da
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,1237 @@
+@@ -0,0 +1,1239 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -722,8 +722,10 @@ index 0000000..8eab217
 +			}
 +		}
 +		if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
-+			IOLog("S8AGX: exec: draw %d prim %u count %u: %u pixels written (fragment unknown op 0x%02x)\n", di, (unsigned)prim, (unsigned)count,
-+			    (unsigned)(dc.pixels - before), (unsigned)dc.unknown);
++			IOLog("S8AGX: exec: draw %d prim %u count %u: %u pixels written (fragment unknown op 0x%02x); samples (32,32) %08x (24,40) %08x (40,40) %08x (32,50) %08x (8,8) %08x\n",
++			    di, (unsigned)prim, (unsigned)count, (unsigned)(dc.pixels - before), (unsigned)dc.unknown,
++			    (unsigned)target[32 * w + 32], (unsigned)target[40 * w + 24], (unsigned)target[40 * w + 40], (unsigned)target[50 * w + 32],
++			    (unsigned)target[8 * w + 8]);
 +		}
 +	}
 +}
