@@ -75,6 +75,79 @@ main(void)
 		 * Second family: one kernel per feature of the AGX compute ISA/command that the first family did not cover. Each entry has its own full
 		 * kernel source and dispatch shape; buffers 0,1,2 are bound (0 and 2 outputs / scratch, 1 = input 0..63) and a constant of 5 at index 3.
 		 */
+		/*
+		 * Render family (before the compute kernels so that its submits come first): a 64x64 BGRA target, a full-screen triangle, a constant or
+		 * interpolated colour; one command buffer per variant, so the capture shows how a render pass, its clear colour, the pipeline state and a draw
+		 * are encoded (and, with the target read back, what a correct result looks like).
+		 */
+		{
+			MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+			td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+			td.storageMode = MTLStorageModeShared;
+			id<MTLTexture> tex = [dev newTextureWithDescriptor:td];
+			LOG("S8MTL: render target %p\n", (__bridge void *)tex);
+			struct rv { const char *name; const char *frag; float cr, cg, cb; int draw; int blend; } rvs[] = {
+				{ "clear only black", "return float4(1,0,0,1);", 0, 0, 0, 0, 0 },
+				{ "clear only 0.25/0.5/0.75", "return float4(1,0,0,1);", 0.25f, 0.5f, 0.75f, 0, 0 },
+				{ "red", "return float4(1,0,0,1);", 0, 0, 0, 1, 0 },
+				{ "green", "return float4(0,1,0,1);", 0, 0, 0, 1, 0 },
+				{ "blue", "return float4(0,0,1,1);", 0, 0, 0, 1, 0 },
+				{ "0.5/0.25/0.125", "return float4(0.5,0.25,0.125,1);", 0, 0, 0, 1, 0 },
+				{ "interpolated colour", "return in.col;", 0, 0, 0, 1, 0 },
+				{ "red over white, no blend", "return float4(1,0,0,1);", 1, 1, 1, 1, 0 },
+				{ "red alpha 0.5 blended over white", "return float4(1,0,0,0.5);", 1, 1, 1, 1, 1 },
+			};
+			int rcount = (int)(sizeof(rvs) / sizeof(rvs[0]));
+			for (int r = 0; r < rcount && tex != nil && q != nil; r++) {
+				NSError *rerr = nil;
+				NSString *rsrc = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\n"
+				    "struct V { float4 pos [[position]]; float4 col; };\n"
+				    "vertex V vs(uint vid [[vertex_id]]) { float2 p[3] = { float2(-1,-1), float2(3,-1), float2(-1,3) }; V o; o.pos = float4(p[vid], 0, 1); o.col = float4(p[vid] * 0.5 + 0.5, 0.25, 1); return o; }\n"
+				    "fragment float4 fs(V in [[stage_in]]) { %s }\n", rvs[r].frag];
+				LOG("S8MTL: ==== render %d: %s\n", r, rvs[r].name);
+				id<MTLLibrary> rl = [dev newLibraryWithSource:rsrc options:nil error:&rerr];
+				if (rl == nil) {
+					LOG("S8MTL: render library failed: %s\n", rerr ? [[rerr description] UTF8String] : "?");
+					continue;
+				}
+				MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+				pd.vertexFunction = [rl newFunctionWithName:@"vs"];
+				pd.fragmentFunction = [rl newFunctionWithName:@"fs"];
+				pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+				if (rvs[r].blend) {
+					pd.colorAttachments[0].blendingEnabled = YES;
+					pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+					pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+					pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+					pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+				}
+				rerr = nil;
+				id<MTLRenderPipelineState> rps = [dev newRenderPipelineStateWithDescriptor:pd error:&rerr];
+				if (rps == nil) {
+					LOG("S8MTL: render pipeline failed: %s\n", rerr ? [[rerr description] UTF8String] : "?");
+					continue;
+				}
+				MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+				rp.colorAttachments[0].texture = tex;
+				rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+				rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+				rp.colorAttachments[0].clearColor = MTLClearColorMake(rvs[r].cr, rvs[r].cg, rvs[r].cb, 1.0);
+				id<MTLCommandBuffer> rcb = [q commandBuffer];
+				id<MTLRenderCommandEncoder> renc = [rcb renderCommandEncoderWithDescriptor:rp];
+				if (rvs[r].draw) {
+					[renc setRenderPipelineState:rps];
+					[renc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+				}
+				[renc endEncoding];
+				[rcb commit];
+				for (int w = 0; w < 5 && [rcb status] < MTLCommandBufferStatusCompleted; w++) {
+					sleep(1);
+				}
+				uint32_t px[4] = { 0, 0, 0, 0 };
+				[tex getBytes:px bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0];
+				LOG("S8MTL: render %d status %ld; pixels (0,0) %08x (1,0) %08x\n", r, (long)[rcb status], px[0], px[1]);
+			}
+		}
 		struct fam { const char *src; int gx, gy, tx, ty; } fams[] = {
 			{ "kernel void kk(device uint *z [[buffer(0)]], device uint *a [[buffer(1)]], uint i [[thread_position_in_grid]]) { a[i] = i; }", 64, 1, 32, 1 },
 			{ "kernel void kk(device uint *z [[buffer(0)]], device uint *y [[buffer(1)]], device uint *a [[buffer(2)]], uint i [[thread_position_in_grid]]) { a[i] = i; }", 64, 1, 32, 1 },
