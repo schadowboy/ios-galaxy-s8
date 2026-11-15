@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..0f88ad7
+index 0000000..5604c86
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,732 @@
+@@ -0,0 +1,778 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -163,7 +163,9 @@ index 0000000..0f88ad7
 +	enum { kShmemMax = 512 };
 +	IOBufferMemoryDescriptor ** fShmemBuf;       /* kShmemMax entries, allocated in initWithTask (the object itself may be at most 16 KiB) */
 +	IOMemoryMap ** fShmemMap;
++	uint32_t * fResShm;                         /* resource id n -> shmem region index (0xffffffff: caller memory) */
 +	uint8_t * fShmemType;                       /* IOGPU shmem type of region i (0xff: a plain mapping) */
++	uint32_t fDumpLines;                        /* lines printed by the current dump (budget: the log ring is finite) */
 +	uint32_t fSubmitDumps;                      /* command-list dumps done so far (the first few submits are dumped) */
 +	UInt32 fShmemCount;
 +
@@ -185,6 +187,7 @@ index 0000000..0f88ad7
 +	uint64_t fGpuVa;                /* next GPU virtual address to give a resource (0 = not started) */
 +
 +	IOReturn createShmem(IOExternalMethodArguments * args);
++	void dumpSparse(const char * what, uint32_t id, uint32_t type, uint64_t va, const uint8_t * m, size_t len);
 +	IOReturn allocShmem(uint64_t size, uint64_t * userAddress);
 +	void releaseShmem(void);
 +
@@ -214,8 +217,12 @@ index 0000000..0f88ad7
 +	fShmemMap = IONewZero(IOMemoryMap *, kShmemMax);
 +	fResVa = IONewZero(uint64_t, kResMax);
 +	fShmemType = IONewZero(uint8_t, kShmemMax);
++	fResShm = IONewZero(uint32_t, kResMax);
++	if (fResShm != NULL) {
++		memset(fResShm, 0xff, kResMax * sizeof(uint32_t));
++	}
 +	fSelCount = IONewZero(uint32_t, 0x200);
-+	if (fShmemBuf == NULL || fShmemMap == NULL || fResVa == NULL || fSelCount == NULL || fShmemType == NULL) {
++	if (fShmemBuf == NULL || fShmemMap == NULL || fResVa == NULL || fSelCount == NULL || fShmemType == NULL || fResShm == NULL) {
 +		return false;
 +	}
 +	if (agx_log_ok()) {
@@ -357,6 +364,10 @@ index 0000000..0f88ad7
 +		IODelete(fShmemType, uint8_t, kShmemMax);
 +		fShmemType = NULL;
 +	}
++	if (fResShm != NULL) {
++		IODelete(fResShm, uint32_t, kResMax);
++		fResShm = NULL;
++	}
 +	IOUserClient::free();
 +}
 +
@@ -384,6 +395,39 @@ index 0000000..0f88ad7
 +		fNqPortSet[refCon - 1] = true;
 +	}
 +	return kIOReturnSuccess;
++}
++
++/* Sparse dump for offline analysis: header line "S8AGX: D <what> <id> type <t> va <va> len <len>", then "S8AGX: L <offset> <64 bytes hex>" per non-zero line. */
++void
++AGXDeviceUserClient::dumpSparse(const char * what, uint32_t id, uint32_t type, uint64_t va, const uint8_t * m, size_t len)
++{
++	uint32_t lines = 0;
++
++	if (fDumpLines >= 2500) {
++		return;
++	}
++
++	IOLog("S8AGX: D %s %u type %u va 0x%llx len 0x%zx\n", what, (unsigned)id, (unsigned)type, (unsigned long long)va, len);
++	for (size_t k = 0; k + 64 <= len && lines < 400; k += 64) {
++		bool nz = false;
++		char hex[64 * 2 + 1];
++
++		for (size_t b = 0; b < 64; b++) {
++			if (m[k + b] != 0) {
++				nz = true;
++				break;
++			}
++		}
++		if (!nz) {
++			continue;
++		}
++		for (size_t b = 0; b < 64; b++) {
++			snprintf(hex + 2 * b, 3, "%02x", m[k + b]);
++		}
++		fDumpLines++;
++		IOLog("S8AGX: L %zx %s\n", k, hex);
++		lines++;
++	}
 +}
 +
 +/* One completion record (0x20 B: cookie, two timestamps, status) into the notification queue of a command queue. */
@@ -501,6 +545,7 @@ index 0000000..0f88ad7
 +		uint32_t pid = *(const uint32_t *)(in + 0x50);      /* the primary buffer's resource id, for a sub-buffer */
 +		bool given = (flags & 0x80) != 0 && uptr != 0;
 +		bool sub = false;
++		uint32_t dataRegion = 0xffffffffu;
 +		IOReturn r = kIOReturnSuccess;
 +
 +		if (size == 0) {
@@ -515,6 +560,7 @@ index 0000000..0f88ad7
 +			}
 +		} else {
 +			r = allocShmem(size, &data);
++			dataRegion = (r == kIOReturnSuccess) ? fShmemCount - 1 : 0xffffffffu;
 +		}
 +		if (r == kIOReturnSuccess) {
 +			r = allocShmem(0x4000, &shared);
@@ -533,6 +579,7 @@ index 0000000..0f88ad7
 +		*(uint64_t *)(o + 0x20) = size;
 +		if (fResId <= kResMax) {
 +			fResVa[fResId - 1] = va;
++			fResShm[fResId - 1] = dataRegion;
 +		}
 +		IOLog("S8AGX: resource %u: size 0x%llx flags 0x%x%s gpu va 0x%llx cpu 0x%llx\n", (unsigned)fResId, size, (unsigned)flags,
 +		    sub ? " (sub-buffer)" : (given ? " (caller memory)" : ""), (unsigned long long)va, (unsigned long long)data);
@@ -627,32 +674,31 @@ index 0000000..0f88ad7
 +			}
 +		}
 +		if (fSubmitDumps < 3 && fShmemType != NULL) {
-+			/* what userland wrote for the GPU: the non-zero part of every device shared-memory region (type 0 segment list, 1 kernel commands, ...) */
-+			fSubmitDumps++;
-+			for (uint32_t r = 0; r < fShmemCount && r < kShmemMax; r++) {
-+				const uint8_t * m;
-+				size_t len, ext = 0;
++			char pname[32] = "?";
 +
-+				if (fShmemType[r] == 0xff || fShmemBuf[r] == NULL) {
-+					continue;
-+				}
-+				m = (const uint8_t *)fShmemBuf[r]->getBytesNoCopy();
-+				len = fShmemBuf[r]->getLength();
-+				for (size_t k = len; k > 0; k--) {
-+					if (m[k - 1] != 0) {
-+						ext = k;
-+						break;
++			proc_selfname(pname, sizeof(pname));
++			if (strncmp(pname, "s8mtl_test", 10) == 0) {
++				/*
++				 * Learn the AGX command format: print every non-zero 64-byte line of (1) the device shared-memory regions (type 0 segment list,
++				 * 1 kernel commands) and (2) every resource userland created (command buffer memory, programs, descriptors), with the resource's GPU
++				 * virtual address, so that offline tools can follow pointers. Only for the first submits of the test process.
++				 */
++				fSubmitDumps++;
++				fDumpLines = 0;
++				for (uint32_t r = 0; r < fShmemCount && r < kShmemMax; r++) {
++					if (fShmemBuf[r] == NULL) {
++						continue;
++					}
++					if (fShmemType[r] != 0xff) {
++						dumpSparse("shmem", r, fShmemType[r], 0, (const uint8_t *)fShmemBuf[r]->getBytesNoCopy(), fShmemBuf[r]->getLength());
 +					}
 +				}
-+				IOLog("S8AGX: dump %u: shmem region %u type %u, %zu bytes, non-zero extent %zu\n", (unsigned)fSubmitDumps, (unsigned)r, (unsigned)fShmemType[r], len, ext);
-+				for (size_t k = 0; k < ext && k < 192; k += 32) {
-+					char hex[32 * 2 + 1];
-+					size_t n = ext - k < 32 ? ext - k : 32;
++				for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
++					uint32_t r = fResShm[n - 1];
 +
-+					for (size_t b = 0; b < n; b++) {
-+						snprintf(hex + 2 * b, 3, "%02x", m[k + b]);
++					if (r != 0xffffffffu && r < fShmemCount && fShmemBuf[r] != NULL) {
++						dumpSparse("res", n, 0, fResVa[n - 1], (const uint8_t *)fShmemBuf[r]->getBytesNoCopy(), fShmemBuf[r]->getLength());
 +					}
-+					IOLog("S8AGX:   +%03zx %s\n", k, hex);
 +				}
 +			}
 +		}
