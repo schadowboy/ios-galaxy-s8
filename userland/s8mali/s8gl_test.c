@@ -433,6 +433,75 @@ main(int argc, char **argv)
 		verdict("a plausible share of the frame is lit (18 to 40 percent)", lit * 100 / total >= 18 && lit * 100 / total <= 40);
 	}
 	free(drawn);
+	{
+		/*
+		 * Stress phase: only when /var/mobile/s8gl_stress exists (holds the number of seconds). A full-screen
+		 * quad at 1024 x 1024 with an ALU-heavy fragment shader keeps every shader core busy; frames per second
+		 * are logged once a second so the kernel log (clock, temperature, throttle cap) can be lined up with them.
+		 */
+		static const float quad[] = {
+			-1, -1, 0.1f, 0.2f, 0.3f,  1, -1, 0.9f, 0.2f, 0.3f,  -1, 1, 0.1f, 0.8f, 0.3f,
+			 1, -1, 0.9f, 0.2f, 0.3f,  1,  1, 0.9f, 0.8f, 0.3f,  -1, 1, 0.1f, 0.8f, 0.3f,
+		};
+		FILE *sf = fopen("/var/mobile/s8gl_stress", "r");
+		int secs = 0;
+
+		if (sf != NULL) {
+			if (fscanf(sf, "%d", &secs) != 1) {
+				secs = 60;
+			}
+			fclose(sf);
+		}
+		if (secs > 0 && secs <= 3600) {
+			unsigned tex2 = 0, fb2 = 0, heavy;
+			int sok = 0, frames = 0, sec = 0;
+			uint64_t t0, mark;
+
+			glGenTextures(1, &tex2);
+			glBindTexture(GL_TEXTURE_2D, tex2);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1024, 1024, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+			glGenFramebuffers(1, &fb2);
+			glBindFramebuffer(GL_FRAMEBUFFER, fb2);
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex2, 0);
+			heavy = glCreateProgram();
+			glAttachShader(heavy, shader(GL_VERTEX_SHADER,
+			    "attribute vec2 where; attribute vec3 colour; varying vec3 c;\n"
+			    "void main() { gl_Position = vec4(where, 0.0, 1.0); c = colour; }\n"));
+			glAttachShader(heavy, shader(GL_FRAGMENT_SHADER,
+			    "precision highp float; varying vec3 c;\n"
+			    "void main() { float x = c.x * 7.0, y = c.y * 5.0;\n"
+			    "  for (int i = 0; i < 200; i++) { x = sin(x * 1.3 + y) + cos(y * 0.7 - x); y = fract(x * y + 0.37) + x * 0.01; }\n"
+			    "  gl_FragColor = vec4(fract(x), fract(y), c.z, 1.0); }\n"));
+			glBindAttribLocation(heavy, 0, "where");
+			glBindAttribLocation(heavy, 1, "colour");
+			glLinkProgram(heavy);
+			glGetProgramiv(heavy, GL_LINK_STATUS, &sok);
+			verdict("stress shader compiles and links", sok);
+			if (sok && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+				glUseProgram(heavy);
+				glViewport(0, 0, 1024, 1024);
+				glVertexAttribPointer(0, 2, GL_FLOAT, 0, 5 * sizeof(float), quad);
+				glVertexAttribPointer(1, 3, GL_FLOAT, 0, 5 * sizeof(float), quad + 2);
+				say("S8GL-TEST: stress for %d s at 1024 x 1024\n", secs);
+				t0 = mark = now_us();
+				while (now_us() - t0 < (uint64_t)secs * 1000000ull) {
+					glDrawArrays(GL_TRIANGLES, 0, 6);
+					glFinish();
+					frames++;
+					if (now_us() - mark >= 1000000ull) {
+						sec++;
+						say("S8GL-TEST: stress t=%d s: %d frames in %llu us\n", sec, frames,
+						    (unsigned long long)(now_us() - mark));
+						frames = 0;
+						mark = now_us();
+					}
+				}
+				verdict("stress finished without a GL error", glGetError() == 0);
+			}
+		}
+	}
 	if (failures == 0) {
 		say("S8GL-TEST: all passed\n");
 	} else {
