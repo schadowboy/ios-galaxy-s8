@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..e01925e
+index 0000000..952d339
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,410 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -336,6 +336,32 @@ index 0000000..e01925e
 +	}
 +	if (args->scalarOutput != NULL) {
 +		bzero(args->scalarOutput, args->scalarOutputCount * sizeof(uint64_t));
++	}
++	if (selector == 0x100 && args->structureOutput != NULL && args->structureOutputSize >= 0x78) {
++		/*
++		 * AGXGPUCoreConfig (0x78 B; AGXG10P keeps it at accelerator-config+0x368 and publishes num_cores/num_frags/num_gps/num_mgpus/
++		 * core_mask_list from it, offsets read off the kext's property publisher). The A11 GPU (G10P) has 3 cores.
++		 */
++		uint8_t * o = (uint8_t *)args->structureOutput;
++
++		bzero(o, args->structureOutputSize);
++		*(uint32_t *)(o + 0x0c) = 3;            /* num_cores */
++		*(uint32_t *)(o + 0x18) = 1;            /* num_gps */
++		*(uint32_t *)(o + 0x20) = 3;            /* num_frags */
++		*(uint32_t *)(o + 0x30) = 1;            /* num_mgpus */
++		*(uint64_t *)(o + 0x48) = 0x7;          /* core_mask_list[0] */
++		o[0x68] = 1;                            /* core mask list valid */
++		return kIOReturnSuccess;
++	}
++	if (selector == 0x102 && args->structureOutput != NULL && args->structureOutputSize >= 0x1c8) {
++		/* build info: strings only (kext build date, build type) */
++		uint8_t * o = (uint8_t *)args->structureOutput;
++
++		bzero(o, args->structureOutputSize);
++		strlcpy((char *)(o + 0xc8), "Jul 11 2025 16:00:18", 0x20);
++		strlcpy((char *)(o + 0xe8), "release", 8);
++		strlcpy((char *)(o + 0x1a8), "Unknown", 0x20);
++		return kIOReturnSuccess;
 +	}
 +	if (selector == 0 && args->structureOutput != NULL && args->structureOutputSize >= 0x40) {
 +		/*
