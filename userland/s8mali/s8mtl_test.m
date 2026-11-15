@@ -96,6 +96,23 @@ main(void)
 				{ "interpolated colour", "return in.col;", 0, 0, 0, 1, 0 },
 				{ "red over white, no blend", "return float4(1,0,0,1);", 1, 1, 1, 1, 0 },
 				{ "red alpha 0.5 blended over white", "return float4(1,0,0,0.5);", 1, 1, 1, 1, 1 },
+				/* one operation per scene (ISA calibration: in.col = (x*0.5+0.5, y*0.5+0.5, 0.25, 1) varies over the target) */
+				{ "fmul imm", "return in.col * 0.5;", 0, 0, 0, 1, 0 },
+				{ "fadd imm", "return in.col + float4(0.125);", 0, 0, 0, 1, 0 },
+				{ "fmul vv", "return in.col * in.col;", 0, 0, 0, 1, 0 },
+				{ "ffma", "return fma(in.col, float4(0.5), float4(0.25));", 0, 0, 0, 1, 0 },
+				{ "swizzle", "return float4(in.col.y, in.col.x, in.col.z, 1);", 0, 0, 0, 1, 0 },
+				{ "saturate scale", "return saturate(in.col * 2.0 - 0.5);", 0, 0, 0, 1, 0 },
+				{ "mix", "return mix(float4(1,0,0,1), float4(0,0,1,1), in.col.x);", 0, 0, 0, 1, 0 },
+				{ "select", "return in.col.x > 0.5 ? float4(1,0,0,1) : float4(0,1,0,1);", 0, 0, 0, 1, 0 },
+				{ "sqrt", "return float4(sqrt(in.col.x), in.col.y, in.col.z, 1);", 0, 0, 0, 1, 0 },
+				{ "rcp", "return float4(1.0/(in.col.x+1.0), in.col.y, in.col.z, 1);", 0, 0, 0, 1, 0 },
+				{ "exp2 log2", "return float4(exp2(in.col.x), log2(in.col.y+1.0), 0, 1);", 0, 0, 0, 1, 0 },
+				{ "min max", "return float4(min(in.col.x, 0.5), max(in.col.y, 0.25), 0, 1);", 0, 0, 0, 1, 0 },
+				{ "half math", "return float4(half4(in.col) * half4(0.5));", 0, 0, 0, 1, 0 },
+				{ "discard", "if (in.col.x < 0.5) discard_fragment(); return float4(1,0,0,1);", 0, 0, 0, 1, 0 },
+				{ "sin", "return float4(sin(in.col.x*3.0)*0.5+0.5, 0, 0, 1);", 0, 0, 0, 1, 0 },
+				{ "floor", "return float4(floor(in.col.x*4.0)/4.0, 0, 0, 1);", 0, 0, 0, 1, 0 },
 			};
 			int rcount = (int)(sizeof(rvs) / sizeof(rvs[0]));
 			for (int r = 0; r < rcount && tex != nil && q != nil; r++) {
