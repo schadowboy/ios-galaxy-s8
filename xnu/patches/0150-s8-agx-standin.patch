@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..7d867be
+index 0000000..6d81d81
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,246 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -47,6 +47,10 @@ index 0000000..7d867be
 +#define S8AGX_LOG_LIMIT 800
 +
 +static volatile SInt32 gAgxLogged;
++static volatile SInt32 gAgxSelCount[0x200];   /* calls seen per selector: only the first few of each are logged */
++
++extern "C" int proc_selfpid(void);
++extern "C" void proc_selfname(char * buf, int size);
 +
 +static bool
 +agx_log_ok(void)
@@ -107,6 +111,7 @@ index 0000000..7d867be
 +public:
 +	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, UInt32 refCon) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
 +	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
@@ -123,7 +128,10 @@ index 0000000..7d867be
 +	fType = type;
 +	fTask = owningTask;
 +	if (agx_log_ok()) {
-+		IOLog("S8AGX: user client opened, type %u (task %p)\n", (unsigned)type, owningTask);
++		char name[32] = "?";
++
++		proc_selfname(name, sizeof(name));
++		IOLog("S8AGX: user client opened, type %u by %s[%d]\n", (unsigned)type, name, proc_selfpid());
 +	}
 +	return true;
 +}
@@ -136,6 +144,15 @@ index 0000000..7d867be
 +	}
 +	if (!isInactive()) {
 +		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AGXDeviceUserClient::registerNotificationPort(mach_port_t port, UInt32 type, UInt32 refCon)
++{
++	if (agx_log_ok()) {
++		IOLog("S8AGX: registerNotificationPort port 0x%x type %u refCon 0x%x\n", (unsigned)port, (unsigned)type, (unsigned)refCon);
 +	}
 +	return kIOReturnSuccess;
 +}
@@ -169,8 +186,11 @@ index 0000000..7d867be
 +	if (args == NULL) {
 +		return kIOReturnBadArgument;
 +	}
-+	if (agx_log_ok()) {
-+		IOLog("S8AGX: sel 0x%x scalarIn %u structIn %u (desc %s) scalarOut %u structOut %u (desc %s) async %s\n", selector,
++	if (selector >= 0x200 || OSIncrementAtomic((SInt32 *)&gAgxSelCount[selector]) < 8) {
++		char name[32] = "?";
++
++		proc_selfname(name, sizeof(name));
++		IOLog("S8AGX: [%s %d] sel 0x%x scalarIn %u structIn %u (desc %s) scalarOut %u structOut %u (desc %s) async %s\n", name, proc_selfpid(), selector,
 +		    args->scalarInputCount, args->structureInputSize, args->structureInputDescriptor ? "yes" : "no",
 +		    args->scalarOutputCount, args->structureOutputSize, args->structureOutputDescriptor ? "yes" : "no",
 +		    args->asyncWakePort ? "yes" : "no");
