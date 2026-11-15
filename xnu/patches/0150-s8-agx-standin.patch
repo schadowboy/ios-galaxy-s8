@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..1b4b87f
+index 0000000..0bcda3b
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,513 @@
+@@ -0,0 +1,535 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -167,6 +167,8 @@ index 0000000..1b4b87f
 +	UInt32 fQueueId;                /* last command queue id handed out (selector 7) */
 +	UInt32 fNqId;                   /* last notification queue id handed out (selector 15) */
 +	UInt32 fResId;                  /* last resource id handed out (selector 9) */
++	enum { kResMax = 1024 };
++	uint64_t fResVa[kResMax];       /* GPU virtual address of resource id n at [n - 1] */
 +	uint64_t fGpuVa;                /* next GPU virtual address to give a resource (0 = not started) */
 +
 +	IOReturn createShmem(IOExternalMethodArguments * args);
@@ -382,13 +384,28 @@ index 0000000..1b4b87f
 +		const uint8_t * in = (const uint8_t *)args->structureInput;
 +		uint8_t * o = (uint8_t *)args->structureOutput;
 +		uint64_t size = *(const uint64_t *)(in + 0x48);
-+		uint64_t data = 0, shared = 0;
-+		IOReturn r;
++		uint64_t data = 0, shared = 0, va = fGpuVa;
++		uint32_t flags = *(const uint32_t *)in;
++		uint64_t uptr = *(const uint64_t *)(in + 0x38);     /* CPU memory the caller gives (flag 0x80) */
++		uint64_t pbase = *(const uint64_t *)(in + 0x40);    /* the primary buffer's CPU base, for a sub-buffer */
++		uint32_t pid = *(const uint32_t *)(in + 0x50);      /* the primary buffer's resource id, for a sub-buffer */
++		bool given = (flags & 0x80) != 0 && uptr != 0;
++		bool sub = false;
++		IOReturn r = kIOReturnSuccess;
 +
 +		if (size == 0) {
 +			size = 0x4000;
 +		}
-+		r = allocShmem(size, &data);
++		if (given) {
++			/* the caller's own memory: the answer must echo its pointer; a sub-buffer sits at the primary's GPU address + the same offset */
++			data = uptr;
++			if (pid != 0 && pid <= fResId && pid <= kResMax && uptr >= pbase) {
++				va = fResVa[pid - 1] + (uptr - pbase);
++				sub = true;
++			}
++		} else {
++			r = allocShmem(size, &data);
++		}
 +		if (r == kIOReturnSuccess) {
 +			r = allocShmem(0x4000, &shared);
 +		}
@@ -398,15 +415,20 @@ index 0000000..1b4b87f
 +		}
 +		size = (size + 0x3fffULL) & ~0x3fffULL;
 +		bzero(o, args->structureOutputSize);
-+		*(uint64_t *)o = fGpuVa;
++		*(uint64_t *)o = va;
 +		*(uint64_t *)(o + 8) = data;
 +		*(uint64_t *)(o + 0x10) = shared;
 +		o[0x18] = 1;
 +		*(uint32_t *)(o + 0x1c) = ++fResId;
 +		*(uint64_t *)(o + 0x20) = size;
-+		IOLog("S8AGX: resource %u: size 0x%llx flags 0x%x gpu va 0x%llx cpu 0x%llx\n", (unsigned)fResId, size,
-+		    (unsigned)*(const uint32_t *)in, (unsigned long long)fGpuVa, (unsigned long long)data);
-+		fGpuVa += (size + 0xffffULL) & ~0xffffULL;
++		if (fResId <= kResMax) {
++			fResVa[fResId - 1] = va;
++		}
++		IOLog("S8AGX: resource %u: size 0x%llx flags 0x%x%s gpu va 0x%llx cpu 0x%llx\n", (unsigned)fResId, size, (unsigned)flags,
++		    sub ? " (sub-buffer)" : (given ? " (caller memory)" : ""), (unsigned long long)va, (unsigned long long)data);
++		if (!sub) {
++			fGpuVa += (size + 0xffffULL) & ~0xffffULL;
++		}
 +		return kIOReturnSuccess;
 +	}
 +	if (selector == 7 && args->structureOutput != NULL && args->structureOutputSize >= 16) {
