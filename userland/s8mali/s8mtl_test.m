@@ -288,6 +288,66 @@ main(void)
 				}
 			}
 		}
+		/*
+		 * Round 5: minimal vertex programs, one operation apart, to isolate each instruction form of the A11 vertex ISA
+		 * (vertex id, buffer load with a stride, plain exports, one multiply, one add).
+		 */
+		if (tex != nil && q != nil) {
+			NSError *e5 = nil;
+			NSString *s5 = @"#include <metal_stdlib>\nusing namespace metal;\n"
+			    "struct V { float4 pos [[position]]; float4 col; };\n"
+			    "vertex V vA(uint vid [[vertex_id]]) { V o; o.pos = float4(0.25, 0.5, 0.0, 1.0); o.col = float4(1.0, 0.0, 0.0, 1.0); return o; }\n"
+			    "vertex V vB(uint vid [[vertex_id]]) { V o; o.pos = float4(float(vid) * 0.5, 0.0, 0.0, 1.0); o.col = float4(1.0, 0.0, 0.0, 1.0); return o; }\n"
+			    "vertex V vC(uint vid [[vertex_id]], constant float4 *vb [[buffer(0)]]) { V o; o.pos = vb[vid]; o.col = float4(1.0, 0.0, 0.0, 1.0); return o; }\n"
+			    "vertex V vD(uint vid [[vertex_id]], constant float4 *vb [[buffer(0)]]) { V o; o.pos = float4(vb[vid].xy, 0.0, 1.0); o.col = float4(1.0, 0.0, 0.0, 1.0); return o; }\n"
+			    "vertex V vE(uint vid [[vertex_id]], constant float4 *vb [[buffer(0)]]) { V o; o.pos = float4(vb[vid].xy, 0.0, 1.0); o.col = vb[vid]; return o; }\n"
+			    "vertex V vF(uint vid [[vertex_id]], constant float4 *vb [[buffer(0)]]) { V o; o.pos = float4(vb[vid].xy, 0.0, 1.0); o.col = vb[vid] * 2.0; return o; }\n"
+			    "vertex V vG(uint vid [[vertex_id]], constant float4 *vb [[buffer(0)]]) { V o; o.pos = float4(vb[vid].xy + 0.125, 0.0, 1.0); o.col = vb[vid]; return o; }\n"
+			    "vertex V vH(uint vid [[vertex_id]], uint iid [[instance_id]], constant float4 *vb [[buffer(0)]]) { V o; o.pos = float4(vb[vid].xy, 0.0, 1.0); o.col = float4(float(iid), 0.0, 0.0, 1.0); return o; }\n"
+			    "fragment float4 fsc(V in [[stage_in]]) { return in.col; }\n";
+			id<MTLLibrary> l5 = [dev newLibraryWithSource:s5 options:nil error:&e5];
+
+			if (l5 != nil) {
+				const char *vn[] = { "vA", "vB", "vC", "vD", "vE", "vF", "vG", "vH" };
+				float tri[3][4] = { { -0.5f, -0.5f, 0.25f, 0.5f }, { 0.5f, -0.5f, 0.75f, 0.125f }, { 0.0f, 0.5f, 0.375f, 0.625f } };
+
+				for (int k = 0; k < 8; k++) {
+					MTLRenderPipelineDescriptor *p5 = [[MTLRenderPipelineDescriptor alloc] init];
+					NSString *nm = [NSString stringWithUTF8String:vn[k]];
+
+					p5.vertexFunction = [l5 newFunctionWithName:nm];
+					p5.fragmentFunction = [l5 newFunctionWithName:@"fsc"];
+					p5.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+					id<MTLRenderPipelineState> ps5 = [dev newRenderPipelineStateWithDescriptor:p5 error:&e5];
+
+					if (ps5 == nil) {
+						LOG("S8MTL: round 5 pipeline %s failed\n", vn[k]);
+						continue;
+					}
+					MTLRenderPassDescriptor *rp5 = [MTLRenderPassDescriptor renderPassDescriptor];
+
+					rp5.colorAttachments[0].texture = tex;
+					rp5.colorAttachments[0].loadAction = MTLLoadActionClear;
+					rp5.colorAttachments[0].storeAction = MTLStoreActionStore;
+					rp5.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+					id<MTLCommandBuffer> cb5 = [q commandBuffer];
+					id<MTLRenderCommandEncoder> en5 = [cb5 renderCommandEncoderWithDescriptor:rp5];
+
+					LOG("S8MTL: ==== vertex scene %s\n", vn[k]);
+					[en5 setRenderPipelineState:ps5];
+					[en5 setVertexBytes:tri length:sizeof(tri) atIndex:0];
+					[en5 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:(k == 7 ? 2 : 1)];
+					[en5 endEncoding];
+					[cb5 commit];
+					for (int w = 0; w < 5 && [cb5 status] < MTLCommandBufferStatusCompleted; w++) {
+						sleep(1);
+					}
+					LOG("S8MTL: vertex scene %s status %ld\n", vn[k], (long)[cb5 status]);
+				}
+			} else {
+				LOG("S8MTL: round 5 library failed: %s\n", e5 ? [[e5 description] UTF8String] : "?");
+			}
+		}
 		struct fam { const char *src; int gx, gy, tx, ty; } fams[] = {
 			{ "kernel void kk(device uint *z [[buffer(0)]], device uint *a [[buffer(1)]], uint i [[thread_position_in_grid]]) { a[i] = i; }", 64, 1, 32, 1 },
 			{ "kernel void kk(device uint *z [[buffer(0)]], device uint *y [[buffer(1)]], device uint *a [[buffer(2)]], uint i [[thread_position_in_grid]]) { a[i] = i; }", 64, 1, 32, 1 },

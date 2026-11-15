@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..6a1ba6f
+index 0000000..0d54133
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,989 @@
+@@ -0,0 +1,992 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -49,6 +49,8 @@ index 0000000..6a1ba6f
 +
 +static volatile SInt32 gAgxLogged;
 +static char gDumpName[32] = "s8mtl_test";      /* boot-arg s8agxdump=<process name prefix> */
++static uint32_t gSkip = 0;                      /* boot-arg s8agxskip=<n>: do not dump the first n submits of that process (later rounds of the test) */
++static uint32_t gSeen = 0;
 +
 +extern "C" uint64_t mach_absolute_time(void);
 +extern "C" int proc_selfpid(void);
@@ -886,7 +888,7 @@ index 0000000..6a1ba6f
 +			char pname[32] = "?";
 +
 +			proc_selfname(pname, sizeof(pname));
-+			if (strncmp(pname, gDumpName, strlen(gDumpName)) == 0) {
++			if (strncmp(pname, gDumpName, strlen(gDumpName)) == 0 && gSeen++ >= gSkip) {
 +				/*
 +				 * Learn the AGX command format: print every non-zero 64-byte line of (1) the device shared-memory regions (type 0 segment list,
 +				 * 1 kernel commands) and (2) every resource userland created (command buffer memory, programs, descriptors), with the resource's GPU
@@ -974,6 +976,7 @@ index 0000000..6a1ba6f
 +	}
 +	PE_parse_boot_argn("s8agxdump", gDumpName, sizeof(gDumpName));
 +	PE_parse_boot_argn("s8agxexec", gExecName, sizeof(gExecName));
++	PE_parse_boot_argn("s8agxskip", &gSkip, sizeof(gSkip));
 +	for (int i = 0; i < 600 && (provider = IOService::getPlatform()) == NULL; i++) {
 +		IOSleep(100);
 +	}
