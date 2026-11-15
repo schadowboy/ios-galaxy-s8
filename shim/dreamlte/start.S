@@ -58,8 +58,58 @@ _start:
 	dsb	sy
 	isb
 	br	x16
-4:	wfe
-	b	4b
+	/* dl_main returned 0: either the failure path, or the kernel was handed to a Mongoose core (mongoose_handoff). Power this core off
+	 * (PSCI CPU_OFF) so XNU can start it later as an ordinary secondary; if that returns, park. */
+4:	movz	x0, #0x8400, lsl #16
+	movk	x0, #0x0002		/* PSCI CPU_OFF 0x84000002 */
+	smc	#0
+5:	wfe
+	b	5b
+
+/*
+ * mongoose_handoff (smp_probe.c) starts this on Mongoose core 0 with PSCI CPU_ON: the loader's own jump to XNU, performed by that core.
+ * mongoose_boot_slot[0] = XNU entry PA, [1] = boot_args PA. EL1 or EL2 entry (as sweet_secondary_entry handles), MMU and caches off.
+ */
+	.globl mongoose_boot_entry
+mongoose_boot_entry:
+	msr	daifset, #0xf
+	mrs	x1, CurrentEL
+	cmp	x1, #0x4
+	b.eq	Lmb_el1
+	cmp	x1, #0x8
+	b.ne	Lmb_bad
+	mov	x1, #(1 << 31)		/* AArch64 EL1, no stage 2 */
+	msr	hcr_el2, x1
+	msr	vttbr_el2, xzr
+	msr	cptr_el2, xzr
+	msr	mdcr_el2, xzr
+	mov	x1, #3
+	msr	cnthctl_el2, x1
+	msr	cntvoff_el2, xzr
+	movz	x1, #0x0800
+	movk	x1, #0x30d0, lsl #16	/* Armv8 SCTLR RES1 bits, M/C/I off */
+	msr	sctlr_el1, x1
+	isb
+	adr	x1, Lmb_el1
+	msr	elr_el2, x1
+	mov	x1, #0x3c5		/* DAIF masked, EL1h */
+	msr	spsr_el2, x1
+	eret
+Lmb_bad:
+	b	Lmb_bad
+Lmb_el1:
+	mrs	x14, sctlr_el1
+	bic	x14, x14, #1		/* M */
+	bic	x14, x14, #4		/* C */
+	bic	x14, x14, #0x1000	/* I */
+	msr	sctlr_el1, x14
+	ic	iallu
+	dsb	sy
+	isb
+	adr	x1, mongoose_boot_slot
+	ldr	x16, [x1]
+	ldr	x0, [x1, #8]
+	br	x16
 
 /*
  * smp_probe.c target: a started secondary marks smp_flags[(Aff1 & 1) << 2 |
@@ -121,6 +171,10 @@ smp_entry3:
 	.globl smp_flags
 smp_flags:
 	.space	128
+	.balign	64
+	.globl mongoose_boot_slot
+mongoose_boot_slot:
+	.space	64
 	.text
 
 .macro vent slot

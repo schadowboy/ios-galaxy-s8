@@ -586,6 +586,27 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 	clean(RAMOOPS_CONSOLE, RAMOOPS_CONSOLE + RAMOOPS_CONSOLE_SIZE);
 	clean(RAMOOPS_PMSG, RAMOOPS_PMSG + RAMOOPS_CONSOLE_SIZE);
 	(void)ufs_write_log((const void *)prz->data, log_len);
+	/* s8bigboot=1: hand XNU to Mongoose core 0 (kernel boot CPU = MPIDR 0); this A53 then powers itself off (start.S). */
+	{
+		int bb = 0;
+		for (int i = 0; i + 11 < BOOT_LINE_LENGTH && p->cmdline[i]; i++) {
+			const char *k = "s8bigboot=";
+			int m = 0;
+			while (k[m] && p->cmdline[i + m] == k[m])
+				m++;
+			if (k[m] || (i && p->cmdline[i - 1] != ' '))
+				continue;
+			bb = p->cmdline[i + 10] == '1';
+			break;
+		}
+		if (bb) {
+			extern int mongoose_handoff(uint64_t, uint64_t, void (*)(const char *, uint64_t), void (*)(const char *), void (*)(void));
+			if (mongoose_handoff(entry_pa, dl_boot_args, kv, out, gpu0_flush) == 0)
+				return 0;
+			out("MONGOOSE BOOT: CPU_ON failed, booting on this core\n");
+			gpu0_flush();
+		}
+	}
 	return entry_pa;
 }
 

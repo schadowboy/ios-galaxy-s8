@@ -45,11 +45,9 @@ def child(node, name):
 
 def cpu_identity(logical):
     """(is_a53, MPIDR) of a logical CPU. The scheduler hands work to the lowest-numbered idle CPU first, so the fast Mongoose cores get the
-    low numbers: logical 0 = the boot A53 (0x100), 1-4 = Mongoose 0-3, 5-7 = the other three A53s (0x101-0x103)."""
-    if logical == 0:
-        return True, 0x100
-    if logical <= 4:
-        return False, logical - 1
+    low numbers: logical 0-3 = Mongoose MPIDR 0-3 (logical 0 is the boot CPU: the loader starts XNU on it), 4-7 = Cortex-A53 0x100-0x103."""
+    if logical < 4:
+        return False, logical
     return True, 0x100 + (logical - 4)
 
 

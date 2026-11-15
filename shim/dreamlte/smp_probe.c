@@ -1001,6 +1001,37 @@ static void mngs_exp10(void (*kv)(const char *, uint64_t), void (*out)(const cha
 	fl(flush);
 }
 
+/*
+ * s8bigboot=1: start XNU on Mongoose core 0 instead of this Cortex-A53 (the kernel numbers the cores 0-3 Mongoose, 4-7 Cortex, so its
+ * boot CPU is a Mongoose). The GIC distributor must be enabled for EL3 to act on CPU_ON (loader experiment mngsexp=10). The new core runs
+ * mongoose_boot_entry (start.S): the loader's own jump to XNU, with x0 = boot_args. Returns 0 when CPU_ON was accepted; the caller then
+ * returns 0 to start.S, which powers this core off.
+ */
+extern char mongoose_boot_entry[];
+extern volatile uint64_t mongoose_boot_slot[8];
+
+int mongoose_handoff(uint64_t entry, uint64_t bootargs, void (*kv)(const char *, uint64_t), void (*out)(const char *), void (*flush)(void))
+{
+	uint32_t old = rd(GICD_BASE + 0x000);
+
+	wr(GICD_BASE + 0x000, old | 1u);
+	__asm__ volatile("dsb sy" ::: "memory");
+	kv("MONGOOSE BOOT: GICD_CTLR", rd(GICD_BASE + 0x000));
+	mongoose_boot_slot[0] = entry;
+	mongoose_boot_slot[1] = bootargs;
+	dc_civac_range((const void *)mongoose_boot_slot, 64);
+	dc_civac_range(mongoose_boot_entry, 512);
+	kv("MONGOOSE BOOT: XNU entry", entry);
+	kv("MONGOOSE BOOT: boot_args", bootargs);
+	out("MONGOOSE BOOT: CPU_ON(0x000)\n");
+	fl(flush);
+	int64_t rc = smc3(PSCI_CPU_ON, 0x000, (uintptr_t)mongoose_boot_entry, bootargs);
+
+	kv("MONGOOSE BOOT: CPU_ON rc", (uint64_t)rc);
+	fl(flush);
+	return rc == 0 ? 0 : -1;
+}
+
 /* mode 0 = original behaviour; 2 = switch the CPUCL0 clock before CPU_ON; 3 = observable stub */
 void mngs_probe_x(void (*kv)(const char *, uint64_t), void (*out)(const char *),
 		  void (*flush)(void), unsigned mode)
