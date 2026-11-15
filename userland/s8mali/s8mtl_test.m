@@ -28,8 +28,7 @@ main(void)
 		for (int i = 0; i < 12 && dev == nil; i++) {
 			sleep(5);
 			dev = MTLCreateSystemDefaultDevice();
-			NSArray *all = MTLCopyAllDevices();
-			LOG("S8MTL: try %d: default device %p, MTLCopyAllDevices %lu\n", i, (__bridge void *)dev, (unsigned long)[all count]);
+			LOG("S8MTL: try %d: default device %p\n", i, (__bridge void *)dev);
 		}
 		if (dev == nil) {
 			LOG("S8MTL: no Metal device\n");
