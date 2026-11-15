@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..dd0540f
+index 0000000..1b4b87f
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,473 @@
+@@ -0,0 +1,513 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -159,13 +159,15 @@ index 0000000..dd0540f
 +	UInt32 fType;
 +	task_t fTask;
 +	/* shared memory the kernel gave this client (selector 0xd): kernel buffer + its mapping in the client's task */
-+	enum { kShmemMax = 64 };
++	enum { kShmemMax = 512 };
 +	IOBufferMemoryDescriptor * fShmemBuf[kShmemMax];
 +	IOMemoryMap * fShmemMap[kShmemMax];
 +	UInt32 fShmemCount;
 +
 +	UInt32 fQueueId;                /* last command queue id handed out (selector 7) */
 +	UInt32 fNqId;                   /* last notification queue id handed out (selector 15) */
++	UInt32 fResId;                  /* last resource id handed out (selector 9) */
++	uint64_t fGpuVa;                /* next GPU virtual address to give a resource (0 = not started) */
 +
 +	IOReturn createShmem(IOExternalMethodArguments * args);
 +	IOReturn allocShmem(uint64_t size, uint64_t * userAddress);
@@ -190,6 +192,7 @@ index 0000000..dd0540f
 +	}
 +	fType = type;
 +	fTask = owningTask;
++	fGpuVa = 0x100000000ULL;
 +	if (agx_log_ok()) {
 +		char name[32] = "?";
 +
@@ -354,8 +357,8 @@ index 0000000..dd0540f
 +		}
 +		if (args->structureInput != NULL && args->structureInputSize != 0) {
 +			const uint8_t * p = (const uint8_t *)args->structureInput;
-+			uint32_t n = args->structureInputSize < 48 ? args->structureInputSize : 48;
-+			char hex[48 * 2 + 1];
++			uint32_t n = args->structureInputSize < 112 ? args->structureInputSize : 112;
++			char hex[112 * 2 + 1];
 +
 +			for (uint32_t i = 0; i < n; i++) {
 +				snprintf(hex + 2 * i, 3, "%02x", p[i]);
@@ -368,6 +371,43 @@ index 0000000..dd0540f
 +	}
 +	if (args->scalarOutput != NULL) {
 +		bzero(args->scalarOutput, args->scalarOutputCount * sizeof(uint64_t));
++	}
++	if (selector == 9 && args->structureInput != NULL && args->structureInputSize >= 0x68 && args->structureOutput != NULL &&
++	    args->structureOutputSize >= 0x50) {
++		/*
++		 * IOGPUResourceCreate (IOGPU): in 0x68 B (u32 flags@0, alignment@0x30, user pointer@0x38, allocation size u64@0x48), out 0x50 B:
++		 * { GPU virtual address@0, CPU data pointer@8, client-shared page@0x10 (must be non-zero), flag byte@0x18, resource id u32@0x1c,
++		 * resident size@0x20 }. Memory is zeroed kernel memory mapped into the caller; the GPU address is a fresh range (stage A: no GPU work yet).
++		 */
++		const uint8_t * in = (const uint8_t *)args->structureInput;
++		uint8_t * o = (uint8_t *)args->structureOutput;
++		uint64_t size = *(const uint64_t *)(in + 0x48);
++		uint64_t data = 0, shared = 0;
++		IOReturn r;
++
++		if (size == 0) {
++			size = 0x4000;
++		}
++		r = allocShmem(size, &data);
++		if (r == kIOReturnSuccess) {
++			r = allocShmem(0x4000, &shared);
++		}
++		if (r != kIOReturnSuccess) {
++			IOLog("S8AGX: resource create failed (size 0x%llx): 0x%x\n", size, (unsigned)r);
++			return r;
++		}
++		size = (size + 0x3fffULL) & ~0x3fffULL;
++		bzero(o, args->structureOutputSize);
++		*(uint64_t *)o = fGpuVa;
++		*(uint64_t *)(o + 8) = data;
++		*(uint64_t *)(o + 0x10) = shared;
++		o[0x18] = 1;
++		*(uint32_t *)(o + 0x1c) = ++fResId;
++		*(uint64_t *)(o + 0x20) = size;
++		IOLog("S8AGX: resource %u: size 0x%llx flags 0x%x gpu va 0x%llx cpu 0x%llx\n", (unsigned)fResId, size,
++		    (unsigned)*(const uint32_t *)in, (unsigned long long)fGpuVa, (unsigned long long)data);
++		fGpuVa += (size + 0xffffULL) & ~0xffffULL;
++		return kIOReturnSuccess;
 +	}
 +	if (selector == 7 && args->structureOutput != NULL && args->structureOutputSize >= 16) {
 +		/* IOGPUCommandQueueCreateWithQoS: in 0x408 B (process name 0x400, qos u32, flag byte), out { queue id (must be non-zero), shared state } */
