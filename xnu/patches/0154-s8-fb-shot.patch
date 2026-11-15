@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index b33139d..3fc56ab 100644
+index b33139d..fbb9fbc 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -209,6 +209,9 @@ public:
@@ -26,11 +26,11 @@ index b33139d..3fc56ab 100644
  	int async = 0;
  	PE_parse_boot_argn("sweetfb_async", &async, sizeof(async));
  	if (async) {
-@@ -738,6 +748,41 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -738,6 +748,44 @@ AppleCLCD::swap(const uint8_t *rec)
  			fStatMaxGap = fStatPresentTicks = 0;
  		}
  	}
-+	if (fShotSecs != 0 && fShotCount < 14) {
++	if (fShotSecs != 0 && fShotCount < 10) {
 +		/*
 +		 * sweetfb_shot: our own screenshot. Layer 0's surface, 96x197 samples, three bytes per sample (B G R),
 +		 * as "SWEET SHOT: <n> r<row> <hex>" lines: tools/shot-decode.py rebuilds the picture from the kernel log.
@@ -45,19 +45,22 @@ index b33139d..3fc56ab 100644
 +			if (src != 0 && s->bytesPerElement == 4 && s->width >= 96 && s->height >= 197 &&
 +			    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height <= (s->memory ? s->memory->getLength() : 0)) {
 +				const uint32_t sw = 96, sh = 197;
-+				char hex[96 * 6 + 1];
++				char hex[32 * 6 + 1];
 +
 +				fShotCount++;
 +				IOLog("SWEET SHOT: %u begin %ux%u fmt 0x%x from %ux%u\n", fShotCount, sw, sh, s->pixelFormat, s->width, s->height);
 +				for (uint32_t y = 0; y < sh; y++) {
 +					const uint32_t *row = (const uint32_t *)(src + s->offset + (uint64_t)(y * s->height / sh) * s->bytesPerRow);
 +
-+					for (uint32_t x = 0; x < sw; x++) {
-+						uint32_t p = row[x * s->width / sw];
++					/* the kernel log cuts a line at about 250 characters: three segments of 32 samples per row */
++					for (uint32_t seg = 0; seg < 3; seg++) {
++						for (uint32_t x = 0; x < 32; x++) {
++							uint32_t p = row[(seg * 32 + x) * s->width / sw];
 +
-+						snprintf(hex + 6 * x, 7, "%02x%02x%02x", p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff);
++							snprintf(hex + 6 * x, 7, "%02x%02x%02x", p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff);
++						}
++						IOLog("SWEET SHOT: %u r%u s%u %s\n", fShotCount, y, seg, hex);
 +					}
-+					IOLog("SWEET SHOT: %u r%u %s\n", fShotCount, y, hex);
 +				}
 +			} else if (s != NULL) {
 +				IOLog("SWEET SHOT: layer 0 surface %u not sampled (fmt 0x%x bpe %u %ux%u)\n", s->id, s->pixelFormat, s->bytesPerElement, s->width, s->height);
