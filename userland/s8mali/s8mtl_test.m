@@ -346,6 +346,55 @@ main(void)
 			} else {
 				LOG("S8MTL: round 5 library failed: %s\n", e5 ? [[e5 description] UTF8String] : "?");
 			}
+			/* Round 6: constants other than 0 and 1 and a different component count, to fix the uniform-to-register layout */
+			{
+				NSError *e6 = nil;
+				NSString *s6 = @"#include <metal_stdlib>\nusing namespace metal;\n"
+				    "struct V { float4 pos [[position]]; float4 col; };\n"
+				    "vertex V wA(uint vid [[vertex_id]], constant float4 *vb [[buffer(0)]]) { V o; o.pos = float4(vb[vid].xy, 0.5, 1.0); o.col = float4(0.3, 0.6, 0.9, 0.2); return o; }\n"
+				    "vertex V wB(uint vid [[vertex_id]], constant float4 *vb [[buffer(0)]]) { V o; o.pos = float4(vb[vid].xyz, 1.0); o.col = float4(0.3, 0.6, 0.9, 0.2); return o; }\n"
+				    "vertex V wC(uint vid [[vertex_id]], constant float4 *vb [[buffer(0)]]) { V o; o.pos = float4(vb[vid].x, 0.25, 0.5, 1.0); o.col = float4(vb[vid].y, 0.7, vb[vid].w, 1.0); return o; }\n"
+				    "vertex V wD(uint vid [[vertex_id]], constant float4 *vb [[buffer(0)]]) { V o; o.pos = float4(vb[vid].xy, 0.0, 1.0); o.col = float4(0.0, 0.0, 0.0, 0.0); return o; }\n"
+				    "fragment float4 fsc(V in [[stage_in]]) { return in.col; }\n";
+				id<MTLLibrary> l6 = [dev newLibraryWithSource:s6 options:nil error:&e6];
+
+				if (l6 != nil) {
+					const char *wn[] = { "wA", "wB", "wC", "wD" };
+					float tri6[3][4] = { { -0.5f, -0.5f, 0.25f, 0.5f }, { 0.5f, -0.5f, 0.75f, 0.125f }, { 0.0f, 0.5f, 0.375f, 0.625f } };
+
+					for (int k = 0; k < 4; k++) {
+						MTLRenderPipelineDescriptor *p6 = [[MTLRenderPipelineDescriptor alloc] init];
+
+						p6.vertexFunction = [l6 newFunctionWithName:[NSString stringWithUTF8String:wn[k]]];
+						p6.fragmentFunction = [l6 newFunctionWithName:@"fsc"];
+						p6.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+						id<MTLRenderPipelineState> ps6 = [dev newRenderPipelineStateWithDescriptor:p6 error:&e6];
+
+						if (ps6 == nil) {
+							continue;
+						}
+						MTLRenderPassDescriptor *rp6 = [MTLRenderPassDescriptor renderPassDescriptor];
+
+						rp6.colorAttachments[0].texture = tex;
+						rp6.colorAttachments[0].loadAction = MTLLoadActionClear;
+						rp6.colorAttachments[0].storeAction = MTLStoreActionStore;
+						rp6.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+						id<MTLCommandBuffer> cb6 = [q commandBuffer];
+						id<MTLRenderCommandEncoder> en6 = [cb6 renderCommandEncoderWithDescriptor:rp6];
+
+						LOG("S8MTL: ==== vertex scene %s\n", wn[k]);
+						[en6 setRenderPipelineState:ps6];
+						[en6 setVertexBytes:tri6 length:sizeof(tri6) atIndex:0];
+						[en6 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+						[en6 endEncoding];
+						[cb6 commit];
+						for (int w = 0; w < 5 && [cb6 status] < MTLCommandBufferStatusCompleted; w++) {
+							sleep(1);
+						}
+						LOG("S8MTL: vertex scene %s status %ld\n", wn[k], (long)[cb6 status]);
+					}
+				}
+			}
 			}
 		}
 		struct fam { const char *src; int gx, gy, tx, ty; } fams[] = {
