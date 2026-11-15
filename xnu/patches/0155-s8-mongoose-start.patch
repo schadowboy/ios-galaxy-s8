@@ -1,0 +1,37 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 5bd24a7..51d7bb3 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -318,6 +318,24 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		IOLog(CPU_PORT_NAME " CPU: cpu=%u entry 0x%llx via low trampoline 0x%llx\n",
+ 		    getCPUNumber(), (uint64_t)entry, tramp_pa);
+ 		entry = (vm_offset_t)tramp_pa;
++		if (cpu->phys_id < 0x100) {
++			/*
++			 * Mongoose (cluster 0, MPIDR 0..3): EL3 powers the cluster and the core itself on a plain CPU_ON, but only while the
++			 * GIC distributor is enabled. GICD_CTLR was 0 in the loader: CPU_ON returned 0 and nothing happened; with
++			 * GICD_CTLR |= 1 the first plain CPU_ON started the core (MIDR 0x534f0010; loader experiment mngsexp=10).
++			 * No PMU writes, no second CPU_ON.
++			 */
++			static vm_offset_t gicd;
++			if (gicd == 0) {
++				gicd = ml_io_map(0x10201000, 0x1000);
++			}
++			volatile uint32_t *ctl = (volatile uint32_t *)gicd;
++			if ((*ctl & 1) == 0) {
++				*ctl |= 1;
++				__builtin_arm_dsb(DSB_SY);
++			}
++			IOLog(CPU_PORT_NAME " CPU: cpu=%u Mongoose: plain CPU_ON, GICD_CTLR=0x%x\n", getCPUNumber(), *ctl);
++		} else {
+ 		static vm_offset_t pmu;
+ 		if (pmu == 0) {
+ 			pmu = ml_io_map(0x16480000, 0x10000);
+@@ -343,6 +361,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		}
+ 		IOLog(CPU_PORT_NAME " CPU: cpu=%u first CPU_ON rc=%d, PMU power-up cfg=0x%x status=0x%x\n",
+ 		    getCPUNumber(), rc0, cfg[0], cfg[1]);
++		}
+ 	}
+ #endif
+ 	__builtin_arm_dsb(DSB_SY);

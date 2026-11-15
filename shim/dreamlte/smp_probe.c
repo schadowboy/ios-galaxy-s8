@@ -933,6 +933,74 @@ static void mngs_exp7(void (*kv)(const char *, uint64_t), void (*out)(const char
 	fl(flush);
 }
 
+/*
+ * mngsexp=10: the GIC distributor reads 0 (disabled) in the loader but is enabled in stock Linux before its first CPU_ON. Enable it,
+ * try a plain CPU_ON of an A53 (control: plain CPU_ON never started one so far) and of Mongoose core 0, restore GICD_CTLR.
+ */
+static void mngs_exp10(void (*kv)(const char *, uint64_t), void (*out)(const char *), void (*flush)(void))
+{
+	uint32_t old = rd(GICD_BASE + 0x000);
+	int up;
+
+	out("MEXP10: begin\n");
+	kv("MEXP10: GICD_CTLR before", old);
+	kv("MEXP10: GICD_TYPER", rd(GICD_BASE + 0x004));
+	wr(GICD_BASE + 0x000, old | 1u);
+	__asm__ volatile("dsb sy" ::: "memory");
+	kv("MEXP10: GICD_CTLR after write", rd(GICD_BASE + 0x000));
+	fl(flush);
+
+	/* control: A53 core 0x101 */
+	for (unsigned i = 0; i < 16; i++)
+		smp_flags[i] = 0;
+	dc_civac_range(smp_entry3, 256);
+	dc_civac_range((const void *)smp_flags, 128);
+	out("MEXP10: CPU_ON(0x101) plain\n");
+	fl(flush);
+	int64_t rca = smc3(PSCI_CPU_ON, 0x101, (uintptr_t)smp_entry3, 0);
+
+	kv("MEXP10: A53 0x101 CPU_ON rc", (uint64_t)rca);
+	up = wait_flag_inv(0, 300);
+	kv("MEXP10: A53 STARTED", up);
+	kv("MEXP10: A53 0x101 st", rd(CPU_STAT(0x101)));
+	fl(flush);
+	smp_flags[11] = 1;			/* release a started stub: it powers itself off */
+	__asm__ volatile("dc civac, %0; dsb sy" :: "r"(&smp_flags[11]) : "memory");
+	{
+		uint64_t e = ticks() + TIMER_HZ / 10;
+
+		while (ticks() < e)
+			;
+	}
+	kv("MEXP10: A53 0x101 st after release", rd(CPU_STAT(0x101)));
+	fl(flush);
+
+	/* Mongoose core 0 */
+	for (unsigned i = 0; i < 16; i++)
+		smp_flags[i] = 0;
+	dc_civac_range(smp_entry3, 256);
+	dc_civac_range((const void *)smp_flags, 128);
+	out("MEXP10: CPU_ON(0x000) plain\n");
+	fl(flush);
+	int64_t rcm = smc3(PSCI_CPU_ON, 0x000, (uintptr_t)smp_entry3, 0);
+
+	kv("MEXP10: MNGS 0x000 CPU_ON rc", (uint64_t)rcm);
+	up = wait_flag_inv(0, 300);
+	kv("MONGOOSE STARTED", up);
+	for (unsigned s = 8; s < 11; s++)
+		__asm__ volatile("dc ivac, %0; dsb sy" :: "r"(&smp_flags[s]) : "memory");
+	kv("MEXP10: MIDR_EL1", smp_flags[8]);
+	kv("MEXP10: core0 st", rd(CPU_STAT(0)));
+	kv("MEXP10: noncpu st", rd(PMU + 0x2404));
+	kv("MEXP10: l2 st", rd(PMU + 0x2604));
+	smp_flags[11] = 1;
+	__asm__ volatile("dc civac, %0; dsb sy" :: "r"(&smp_flags[11]) : "memory");
+	wr(GICD_BASE + 0x000, old);
+	kv("MEXP10: GICD_CTLR restored", rd(GICD_BASE + 0x000));
+	out("MEXP10: done\n");
+	fl(flush);
+}
+
 /* mode 0 = original behaviour; 2 = switch the CPUCL0 clock before CPU_ON; 3 = observable stub */
 void mngs_probe_x(void (*kv)(const char *, uint64_t), void (*out)(const char *),
 		  void (*flush)(void), unsigned mode)
@@ -940,6 +1008,10 @@ void mngs_probe_x(void (*kv)(const char *, uint64_t), void (*out)(const char *),
 	const int obs = mode >= 3;	/* 3 and 4 both use the observable stub + cache clean */
 	const void *entry = obs ? (const void *)smp_entry3 : (const void *)smp_entry;
 	out("MNGS probe (Mongoose cluster 0)\n");
+	if (mode == 10) {
+		mngs_exp10(kv, out, flush);
+		return;
+	}
 	if (mode >= 7) {
 		mngs_exp7(kv, out, flush, mode);
 		return;
