@@ -1,6 +1,6 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..cb9ff86
+index 0000000..9118c23
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
 @@ -0,0 +1,1196 @@
@@ -751,7 +751,7 @@ index 0000000..cb9ff86
 +		uint64_t nd = fShmemBuf[r]->getLength() / 4;
 +
 +		for (uint64_t i = 0; i + 4 < nd; i++) {
-+			if (d[i] == 0x0009051fu && (d[i + 2] == 0x108u || d[i + 3] == 0x108u)) {
++			if ((d[i] == 0x0009051fu || d[i] == 0x0009851fu) && (d[i + 2] == 0x108u || d[i + 3] == 0x108u)) {
 +				fragVa = 0x100000000ULL | (d[i + 1] & ~1u);
 +			}
 +		}
@@ -1202,7 +1202,7 @@ index 0000000..cb9ff86
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
 diff --git a/iokit/Kernel/arm/s8gfx_frag.h b/iokit/Kernel/arm/s8gfx_frag.h
 new file mode 100755
-index 0000000..703c34b
+index 0000000..d3c4257
 --- /dev/null
 +++ b/iokit/Kernel/arm/s8gfx_frag.h
 @@ -0,0 +1,188 @@
@@ -1368,7 +1368,7 @@ index 0000000..703c34b
 +s8v_find_start(const uint8_t * m, unsigned len, unsigned off)
 +{
 +	static const uint8_t sig[12] = { 0xc2, 0x02, 0x02, 0x00, 0x0e, 0x00, 0xc0, 0xca, 0x1a, 0x04, 0x05, 0x01 };
-+	unsigned lo = off >= 8 ? off - 8 : 0;
++	unsigned lo = off >= 0x30 ? off - 0x30 : 0;      /* the entry pointer lands inside the prologue or up to ~0x20 bytes into the constant run */
 +	unsigned q;
 +
 +	for (q = lo; q <= off + 0x40 && q + 12 <= len; q++) {
