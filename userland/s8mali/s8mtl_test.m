@@ -6,6 +6,7 @@
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <objc/runtime.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -42,6 +43,30 @@ main(void)
 		    (int)[dev supportsFamily:MTLGPUFamilyApple4]);
 		id<MTLCommandQueue> q = [dev newCommandQueue];
 		LOG("S8MTL: command queue %p\n", (__bridge void *)q);
+		{
+			/*
+			 * Debug aid: IOGPUMetalDevice keeps the hardware resource pools (set by -[AGXA11FamilyDevice setupDeferred] through
+			 * setHwResourcePool:count:) in the ivar _storageCreateParams: { ... [3] = pool array (+0x18), count u32 (+0x20) }.
+			 * Read them from this process's own device object and log which pools are missing.
+			 */
+			Ivar iv = class_getInstanceVariable([(id)dev class], "_storageCreateParams");
+			Class c = [(id)dev class];
+			while (iv == NULL && c != Nil) {
+				c = class_getSuperclass(c);
+				iv = c ? class_getInstanceVariable(c, "_storageCreateParams") : NULL;
+			}
+			if (iv != NULL) {
+				uint8_t *base = (uint8_t *)(__bridge void *)dev + ivar_getOffset(iv);
+				void **pools = *(void ***)(base + 0x18);
+				uint32_t count = *(uint32_t *)(base + 0x20);
+				LOG("S8MTL: storageCreateParams at +0x%lx: pool array %p count %u\n", (unsigned long)ivar_getOffset(iv), (void *)pools, count);
+				for (uint32_t i = 0; pools != NULL && i < count && i < 64; i++) {
+					LOG("S8MTL:   pool[%u] = %p\n", i, pools[i]);
+				}
+			} else {
+				LOG("S8MTL: ivar _storageCreateParams not found\n");
+			}
+		}
 		id<MTLBuffer> buf = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
 		LOG("S8MTL: buffer %p contents %p\n", (__bridge void *)buf, buf ? [buf contents] : NULL);
 		NSError *err = nil;
