@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..82091e0
+index 0000000..fed8971
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,568 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -47,7 +47,6 @@ index 0000000..82091e0
 +#define S8AGX_LOG_LIMIT 800
 +
 +static volatile SInt32 gAgxLogged;
-+static volatile SInt32 gAgxSelCount[0x200];   /* calls seen per selector: only the first few of each are logged */
 +
 +extern "C" int proc_selfpid(void);
 +extern "C" void proc_selfname(char * buf, int size);
@@ -167,6 +166,7 @@ index 0000000..82091e0
 +	UInt32 fQueueId;                /* last command queue id handed out (selector 7) */
 +	UInt32 fNqId;                   /* last notification queue id handed out (selector 15) */
 +	UInt32 fResId;                  /* last resource id handed out (selector 9) */
++	uint32_t * fSelCount;           /* 0x200 entries: calls per selector of THIS client (the log shows the first few of each) */
 +	enum { kResMax = 1024 };
 +	uint64_t * fResVa;                /* kResMax entries: GPU virtual address of resource id n at [n - 1] */
 +	uint64_t fGpuVa;                /* next GPU virtual address to give a resource (0 = not started) */
@@ -199,7 +199,8 @@ index 0000000..82091e0
 +	fShmemBuf = IONewZero(IOBufferMemoryDescriptor *, kShmemMax);
 +	fShmemMap = IONewZero(IOMemoryMap *, kShmemMax);
 +	fResVa = IONewZero(uint64_t, kResMax);
-+	if (fShmemBuf == NULL || fShmemMap == NULL || fResVa == NULL) {
++	fSelCount = IONewZero(uint32_t, 0x200);
++	if (fShmemBuf == NULL || fShmemMap == NULL || fResVa == NULL || fSelCount == NULL) {
 +		return false;
 +	}
 +	if (agx_log_ok()) {
@@ -320,6 +321,10 @@ index 0000000..82091e0
 +		IODelete(fResVa, uint64_t, kResMax);
 +		fResVa = NULL;
 +	}
++	if (fSelCount != NULL) {
++		IODelete(fSelCount, uint32_t, 0x200);
++		fSelCount = NULL;
++	}
 +	IOUserClient::free();
 +}
 +
@@ -374,7 +379,7 @@ index 0000000..82091e0
 +	if (args == NULL) {
 +		return kIOReturnBadArgument;
 +	}
-+	if (selector >= 0x200 || OSIncrementAtomic((SInt32 *)&gAgxSelCount[selector]) < 8) {
++	if (selector >= 0x200 || fSelCount == NULL || fSelCount[selector]++ < 8) {
 +		char name[32] = "?";
 +
 +		proc_selfname(name, sizeof(name));
