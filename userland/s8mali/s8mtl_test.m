@@ -86,8 +86,13 @@ main(void)
 				[enc setBuffer:buf offset:0 atIndex:0];
 				[enc dispatchThreads:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 				[enc endEncoding];
+				LOG("S8MTL: committing the command buffer\n");
 				[cb commit];
-				[cb waitUntilCompleted];
+				for (int w = 0; w < 15 && [cb status] < MTLCommandBufferStatusCompleted; w++) {
+					LOG("S8MTL:   waiting %d s, status %ld\n", w, (long)[cb status]);
+					sleep(1);
+				}
+				LOG("S8MTL: after waiting, status %ld\n", (long)[cb status]);
 				uint32_t *p = (uint32_t *)[buf contents];
 				LOG("S8MTL: command buffer status %ld error %s; a[0..3] = %u %u %u %u\n", (long)[cb status],
 				    [cb error] ? [[[cb error] description] UTF8String] : "none", p[0], p[1], p[2], p[3]);
