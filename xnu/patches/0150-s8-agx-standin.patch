@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..bc5bee4
+index 0000000..15d6878
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,684 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -42,12 +42,14 @@ index 0000000..bc5bee4
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOUserClient.h>
 +#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOSharedDataQueue.h>
 +#include <pexpert/pexpert.h>
 +
 +#define S8AGX_LOG_LIMIT 800
 +
 +static volatile SInt32 gAgxLogged;
 +
++extern "C" uint64_t mach_absolute_time(void);
 +extern "C" int proc_selfpid(void);
 +extern "C" void proc_selfname(char * buf, int size);
 +
@@ -167,6 +169,12 @@ index 0000000..bc5bee4
 +	UInt32 fNqId;                   /* last notification queue id handed out (selector 15) */
 +	UInt32 fResId;                  /* last resource id handed out (selector 9) */
 +	uint64_t fTraceNext;            /* next global trace id range (selector 5) */
++	enum { kNqMax = 32 };
++	IOSharedDataQueue * fNq[kNqMax];        /* notification queue n (id n) at [n - 1]: completion notifications for userland */
++	IOMemoryMap * fNqMap[kNqMax];           /* its mapping in the client's task */
++	uint32_t fCqNq[kNqMax];                 /* command queue id n -> notification queue id (selector 0x19) */
++
++	bool postCompletion(uint32_t cmdQueue, uint64_t cookie, uint64_t t1, uint64_t t2, uint32_t status);
 +	uint32_t * fSelCount;           /* 0x200 entries: calls per selector of THIS client (the log shows the first few of each) */
 +	enum { kResMax = 1024 };
 +	uint64_t * fResVa;                /* kResMax entries: GPU virtual address of resource id n at [n - 1] */
@@ -308,6 +316,17 @@ index 0000000..bc5bee4
 +void
 +AGXDeviceUserClient::free(void)
 +{
++	for (uint32_t i = 0; i < kNqMax; i++) {
++		if (fNqMap[i] != NULL) {
++			fNqMap[i]->release();
++			fNqMap[i] = NULL;
++		}
++		if (fNq[i] != NULL) {
++			fNq[i]->setNotificationPort(MACH_PORT_NULL);
++			fNq[i]->release();
++			fNq[i] = NULL;
++		}
++	}
 +	if (fShmemBuf != NULL) {
 +		releaseShmem();
 +	}
@@ -350,6 +369,28 @@ index 0000000..bc5bee4
 +		IOLog("S8AGX: registerNotificationPort port %p type %u refCon 0x%x\n", (void *)port,(unsigned)type, (unsigned)refCon);
 +	}
 +	return kIOReturnSuccess;
++}
++
++/* One completion record (0x20 B: cookie, two timestamps, status) into the notification queue of a command queue. */
++bool
++AGXDeviceUserClient::postCompletion(uint32_t cmdQueue, uint64_t cookie, uint64_t t1, uint64_t t2, uint32_t status)
++{
++	uint8_t rec[0x20];
++	uint32_t nq;
++
++	if (cmdQueue == 0 || cmdQueue > kNqMax) {
++		return false;
++	}
++	nq = fCqNq[cmdQueue - 1];
++	if (nq == 0 || nq > kNqMax || fNq[nq - 1] == NULL) {
++		return false;
++	}
++	bzero(rec, sizeof(rec));
++	*(uint64_t *)rec = cookie;
++	*(uint64_t *)(rec + 8) = t1;
++	*(uint64_t *)(rec + 0x10) = t2;
++	*(uint32_t *)(rec + 0x18) = status;
++	return fNq[nq - 1]->enqueue(rec, sizeof(rec));
 +}
 +
 +/* Stage A: every shared-memory type is a zeroed 64 KiB buffer, so the userland mapping succeeds and the next call shows up. */
@@ -495,19 +536,79 @@ index 0000000..bc5bee4
 +		return kIOReturnSuccess;
 +	}
 +	if (selector == 0xf && args->structureOutput != NULL && args->structureOutputSize >= 16 && args->scalarInputCount >= 2) {
-+		/* IOGPUNotificationQueueCreate: scalars { entries, entry size }, out { user address of the queue memory, queue id (u32, non-zero) } */
++		/*
++		 * IOGPUNotificationQueueCreate: scalars { entries, entry size }, out { user address of the queue, queue id (u32, non-zero) }.
++		 * Userland dequeues with IODataQueueDequeue, so the queue is a real IOSharedDataQueue (header + entries) mapped into the client.
++		 */
 +		uint8_t * o = (uint8_t *)args->structureOutput;
-+		uint64_t addr = 0;
 +		uint64_t entries = args->scalarInput[0] & 0xffffffffULL, esize = args->scalarInput[1] & 0xffffffffULL;
-+		IOReturn r = allocShmem(entries * esize + 0x4000, &addr);
++		IOSharedDataQueue * q;
++		IOMemoryDescriptor * md;
++		IOMemoryMap * map;
 +
-+		if (r != kIOReturnSuccess) {
-+			return r;
++		if (fNqId >= kNqMax || entries == 0 || esize == 0 || entries * (esize + 8) > (4ULL << 20)) {
++			return kIOReturnNoResources;
 +		}
++		q = IOSharedDataQueue::withCapacity((UInt32)(entries * (esize + 8)));
++		if (q == NULL) {
++			return kIOReturnNoMemory;
++		}
++		md = q->getMemoryDescriptor();
++		map = md ? md->createMappingInTask(fTask, 0, kIOMapAnywhere) : NULL;
++		if (md != NULL) {
++			md->release();
++		}
++		if (map == NULL) {
++			q->release();
++			return kIOReturnVMError;
++		}
++		fNq[fNqId] = q;
++		fNqMap[fNqId] = map;
 +		bzero(o, args->structureOutputSize);
-+		*(uint64_t *)o = addr;
++		*(uint64_t *)o = (uint64_t)map->getVirtualAddress();
 +		*(uint32_t *)(o + 8) = ++fNqId;
-+		IOLog("S8AGX: notification queue %u created: %llu x %llu bytes at 0x%llx\n", (unsigned)fNqId, entries, esize, (unsigned long long)addr);
++		IOLog("S8AGX: notification queue %u created: %llu x %llu bytes at 0x%llx
++", (unsigned)fNqId, entries, esize,
++		    (unsigned long long)map->getVirtualAddress());
++		return kIOReturnSuccess;
++	}
++	if (selector == 0x19 && args->scalarInputCount >= 2) {
++		/* attach the notification queue (scalar 1) to the command queue (scalar 0) */
++		uint64_t cq = args->scalarInput[0], nq = args->scalarInput[1];
++
++		if (cq >= 1 && cq <= kNqMax && nq >= 1 && nq <= kNqMax) {
++			fCqNq[cq - 1] = (uint32_t)nq;
++		}
++		IOLog("S8AGX: command queue %llu -> notification queue %llu
++", cq, nq);
++		return kIOReturnSuccess;
++	}
++	if (selector == 0x1a && args->scalarInputCount >= 4 && args->structureInput != NULL) {
++		/*
++		 * IOGPUCommandQueueSubmitCommandBuffers: scalars { command queue id, flag, count, entry size }, struct = count entries; the cookies of
++		 * an entry are u64 at +0x10 and +0x18 (userland calls the function stored in each: "started" and "completed"). Stage A: nothing runs
++		 * on the GPU yet; the command buffers are reported as completed straight away (status 0).
++		 */
++		uint64_t cq = args->scalarInput[0], count = args->scalarInput[2], esize = args->scalarInput[3];
++		const uint8_t * in = (const uint8_t *)args->structureInput;
++		uint32_t posted = 0;
++
++		if (esize < 0x20 || count == 0 || count * esize > args->structureInputSize) {
++			return kIOReturnBadArgument;
++		}
++		for (uint64_t i = 0; i < count; i++) {
++			const uint8_t * e = in + i * esize;
++			uint64_t t = mach_absolute_time();
++
++			if (postCompletion((uint32_t)cq, *(const uint64_t *)(e + 0x10), t, t, 0)) {
++				posted++;
++			}
++			if (postCompletion((uint32_t)cq, *(const uint64_t *)(e + 0x18), t, mach_absolute_time(), 0)) {
++				posted++;
++			}
++		}
++		IOLog("S8AGX: submit on command queue %llu: %llu command buffer(s), %u completion record(s) posted
++", cq, count, (unsigned)posted);
 +		return kIOReturnSuccess;
 +	}
 +	if (selector == 0x100 && args->structureOutput != NULL && args->structureOutputSize >= 0x78) {
