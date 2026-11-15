@@ -1,8 +1,91 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 1c17ab4..2a67252 100644
+index 1c17ab4..93f9670 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -1008,6 +1008,15 @@ sweet_log_start(void)
+@@ -141,6 +141,7 @@ static struct {
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
++	bool hw_ok;                             /* controller taken over, partition found: the raw I/O path works (before the BSD side exists) */
+ } su;
+ 
+ /* per-command poll timeout; the panic-context log flush shortens it (sweet_log_panic_flush) */
+@@ -694,8 +695,14 @@ static const struct cdevsw sweet_ufs_cdevsw = {
+ 	.d_type       = D_DISK,
+ };
+ 
++static LCK_MTX_DECLARE(sweet_ufs_hw_lock, &sweet_ufs_grp);
++
++/*
++ * The hardware half of the init: take over the host controller, find the partition. Needs no BSD (no devfs, no bdevsw), so SweetCPU can
++ * run it early (sweet_ufs_early_init) and a panic during CPU bring-up can still flush the log. Idempotent, serialized.
++ */
+ static int
+-sweet_ufs_init(void)
++sweet_ufs_hw_init_locked(void)
+ {
+ 	DTEntry node;
+ 	uintptr_t const *reg = NULL;
+@@ -763,6 +770,46 @@ sweet_ufs_init(void)
+ 	if (error) {
+ 		return error;
+ 	}
++	/* The partition bounds are known: writes can be allowed (raw path only until the BSD side registers). */
++	su.writable = (rw != 0);
++	su.hw_ok = true;
++	return 0;
++}
++
++static int
++sweet_ufs_hw_init(void)
++{
++	int error = 0;
++
++	lck_mtx_lock(&sweet_ufs_hw_lock);
++	if (!su.hw_ok) {
++		error = sweet_ufs_hw_init_locked();
++	}
++	lck_mtx_unlock(&sweet_ufs_hw_lock);
++	return error;
++}
++
++/* Called by SweetCPU::startAll (DREAMLTE) before it starts any secondary CPU. */
++int sweet_ufs_early_init(void);
++
++int
++sweet_ufs_early_init(void)
++{
++	return sweet_ufs_hw_init();
++}
++
++static int
++sweet_ufs_init(void)
++{
++	char want[64] = UFS_DEFAULT_PART;
++	uint32_t rw = 0;
++	int error = sweet_ufs_hw_init();
++
++	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
++	if (error) {
++		return error;
++	}
+ 
+ 	su.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
+ 	if (su.bmajor < 0) {
+@@ -939,8 +986,9 @@ sweet_log_panic_flush(uint32_t budget_ms)
+ 	void *bounce;
+ 	int error = 0;
+ 
+-	if (!sweet_log_on || !su.ready || !su.writable || su.dma == 0) {
+-		s8_panic_puts("S8PANIC: ufs flush skipped (log not running)\n");
++	/* The raw path is enough: a panic before the BSD side exists (CPU bring-up) is saved too once sweet_ufs_early_init ran. */
++	if (!su.hw_ok || !su.writable || su.dma == 0) {
++		s8_panic_puts("S8PANIC: ufs flush skipped (UFS not initialized)\n");
+ 		return 0;
+ 	}
+ 	if (!lck_mtx_try_lock(&sweet_ufs_lock)) {
+@@ -1008,6 +1056,15 @@ sweet_log_start(void)
  	}
  }
  
@@ -19,23 +102,24 @@ index 1c17ab4..2a67252 100644
  int sweet_ufs_rootdev(dev_t *dev);
  
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 5bd24a7..d1c1ddf 100644
+index 5bd24a7..fbc7402 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -22,6 +22,12 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -22,6 +22,13 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  #endif
  
  extern "C" void sweet_secondary_entry(void);
 +
 +#if defined(DREAMLTE)
 +extern "C" bool sweet_log_ready(void);     /* bsd/dev/sweet_ufs.c: the log is being written to USERDATA */
++extern "C" int sweet_ufs_early_init(void); /* bsd/dev/sweet_ufs.c: raw UFS path up (panic flush works) */
 +/* Kernel mapping of the low page 0x8f000000 (entry trampoline + start.s breadcrumbs of every core at +0x100 + slot * 0x20). */
 +static vm_offset_t sweet_tramp_va;
 +#endif
  extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
  #if defined(A5XELTE)
  extern "C" void a5xelte_send_self_ipi(void);
-@@ -57,6 +63,7 @@ class SweetCPU : public IOCPU {
+@@ -57,6 +64,7 @@ class SweetCPU : public IOCPU {
  
  public:
  	static void startAll(void *arg, wait_result_t result);
@@ -43,7 +127,28 @@ index 5bd24a7..d1c1ddf 100644
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void free(void) APPLE_KEXT_OVERRIDE;
  	void initCPU(bool boot) APPLE_KEXT_OVERRIDE;
-@@ -182,7 +189,15 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -164,6 +172,20 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
+ 	IOLog(CPU_PORT_NAME " CPU: requested=%u selected=%u (limit=%u)\n",
+ 	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
++#if defined(DREAMLTE)
++	{
++		/*
++		 * Bring the raw UFS path up before any secondary starts: a panic during CPU bring-up happens long before the BSD side
++		 * (root mount) initializes UFS, and could not be saved. boot-arg s8earlyufs=0 turns this off.
++		 */
++		uint32_t early = 1;
++		PE_parse_boot_argn("s8earlyufs", &early, sizeof(early));
++		if (early) {
++			int rc = sweet_ufs_early_init();
++			IOLog(CPU_PORT_NAME " CPU: early UFS init rc=%d\n", rc);
++		}
++	}
++#endif
+ 
+ 	uint64_t deadline;
+ 	nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
+@@ -182,7 +204,15 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != A5_BOOT_MPIDR) {
  		panic(CPU_PORT_NAME " CPU: expected boot MPIDR %#x and logical CPU 0", A5_BOOT_MPIDR);
  	}
@@ -59,7 +164,7 @@ index 5bd24a7..d1c1ddf 100644
  		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
  		kern_return_t kr = processor_start(cpu->machProcessor);
  		if (kr != KERN_SUCCESS) {
-@@ -190,15 +205,34 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -190,15 +220,34 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  		}
  		/* processor_start() is asynchronous for secondaries in this XNU. */
  		nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
@@ -94,7 +199,7 @@ index 5bd24a7..d1c1ddf 100644
  		IOLog(CPU_PORT_NAME " CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
  		    i, topology->cpus[i].phys_id);
  	}
-@@ -209,9 +243,61 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -209,9 +258,61 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  	ml_set_max_cpus(topology->max_cpu_id + 1);
  	IOLog(CPU_PORT_NAME " CPU: %u/%u CPUs initialized, SGI1 verified\n",
  	    topology->num_cpus, topology->num_cpus);
@@ -156,7 +261,7 @@ index 5bd24a7..d1c1ddf 100644
  void
  SweetCPU::free(void)
  {
-@@ -308,6 +394,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+@@ -308,6 +409,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
  		const uint64_t tramp_pa = 0x8f000000ULL;
  		if (tramp == 0) {
  			tramp = ml_io_map(tramp_pa, 0x1000);
@@ -164,7 +269,7 @@ index 5bd24a7..d1c1ddf 100644
  		}
  		volatile uint32_t *t = (volatile uint32_t *)tramp;
  		t[0] = 0x58000041;              /* ldr x1, #8 */
-@@ -318,6 +405,24 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+@@ -318,6 +420,24 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
  		IOLog(CPU_PORT_NAME " CPU: cpu=%u entry 0x%llx via low trampoline 0x%llx\n",
  		    getCPUNumber(), (uint64_t)entry, tramp_pa);
  		entry = (vm_offset_t)tramp_pa;
@@ -189,7 +294,7 @@ index 5bd24a7..d1c1ddf 100644
  		static vm_offset_t pmu;
  		if (pmu == 0) {
  			pmu = ml_io_map(0x16480000, 0x10000);
-@@ -343,6 +448,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+@@ -343,6 +463,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
  		}
  		IOLog(CPU_PORT_NAME " CPU: cpu=%u first CPU_ON rc=%d, PMU power-up cfg=0x%x status=0x%x\n",
  		    getCPUNumber(), rc0, cfg[0], cfg[1]);
