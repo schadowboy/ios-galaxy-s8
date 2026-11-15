@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..760119d
+index 0000000..e01925e
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,384 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -60,8 +60,17 @@ index 0000000..760119d
 +
 +/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 +
-+/* The IOKit base class Metal enumerates (IOServiceMatching("IOAccelerator")). */
-+class IOAccelerator : public IOService
++/*
++ * Metal.framework enumerates GPUs with IOServiceMatching("IOAcceleratorES") (IOGPUFamily's class; found in Metal's strings),
++ * the compositor's side matches "IOAccelerator". The chain of the real stack is ... AGXAccelerator -> IOAccelerator -> IOAcceleratorES
++ * -> IOService, so a service of the stand-in matches both names.
++ */
++class IOAcceleratorES : public IOService
++{
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++class IOAccelerator : public IOAcceleratorES
 +{
 +	OSDeclareDefaultStructors(IOAccelerator);
 +};
@@ -83,7 +92,8 @@ index 0000000..760119d
 +	OSDeclareDefaultStructors(AGXAcceleratorG10P_B0);
 +};
 +
-+OSDefineMetaClassAndStructors(IOAccelerator, IOService);
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++OSDefineMetaClassAndStructors(IOAccelerator, IOAcceleratorES);
 +OSDefineMetaClassAndStructors(AGXAccelerator, IOAccelerator);
 +OSDefineMetaClassAndStructors(AGXAcceleratorG10P_B0, AGXAccelerator);
 +
@@ -97,7 +107,7 @@ index 0000000..760119d
 +	setProperty("IOClass", "AGXAcceleratorG10P_B0");
 +	setProperty("IOGLBundleName", "AGXGL");
 +	setProperty("MetalPluginName", "AGXMetalA11");
-+	setProperty("MetalPluginClassName", "AGXA11FamilyDevice");
++	setProperty("MetalPluginClassName", "AGXA11Device");
 +	setName("AGXAcceleratorG10P_B0");
 +	registerService();
 +	return true;
