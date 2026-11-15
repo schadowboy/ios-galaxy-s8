@@ -324,6 +324,38 @@ index 9a35982..eeaa219 100644
  #else
      "     'IONameMatch'     = 'qcom,kryo470';"
  #endif
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 6d56a33..c154805 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1058,6 +1058,14 @@ ml_parse_cpu_topology(void)
+ 		assert(phys_cluster_id <= MAX_CPU_CLUSTER_PHY_ID);
+ 		cpu->cluster_id = ((cluster_phys_to_logical[phys_cluster_id] == -1) ?
+ 		    topology_info.num_clusters : cluster_phys_to_logical[phys_cluster_id]);
++#if defined(DREAMLTE)
++		/*
++		 * The A53 and Mongoose cores form ONE scheduler cluster (one processor set): a second processor set made the scheduler recurse on
++		 * pset0's ticket lock the moment the first Mongoose core registered. The physical clusters keep their own cluster_offsets
++		 * entries (indexed by the real MPIDR Aff1 in exception_asm.h); see cluster_phys_to_logical below.
++		 */
++		cpu->cluster_id = 0;
++#endif
+ 
+ 		assert(cpu->cluster_id < MAX_CPU_CLUSTERS);
+ 
+@@ -1084,6 +1092,12 @@ ml_parse_cpu_topology(void)
+ 			ml_read_reg_range(child, "cpm-impl-reg", &cluster->cpm_IMPL_pa, &cluster->cpm_IMPL_len);
+ 		}
+ 
++#if defined(DREAMLTE)
++		/* the second physical cluster joins logical cluster 0 but still needs its cluster_offsets entry */
++		if (cluster_phys_to_logical[phys_cluster_id] == -1) {
++			cluster_phys_to_logical[phys_cluster_id] = cpu->cluster_id;
++		}
++#endif
+ #if HAS_CLUSTER || defined(A5XELTE)
+ 		if (MPIDR_CPU_ID(cpu->phys_id) > cluster_max_cpu_phys_id[phys_cluster_id]) {
+ 			cluster_max_cpu_phys_id[phys_cluster_id] = MPIDR_CPU_ID(cpu->phys_id);
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index 1606c91..0b54a55 100644
 --- a/osfmk/arm64/start.s
