@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..9118c23
+index 0000000..8eab217
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,1196 @@
+@@ -0,0 +1,1237 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -563,6 +563,37 @@ index 0000000..9118c23
 +	return false;
 +}
 +
++/*
++ * Old state records stay in memory after a pipeline change, so "the last one in memory" is often stale. Remember what every record slot held at the
++ * previous scan: a slot whose program pointer changed is the pipeline the caller just set; with no change the previous choice stays.
++ */
++struct agx_seen { uint32_t n, kind, val; uint64_t i; };
++static struct agx_seen gSeenRec[128];
++static int gNSeenRec;
++static uint64_t gLastVtx, gLastFrag;
++
++static bool
++agx_rec_changed(uint32_t n, uint64_t i, uint32_t kind, uint32_t val)
++{
++	for (int k = 0; k < gNSeenRec; k++) {
++		if (gSeenRec[k].n == n && gSeenRec[k].i == i && gSeenRec[k].kind == kind) {
++			if (gSeenRec[k].val == val) {
++				return false;
++			}
++			gSeenRec[k].val = val;
++			return true;
++		}
++	}
++	if (gNSeenRec < 128) {
++		gSeenRec[gNSeenRec].n = n;
++		gSeenRec[gNSeenRec].i = i;
++		gSeenRec[gNSeenRec].kind = kind;
++		gSeenRec[gNSeenRec].val = val;
++		gNSeenRec++;
++	}
++	return true;
++}
++
 +/* per-pixel callback of the rasteriser: run the fragment program on the interpolated varyings and store the colour (BGRA8) */
 +struct agx_draw_ctx {
 +	const uint8_t * frag;
@@ -721,7 +752,7 @@ index 0000000..9118c23
 +		uint64_t nd = fShmemBuf[r]->getLength() / 4;
 +
 +		for (uint64_t i = 1; i + 10 < nd; i++) {
-+			if ((d[i] == 0x0001001fu || d[i] == 0x0001002fu) && d[i + 2] == 0x108u) {
++			if ((d[i] == 0x0001001fu || d[i] == 0x0001002fu) && d[i + 2] == 0x108u && agx_rec_changed(n, i, 1, d[i + 1])) {
 +				vtxVa = 0x100000000ULL | (d[i + 1] & ~1u);
 +			}
 +			if (d[i - 1] == 0xc00u && d[i + 1] == 1u && d[i + 2] == 0xc00u && d[i + 3] == 0x80000001u) {
@@ -751,10 +782,20 @@ index 0000000..9118c23
 +		uint64_t nd = fShmemBuf[r]->getLength() / 4;
 +
 +		for (uint64_t i = 0; i + 4 < nd; i++) {
-+			if ((d[i] == 0x0009051fu || d[i] == 0x0009851fu) && (d[i + 2] == 0x108u || d[i + 3] == 0x108u)) {
++			if ((d[i] == 0x0009051fu || d[i] == 0x0009851fu) && (d[i + 2] == 0x108u || d[i + 3] == 0x108u) && agx_rec_changed(n, i, 2, d[i + 1])) {
 +				fragVa = 0x100000000ULL | (d[i + 1] & ~1u);
 +			}
 +		}
++	}
++	if (vtxVa != 0) {
++		gLastVtx = vtxVa;
++	} else {
++		vtxVa = gLastVtx;
++	}
++	if (fragVa != 0) {
++		gLastFrag = fragVa;
++	} else {
++		fragVa = gLastFrag;
 +	}
 +	if (fragVa != 0) {
 +		uint8_t * p;
