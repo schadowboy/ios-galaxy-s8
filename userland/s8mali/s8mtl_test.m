@@ -69,33 +69,47 @@ main(void)
 		}
 		id<MTLBuffer> buf = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
 		id<MTLBuffer> buf2 = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+		id<MTLBuffer> buf3 = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
 		LOG("S8MTL: buffer %p contents %p\n", (__bridge void *)buf, buf ? [buf contents] : NULL);
 		/*
-		 * A family of tiny kernels, each differing from its neighbours in ONE thing, so the AGX machine code can be decoded by comparing the
-		 * binaries (one line of the program heap per kernel, captured by the kernel side at every submit). Dispatched over 64 threads with
-		 * buffer 0 = output, buffer 1 = input (0..63). The kernel NUMBER n is logged with its source; session n+1 of the capture is kernel n.
+		 * Second family: one kernel per feature of the AGX compute ISA/command that the first family did not cover. Each entry has its own full
+		 * kernel source and dispatch shape; buffers 0,1,2 are bound (0 and 2 outputs / scratch, 1 = input 0..63) and a constant of 5 at index 3.
 		 */
-		static const char *bodies[] = {
-			"a[i] = i + 0;", "a[i] = i + 1;", "a[i] = i + 2;", "a[i] = i + 3;", "a[i] = i + 4;", "a[i] = i + 7;", "a[i] = i + 100;",
-			"a[i] = i + 255;", "a[i] = i + 256;", "a[i] = i + 65535;",
-			"a[i] = i * 1;", "a[i] = i * 2;", "a[i] = i * 3;", "a[i] = i * 4;", "a[i] = i * 5;", "a[i] = i * 6;", "a[i] = i * 7;", "a[i] = i * 10;",
-			"a[i] = i << 1;", "a[i] = i << 3;", "a[i] = i >> 1;", "a[i] = i >> 2;",
-			"a[i] = i & 15;", "a[i] = i | 16;", "a[i] = i ^ 255;",
-			"a[i] = 100 - i;", "a[i] = i - 1;",
-			"device float *f = (device float *)a; f[i] = float(i) * 2.0f;", "device float *f = (device float *)a; f[i] = float(i) + 1.0f;",
-			"a[i] = b[i];", "a[i] = b[i] + b[i];",
+		struct fam { const char *src; int gx, gy, tx, ty; } fams[] = {
+			{ "kernel void kk(device uint *z [[buffer(0)]], device uint *a [[buffer(1)]], uint i [[thread_position_in_grid]]) { a[i] = i; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uint *z [[buffer(0)]], device uint *y [[buffer(1)]], device uint *a [[buffer(2)]], uint i [[thread_position_in_grid]]) { a[i] = i; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], uint2 g [[thread_position_in_grid]]) { a[g.x + g.y * 8] = g.x * 10 + g.y; }", 8, 8, 8, 4 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], uint t [[thread_position_in_threadgroup]], uint g [[threadgroup_position_in_grid]]) { a[g * 16 + t] = g * 100 + t; }", 64, 1, 16, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], device const uint *b [[buffer(1)]], uint i [[thread_position_in_grid]]) { uint s = 0; for (uint j = 0; j < 4; j++) { s += b[j]; } a[i] = s + i; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], device const uint *b [[buffer(1)]], uint i [[thread_position_in_grid]]) { a[i] = b[i] > 10 ? 5u : 9u; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { if (i < 8) { a[i] = 1; } else { a[i] = 2; } }", 64, 1, 32, 1 },
+			{ "kernel void kk(device ushort *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = (ushort)(i + 1); }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uchar *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = (uchar)(i + 1); }", 64, 1, 32, 1 },
+			{ "kernel void kk(device float *f [[buffer(0)]], device const uint *b [[buffer(1)]], uint i [[thread_position_in_grid]]) { f[i] = float(b[i]) * 0.5f; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device float *f [[buffer(0)]], device const uint *b [[buffer(1)]], uint i [[thread_position_in_grid]]) { float x = float(b[i]); f[i] = x > 10.0f ? x : 10.0f; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], constant uint &k [[buffer(3)]], uint i [[thread_position_in_grid]]) { a[i] = i + k; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = i / 3; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = i % 5; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = min(i, 20u); }", 64, 1, 32, 1 },
+			{ "kernel void kk(device float *f [[buffer(0)]], uint i [[thread_position_in_grid]]) { f[i] = sqrt(float(i)); }", 64, 1, 32, 1 },
+			{ "kernel void kk(device float *f [[buffer(0)]], uint i [[thread_position_in_grid]]) { f[i] = float(i) * 0.25f + 3.0f; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = i * i; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = i * i + i; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[2 * i] = i; a[2 * i + 1] = i + 1; }", 32, 1, 32, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = 7; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = 0; }", 64, 1, 32, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = i + 1; }", 128, 1, 64, 1 },
+			{ "kernel void kk(device uint *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = i + 1; }", 64, 1, 16, 1 },
 		};
-		int count = (int)(sizeof(bodies) / sizeof(bodies[0]));
+		int count = (int)(sizeof(fams) / sizeof(fams[0]));
 		for (int n = 0; n < count && q != nil && buf != nil; n++) {
 			NSError *err = nil;
 			uint32_t *in = (uint32_t *)[buf2 contents];
 			for (uint32_t t = 0; t < 64; t++) {
 				in[t] = t;
 			}
-			NSString *src = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\n"
-			    "kernel void kk(device uint *a [[buffer(0)]], device const uint *b [[buffer(1)]], uint i [[thread_position_in_grid]]) { %s }\n",
-			    bodies[n]];
-			LOG("S8MTL: ==== kernel %d: %s\n", n, bodies[n]);
+			NSString *src = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\n%s\n", fams[n].src];
+			LOG("S8MTL: ==== kernel %d grid %dx%d tg %dx%d: %s\n", n, fams[n].gx, fams[n].gy, fams[n].tx, fams[n].ty, fams[n].src);
 			id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
 			if (lib == nil) {
 				LOG("S8MTL: library failed: %s\n", err ? [[err description] UTF8String] : "?");
@@ -110,10 +124,13 @@ main(void)
 			}
 			id<MTLCommandBuffer> cb = [q commandBuffer];
 			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+			uint32_t k5 = 5;
 			[enc setComputePipelineState:ps];
 			[enc setBuffer:buf offset:0 atIndex:0];
 			[enc setBuffer:buf2 offset:0 atIndex:1];
-			[enc dispatchThreads:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+			[enc setBuffer:buf3 offset:0 atIndex:2];
+			[enc setBytes:&k5 length:4 atIndex:3];
+			[enc dispatchThreads:MTLSizeMake(fams[n].gx, fams[n].gy, 1) threadsPerThreadgroup:MTLSizeMake(fams[n].tx, fams[n].ty, 1)];
 			[enc endEncoding];
 			[cb commit];
 			for (int w = 0; w < 5 && [cb status] < MTLCommandBufferStatusCompleted; w++) {
