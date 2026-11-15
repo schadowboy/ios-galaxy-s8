@@ -596,6 +596,211 @@ void wifi_link(void (*kv)(const char *, uint64_t), void (*out)(const char *), vo
 				kv("WIFI: packaging option", (id >> 20) & 0xf);
 				kv("WIFI: core count", (id >> 24) & 0xf);
 				kv("WIFI: ChipCommon[4] capabilities", wifi_rd_traced(kv, flush, "WIFI: ChipCommon[4]", base0 + 0x4));
+
+				if (stage == 6) {
+					/*
+					 * wifiprobe=6: dump the chip's EROM (the AI core table, ChipCommon EROMPTR at +0xFC) raw, through the
+					 * BAR0 backplane window, until the end marker 0xF (at most 1024 words). Parsed offline on the PC:
+					 * core ids and base/wrapper addresses (ARM CR4, SOCRAM, PCIe2).
+					 */
+					uint32_t erom = rd(base0 + 0xFC), win = 0xffffffffu, w;
+
+					kv("WIFI: EROMPTR", erom);
+					fl(flush);
+					for (unsigned i = 0; i < 1024; i++) {
+						uint32_t a = erom + 4 * i, want = a & ~0xFFFu;
+
+						if (want != win) {
+							wr(CFG + 0x80, want);
+							(void)rd(CFG + 0x80);
+							win = want;
+						}
+						w = rd(base0 + (a & 0xFFFu));
+						kv("E", w);
+						if (w == 0xF)
+							break;
+					}
+					out("\nWIFI: EROM dump done\n");
+					fl(flush);
+				}
+
+				if (stage >= 7) {
+					/*
+					 * wifiprobe=7 (W1): the final window layout, then halt the chip's ARM CR4 and prove the RAM is reachable.
+					 * Core addresses are from the chip's own EROM (parse_erom.py on the v64 dump): ARM CR4 registers
+					 * 0x18002000, its wrapper 0x18102000, RAM slave 0x170000 + 0x150000 (RAM base 0x170000, size 0x150000);
+					 * the TCM is backplane address 0 through the second BAR once PCI_BAR1_WIN (config 0x84) is 0.
+					 * ATU region 1 = BAR0 only (32 KiB), region 2 = TCM window (CPU 0x11808000.. -> PCI 0x12000000..), so both
+					 * BARs fit although the SoC's outbound range is only 4 MiB. The halt is Samsung's ai_core_reset
+					 * (aiutils.c / dhdpcie_bus_download_state): wrapper IOCTRL 0x408, RESETCTRL 0x800, RESETSTATUS 0x804.
+					 */
+					static const uintptr_t TCM = 0x11808000UL, WRAP_CR4 = 0x18102000UL;
+					uint32_t io, rc, tries;
+
+					out("WIFI: stage 7, window layout + ARM CR4 halt + TCM test\n");
+					fl(flush);
+					wifi_wr_traced(kv, flush, DBI + 0x900, 0x00000001u); /* region 1: BAR0 only */
+					wr(DBI + 0x90C, (uint32_t)MEMWIN);
+					wr(DBI + 0x910, 0x0);
+					wr(DBI + 0x914, (uint32_t)MEMWIN + 0x8000 - 1);
+					wr(DBI + 0x918, (uint32_t)MEMWIN);
+					wr(DBI + 0x91C, 0x0);
+					wr(DBI + 0x904, 0x0);
+					wr(DBI + 0x908, 0x80000000u);
+					wifi_wr_traced(kv, flush, DBI + 0x900, 0x00000002u); /* region 2: TCM window */
+					wr(DBI + 0x90C, (uint32_t)TCM);
+					wr(DBI + 0x910, 0x0);
+					wr(DBI + 0x914, (uint32_t)MEMWIN + 0x3FF000 - 1);
+					wr(DBI + 0x918, 0x12000000u);
+					wr(DBI + 0x91C, 0x0);
+					wr(DBI + 0x904, 0x0);
+					wr(DBI + 0x908, 0x80000000u);
+					kv("WIFI: ATU region 2 CR2 readback", rd(DBI + 0x908));
+					kv("WIFI: ATU region 2 limit readback", rd(DBI + 0x914));
+					wifi_wr_traced(kv, flush, CFG + 0x18, 0x12000000u | (got[2] & 0xfu));
+					wr(CFG + 0x1c, 0x0);
+					kv("WIFI: BAR2 now", rd(CFG + 0x18));
+					wifi_wr_traced(kv, flush, CFG + 0x84, 0x0); /* PCI_BAR1_WIN: second BAR maps backplane address 0 (TCM) */
+					kv("WIFI: PCI_BAR1_WIN readback", rd(CFG + 0x84));
+
+					wifi_wr_traced(kv, flush, CFG + 0x80, (uint32_t)WRAP_CR4); /* BAR0 window -> the CR4 wrapper */
+					kv("WIFI: BAR0 window readback", rd(CFG + 0x80));
+					io = wifi_rd_traced(kv, flush, "WIFI: CR4 IOCTRL before", base0 + 0x408);
+					rc = wifi_rd_traced(kv, flush, "WIFI: CR4 RESETCTRL before", base0 + 0x800);
+					kv("WIFI: CR4 RESETSTATUS before", wifi_rd_traced(kv, flush, "WIFI: CR4 RESETSTATUS", base0 + 0x804));
+					(void)io;
+					(void)rc;
+					/* ai_core_disable(SICF_CPUHALT): reset the core, then ioctrl = bits | FGC | CLOCK_EN */
+					if (!(rd(base0 + 0x800) & 1)) {
+						for (tries = 0; tries < 300 && rd(base0 + 0x804) != 0; tries++)
+							wifi_us(1);
+						wifi_wr_traced(kv, flush, base0 + 0x800, 0x1);
+						wifi_us(10);
+						for (tries = 0; tries < 300 && rd(base0 + 0x804) != 0; tries++)
+							wifi_us(1);
+						wr(base0 + 0x408, 0x20 | 0x2 | 0x1);
+						(void)rd(base0 + 0x408);
+					}
+					/* ai_core_reset(SICF_CPUHALT, 0) */
+					wr(base0 + 0x408, 0x20 | 0x2 | 0x1); /* CPUHALT | FGC | CLOCK_EN */
+					(void)rd(base0 + 0x408);
+					wr(base0 + 0x800, 0x0);              /* out of reset */
+					(void)rd(base0 + 0x800);
+					wifi_us(1);
+					wr(base0 + 0x408, 0x20 | 0x1);       /* CPUHALT | CLOCK_EN (FGC off) */
+					(void)rd(base0 + 0x408);
+					wifi_us(1);
+					kv("WIFI: CR4 IOCTRL after halt (expect 0x21)", rd(base0 + 0x408));
+					kv("WIFI: CR4 RESETCTRL after (expect 0)", rd(base0 + 0x800));
+
+					/* the TCM: the RAM at backplane 0x170000 (offset = 0x170000 in the TCM window) */
+					out("WIFI: TCM test\n");
+					fl(flush);
+					kv("WIFI: TCM[0] (reset vector area)", wifi_rd_traced(kv, flush, "WIFI: TCM[0]", TCM + 0x0));
+					kv("WIFI: TCM[0x170000] RAM first word", wifi_rd_traced(kv, flush, "WIFI: TCM[0x170000]", TCM + 0x170000));
+					wifi_wr_traced(kv, flush, TCM + 0x170100, 0xa5a55a5au);
+					wr(TCM + 0x170104, 0x12345678u);
+					kv("WIFI: RAM test word 1 (expect 0xa5a55a5a)", rd(TCM + 0x170100));
+					kv("WIFI: RAM test word 2 (expect 0x12345678)", rd(TCM + 0x170104));
+					out("WIFI: stage 7 done\n");
+					fl(flush);
+				}
+
+				if (stage >= 8) {
+					/*
+					 * wifiprobe=8 (W1b): download Samsung's firmware to the RAM base (0x170000), the NVRAM at the RAM end with
+					 * its length token in the last word, the reset instruction (first firmware word) to address 0, release
+					 * the CR4, then wait for the firmware to replace the token with its pcie_shared pointer and dump its console.
+					 * Same order as bcmdhd dhdpcie_download_code_file / write_vars / download_state(FALSE).
+					 */
+					extern const uint32_t wifi_fw[], wifi_fw_end[], wifi_nvram[], wifi_nvram_end[];
+					static const uintptr_t TCMW = 0x11808000UL, RAMB = 0x170000UL, RAMS = 0x150000UL;
+					uint32_t fwn = (uint32_t)(wifi_fw_end - wifi_fw), nvn = (uint32_t)(wifi_nvram_end - wifi_nvram), i, bad = 0, v;
+					uint32_t token, shared = 0;
+					uintptr_t ramend = RAMB + RAMS;
+
+					out("WIFI: stage 8, firmware download\n");
+					kv("WIFI: firmware words", fwn);
+					kv("WIFI: nvram words", nvn);
+					fl(flush);
+					for (i = 0; i < fwn; i++)
+						wr(TCMW + RAMB + 4 * i, wifi_fw[i]);
+					for (i = 0; i < fwn; i++)
+						if (rd(TCMW + RAMB + 4 * i) != wifi_fw[i] && bad++ < 4)
+							kv("WIFI: firmware mismatch at word", i);
+					kv("WIFI: firmware mismatches", bad);
+					fl(flush);
+					for (i = 0; i < nvn; i++)
+						wr(TCMW + ramend - 4 - 4 * nvn + 4 * i, wifi_nvram[i]);
+					token = ((~nvn & 0xffffu) << 16) | (nvn & 0xffffu);
+					wr(TCMW + ramend - 4, token);
+					kv("WIFI: nvram token", rd(TCMW + ramend - 4));
+					wr(TCMW + 0, wifi_fw[0]); /* resetinstr */
+					kv("WIFI: reset instruction readback", rd(TCMW + 0));
+					fl(flush);
+					/* release the core: ai_core_reset(0, 0) = ioctrl FGC|CLK, reset 0, ioctrl CLK */
+					wr(base0 + 0x408, 0x2 | 0x1);
+					(void)rd(base0 + 0x408);
+					wr(base0 + 0x800, 0x0);
+					(void)rd(base0 + 0x800);
+					wifi_us(1);
+					wr(base0 + 0x408, 0x1);
+					kv("WIFI: CR4 IOCTRL after release", rd(base0 + 0x408));
+					fl(flush);
+					for (i = 0; i < 5000; i++) {
+						v = rd(TCMW + ramend - 4);
+						if (v != token) {
+							shared = v;
+							break;
+						}
+						wifi_us(1000);
+					}
+					kv("WIFI: ms waited for the firmware", i);
+					kv("WIFI: last RAM word (pcie_shared pointer)", shared);
+					kv("WIFI: CR4 IOCTRL now", rd(base0 + 0x408));
+					fl(flush);
+					if (shared >= RAMB && shared < ramend && !(shared & 3)) {
+						uint32_t sh[8], cons, buf, bsz, idx, n, k, j;
+						char line[65];
+
+						for (i = 0; i < 8; i++) {
+							sh[i] = rd(TCMW + shared + 4 * i);
+							kv("WIFI: pcie_shared word", sh[i]);
+						}
+						cons = sh[5];
+						if (cons >= RAMB && cons < ramend) {
+							buf = rd(TCMW + cons + 8);
+							bsz = rd(TCMW + cons + 12);
+							idx = rd(TCMW + cons + 16);
+							kv("WIFI: console buf", buf);
+							kv("WIFI: console size", bsz);
+							kv("WIFI: console idx", idx);
+							n = idx < bsz ? idx : bsz;
+							if (n > 1500 || buf < RAMB || buf >= ramend)
+								n = buf >= RAMB && buf < ramend ? 1500 : 0;
+							out("WIFI: console: ");
+							for (k = 0, j = 0; k < n; k += 4) {
+								uint32_t w = rd(TCMW + buf + k);
+								uint32_t b;
+
+								for (b = 0; b < 4; b++) {
+									char c = (char)(w >> (8 * b));
+									line[j++] = (c >= 32 && c < 127) ? c : '|';
+									if (j == 64) {
+										line[j] = 0;
+										out(line);
+										j = 0;
+									}
+								}
+							}
+							line[j] = 0;
+							out(line);
+							out("\n");
+						}
+					}
+					out("WIFI: stage 8 done\n");
+					fl(flush);
+				}
 			} else {
 				out("WIFI: BAR sizes not plausible, BARs left alone\n");
 			}
