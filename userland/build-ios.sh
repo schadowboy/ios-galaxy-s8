@@ -49,4 +49,8 @@ xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -fobjc-ar
 	-o "$OUT/s8mtl_test" "$HERE/s8mali/s8mtl_test.m"
 "$LDID" -S"$HERE/s8mali/s8mali_test.entitlements" "$OUT/s8mtl_test"
 file "$OUT/s8mtl_test" || true
-(cd "$OUT" && shasum -a 256 s8mali_test s8gl_test s8mtl_test | tee SHA256SUMS)
+# s8pm_test: real restart / power off through the reboot() system call (test scaffolding)
+xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall \
+	-o "$OUT/s8pm_test" "$HERE/s8mali/s8pm_test.c"
+"$LDID" -S"$HERE/s8mali/s8mali_test.entitlements" "$OUT/s8pm_test"
+(cd "$OUT" && shasum -a 256 s8mali_test s8gl_test s8mtl_test s8pm_test | tee SHA256SUMS)

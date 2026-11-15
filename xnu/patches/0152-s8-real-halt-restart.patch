@@ -1,0 +1,84 @@
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+index f17361d..a07f7c2 100644
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1108,6 +1108,11 @@ skip_to_haltRestart:
+ 			extern void s8_reset_to_recovery(const char *why);
+ 			printf("S8RECOV: PE halt/restart type %u\n", type);
+ 			s8_reset_to_recovery("PE_halt_restart");
++		} else if (type == kPEHaltCPU || type == kPERestartCPU || type == kPEUPSDelayHaltCPU) {
++			/* boot-arg s8noreset: the real thing (0152): restart boots iOS again, halt powers the phone off */
++			extern void s8_pm_halt_restart(int restart);
++			printf("S8PM: PE %s\n", type == kPERestartCPU ? "restart" : "halt");
++			s8_pm_halt_restart(type == kPERestartCPU);
+ 		}
+ 	}
+ #endif
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 690020e..914dd2a 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -747,6 +747,7 @@ static void klog_putc(uint8_t c);
+ #define S8_PMU_INFORM2          0x808
+ #define S8_PMU_INFORM3          0x80c
+ #define S8_PMU_SWRESET          0x400
++#define S8_PMU_PS_HOLD          0x330c      /* PS_HOLD_CONTROL: bit 8 = the data line, low = power off */
+ static volatile uint8_t *s8_pmu;
+ volatile uint64_t s8recov_deadline_abs;     /* s8recov=N: abs time of the reset */
+ static volatile uint64_t s8recov_fire;
+@@ -757,7 +758,7 @@ extern void thread_terminate_self(void);
+ static void
+ klog_init(void)
+ {
+-	s8_pmu = (volatile uint8_t *)ml_io_map(S8_PMU_PA, 0x1000);
++	s8_pmu = (volatile uint8_t *)ml_io_map(S8_PMU_PA, 0x4000);
+ 	klog_hdr = (volatile uint32_t *)ml_io_map(A5_KLOG_PHYS, A5_KLOG_SIZE);
+ 	if (klog_hdr == NULL) {
+ 		return;
+@@ -860,6 +861,33 @@ s8_panic_reset_ready(void)
+ 	return s8_pmu != NULL;
+ }
+ 
++
++/*
++ * Real restart / power off (boot-arg s8noreset): the reset reason registers are cleared so that S-Boot starts the BOOT image (iOS) and not
++ * recovery; restart = PMU software reset, power off = PS_HOLD low (Samsung's own power-off, exynos_power_off).
++ */
++__attribute__((noreturn)) void s8_pm_halt_restart(int restart);
++void
++s8_pm_halt_restart(int restart)
++{
++	if (s8_pmu != NULL) {
++		klog_puts(restart ? "\nS8PM: restart\n" : "\nS8PM: power off\n");
++		__builtin_arm_dsb(DSB_SY);
++		*(volatile uint32_t *)(s8_pmu + S8_PMU_INFORM2) = 0;
++		*(volatile uint32_t *)(s8_pmu + S8_PMU_INFORM3) = 0;
++		__builtin_arm_dsb(DSB_SY);
++		if (restart) {
++			*(volatile uint32_t *)(s8_pmu + S8_PMU_SWRESET) = 1;
++		} else {
++			*(volatile uint32_t *)(s8_pmu + S8_PMU_PS_HOLD) &= ~(1u << 8);
++		}
++		__builtin_arm_dsb(DSB_SY);
++	}
++	for (;;) {
++		__builtin_arm_wfe();
++	}
++}
++
+ static int s8recov_event;
+ 
+ static void
+@@ -910,6 +938,12 @@ s8_recov_init(void)
+ 	}
+ }
+ #else
++void s8_pm_halt_restart(int restart);
++void
++s8_pm_halt_restart(int restart)
++{
++	(void)restart;
++}
+ void s8_reset_to_recovery(const char *why);
+ void s8_recov_init(void);
+ void s8_panic_puts(const char *s);
