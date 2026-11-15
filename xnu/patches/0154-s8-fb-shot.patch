@@ -1,18 +1,19 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index b33139d..fbb9fbc 100644
+index b33139d..a393916 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -209,6 +209,9 @@ public:
+@@ -209,6 +209,10 @@ public:
  	SweetSurface *fShownPrev;     /* the one before, until fShown's flip is taken */
  	uint64_t      fFlips, fCopies;
  	bool          fFpsLog;        /* sweetfb_fpslog: a line every 5 s */
 +	uint32_t      fShotSecs;      /* sweetfb_shot=<s>: a downsampled thumbnail of the presented frame into the kernel log every <s> seconds */
 +	uint32_t      fShotCount;
 +	uint64_t      fShotLast;
++	uint8_t       fShotSig[64];   /* luma of 64 sample points at the last shot */
  	uint64_t      fStatT0, fLastSwap, fStatMaxGap, fStatPresentTicks;
  	uint32_t      fStatSwaps, fStatPresents, fStatFlips;
  
-@@ -341,6 +344,13 @@ AppleCLCD::start(IOService *provider)
+@@ -341,6 +345,14 @@ AppleCLCD::start(IOService *provider)
  	int fpslog = 0;
  	PE_parse_boot_argn("sweetfb_fpslog", &fpslog, sizeof(fpslog));
  	fFpsLog = fpslog != 0;
@@ -22,28 +23,54 @@ index b33139d..fbb9fbc 100644
 +		fShotSecs = shot > 0 ? (uint32_t)shot : 0;
 +		fShotCount = 0;
 +		fShotLast = 0;
++		bzero(fShotSig, sizeof(fShotSig));
 +	}
  	int async = 0;
  	PE_parse_boot_argn("sweetfb_async", &async, sizeof(async));
  	if (async) {
-@@ -738,6 +748,44 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -738,6 +750,67 @@ AppleCLCD::swap(const uint8_t *rec)
  			fStatMaxGap = fStatPresentTicks = 0;
  		}
  	}
-+	if (fShotSecs != 0 && fShotCount < 10) {
++	if (fShotSecs != 0 && fShotCount < 12) {
 +		/*
-+		 * sweetfb_shot: our own screenshot. Layer 0's surface, 96x197 samples, three bytes per sample (B G R),
-+		 * as "SWEET SHOT: <n> r<row> <hex>" lines: tools/shot-decode.py rebuilds the picture from the kernel log.
++		 * sweetfb_shot=<s>: our own screenshot, taken when the picture changed (at least <s> seconds apart: 10 of 64 sample points
++		 * differ by more than 24 in luma from the last shot). Layer 0's surface, 96x197 samples, three bytes per sample (B G R),
++		 * as "SWEET SHOT: <n> r<row> s<segment> <hex>" lines: tools/shot-decode.py rebuilds the picture from the kernel log.
 +		 */
 +		uint64_t tnow = mach_absolute_time();
 +
 +		if (fShotLast == 0 || tnow - fShotLast >= (uint64_t)fShotSecs * SWEET_FB_TIMEBASE_HZ) {
 +			SweetSurface *s = sweet_surface_copy(get32(rec, 0x54));
 +			uintptr_t src = s != NULL ? s->kernelAddress() : 0;
++			bool take = false;
 +
-+			fShotLast = tnow;
 +			if (src != 0 && s->bytesPerElement == 4 && s->width >= 96 && s->height >= 197 &&
 +			    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height <= (s->memory ? s->memory->getLength() : 0)) {
++				uint8_t sig[64];
++				uint32_t diffs = 0;
++
++				for (uint32_t i = 0; i < 64; i++) {
++					const uint32_t *srow = (const uint32_t *)(src + s->offset + (uint64_t)((i / 8) * s->height / 8 + s->height / 16) * s->bytesPerRow);
++					uint32_t px = srow[(i % 8) * s->width / 8 + s->width / 16];
++					uint32_t l = ((px & 0xff) + ((px >> 8) & 0xff) * 2 + ((px >> 16) & 0xff)) / 4;
++					int d = (int)l - (int)fShotSig[i];
++
++					sig[i] = (uint8_t)l;
++					if (d < 0) {
++						d = -d;
++					}
++					if (d > 24) {
++						diffs++;
++					}
++				}
++				take = fShotCount == 0 || diffs >= 10;
++				if (take) {
++					memcpy(fShotSig, sig, sizeof(sig));
++					fShotLast = tnow;
++				}
++			}
++			if (take) {
 +				const uint32_t sw = 96, sh = 197;
 +				char hex[32 * 6 + 1];
 +
@@ -62,8 +89,6 @@ index b33139d..fbb9fbc 100644
 +						IOLog("SWEET SHOT: %u r%u s%u %s\n", fShotCount, y, seg, hex);
 +					}
 +				}
-+			} else if (s != NULL) {
-+				IOLog("SWEET SHOT: layer 0 surface %u not sampled (fmt 0x%x bpe %u %ux%u)\n", s->id, s->pixelFormat, s->bytesPerElement, s->width, s->height);
 +			}
 +			OSSafeReleaseNULL(s);
 +		}
