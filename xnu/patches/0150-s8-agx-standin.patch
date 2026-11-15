@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..b123d60
+index 0000000..1204a99
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,823 @@
+@@ -0,0 +1,825 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -48,6 +48,7 @@ index 0000000..b123d60
 +#define S8AGX_LOG_LIMIT 800
 +
 +static volatile SInt32 gAgxLogged;
++static char gDumpName[32] = "s8mtl_test";      /* boot-arg s8agxdump=<process name prefix> */
 +
 +extern "C" uint64_t mach_absolute_time(void);
 +extern "C" int proc_selfpid(void);
@@ -722,7 +723,7 @@ index 0000000..b123d60
 +			char pname[32] = "?";
 +
 +			proc_selfname(pname, sizeof(pname));
-+			if (strncmp(pname, "s8mtl_test", 10) == 0) {
++			if (strncmp(pname, gDumpName, strlen(gDumpName)) == 0) {
 +				/*
 +				 * Learn the AGX command format: print every non-zero 64-byte line of (1) the device shared-memory regions (type 0 segment list,
 +				 * 1 kernel commands) and (2) every resource userland created (command buffer memory, programs, descriptors), with the resource's GPU
@@ -808,6 +809,7 @@ index 0000000..b123d60
 +	if (!PE_parse_boot_argn("s8agx", &on, sizeof(on)) || on == 0) {
 +		return;
 +	}
++	PE_parse_boot_argn("s8agxdump", gDumpName, sizeof(gDumpName));
 +	for (int i = 0; i < 600 && (provider = IOService::getPlatform()) == NULL; i++) {
 +		IOSleep(100);
 +	}
