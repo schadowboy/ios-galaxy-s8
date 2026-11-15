@@ -43,4 +43,10 @@ xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall -We
 	-o "$OUT/s8gl_test" "$HERE/s8mali/s8gl_test.c" "$HERE/s8mali/s8mali_drm.c"
 "$LDID" -S"$HERE/s8mali/s8mali_test.entitlements" "$OUT/s8gl_test"
 file "$OUT/s8gl_test" || true
-(cd "$OUT" && shasum -a 256 s8mali_test s8gl_test | tee SHA256SUMS)
+# s8mtl_test: does Metal create a device on the AGX stand-in (test scaffolding, no IOKit shim needed)
+xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -fobjc-arc -Wall \
+	-framework Foundation -framework Metal \
+	-o "$OUT/s8mtl_test" "$HERE/s8mali/s8mtl_test.m"
+"$LDID" -S"$HERE/s8mali/s8mali_test.entitlements" "$OUT/s8mtl_test"
+file "$OUT/s8mtl_test" || true
+(cd "$OUT" && shasum -a 256 s8mali_test s8gl_test s8mtl_test | tee SHA256SUMS)
