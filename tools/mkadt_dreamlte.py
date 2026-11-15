@@ -43,9 +43,18 @@ def child(node, name):
     raise ValueError(f'missing donor ADT node {name}')
 
 
+def cpu_identity(logical):
+    """(is_a53, MPIDR) of a logical CPU. The scheduler hands work to the lowest-numbered idle CPU first, so the fast Mongoose cores get the
+    low numbers: logical 0 = the boot A53 (0x100), 1-4 = Mongoose 0-3, 5-7 = the other three A53s (0x101-0x103)."""
+    if logical == 0:
+        return True, 0x100
+    if logical <= 4:
+        return False, logical - 1
+    return True, 0x100 + (logical - 4)
+
+
 def cpu_node(logical):
-    a53 = logical < 4
-    mpidr = 0x100 + logical if a53 else logical - 4
+    a53, mpidr = cpu_identity(logical)
     cluster = 0 if a53 else 1
     return [
         ('device_type', mkadt.cstr('cpu')),
@@ -56,7 +65,7 @@ def cpu_node(logical):
         ('cluster-id', mkadt.u32(cluster)),
         ('cluster-type', mkadt.u32(0)),
         ('die-cluster-id', mkadt.u32(cluster)),
-        ('cluster-core-id', mkadt.u32(logical % 4)),
+        ('cluster-core-id', mkadt.u32(mpidr & 3)),
         ('l2-cache-id', mkadt.u32(cluster)),
         ('l3-cache-id', mkadt.u32(0)),
         ('state', mkadt.cstr('running' if logical == 0 else 'stopped')),
