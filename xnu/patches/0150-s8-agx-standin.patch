@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..0bcda3b
+index 0000000..82091e0
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,535 @@
+@@ -0,0 +1,563 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -160,15 +160,15 @@ index 0000000..0bcda3b
 +	task_t fTask;
 +	/* shared memory the kernel gave this client (selector 0xd): kernel buffer + its mapping in the client's task */
 +	enum { kShmemMax = 512 };
-+	IOBufferMemoryDescriptor * fShmemBuf[kShmemMax];
-+	IOMemoryMap * fShmemMap[kShmemMax];
++	IOBufferMemoryDescriptor ** fShmemBuf;       /* kShmemMax entries, allocated in initWithTask (the object itself may be at most 16 KiB) */
++	IOMemoryMap ** fShmemMap;
 +	UInt32 fShmemCount;
 +
 +	UInt32 fQueueId;                /* last command queue id handed out (selector 7) */
 +	UInt32 fNqId;                   /* last notification queue id handed out (selector 15) */
 +	UInt32 fResId;                  /* last resource id handed out (selector 9) */
 +	enum { kResMax = 1024 };
-+	uint64_t fResVa[kResMax];       /* GPU virtual address of resource id n at [n - 1] */
++	uint64_t * fResVa;                /* kResMax entries: GPU virtual address of resource id n at [n - 1] */
 +	uint64_t fGpuVa;                /* next GPU virtual address to give a resource (0 = not started) */
 +
 +	IOReturn createShmem(IOExternalMethodArguments * args);
@@ -178,6 +178,7 @@ index 0000000..0bcda3b
 +public:
 +	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, UInt32 refCon) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
@@ -195,6 +196,12 @@ index 0000000..0bcda3b
 +	fType = type;
 +	fTask = owningTask;
 +	fGpuVa = 0x100000000ULL;
++	fShmemBuf = IONewZero(IOBufferMemoryDescriptor *, kShmemMax);
++	fShmemMap = IONewZero(IOMemoryMap *, kShmemMax);
++	fResVa = IONewZero(uint64_t, kResMax);
++	if (fShmemBuf == NULL || fShmemMap == NULL || fResVa == NULL) {
++		return false;
++	}
 +	if (agx_log_ok()) {
 +		char name[32] = "?";
 +
@@ -293,6 +300,27 @@ index 0000000..0bcda3b
 +	IOLog("S8AGX: shmem #%u type %llu size 0x%llx -> user address 0x%llx\n", (unsigned)fShmemCount, type, size,
 +	    (unsigned long long)map->getVirtualAddress());
 +	return kIOReturnSuccess;
++}
++
++void
++AGXDeviceUserClient::free(void)
++{
++	if (fShmemBuf != NULL) {
++		releaseShmem();
++	}
++	if (fShmemBuf != NULL) {
++		IODelete(fShmemBuf, IOBufferMemoryDescriptor *, kShmemMax);
++		fShmemBuf = NULL;
++	}
++	if (fShmemMap != NULL) {
++		IODelete(fShmemMap, IOMemoryMap *, kShmemMax);
++		fShmemMap = NULL;
++	}
++	if (fResVa != NULL) {
++		IODelete(fResVa, uint64_t, kResMax);
++		fResVa = NULL;
++	}
++	IOUserClient::free();
 +}
 +
 +IOReturn
