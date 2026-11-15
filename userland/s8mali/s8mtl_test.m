@@ -287,8 +287,7 @@ main(void)
 					LOG("S8MTL: draw scene %d status %ld; centre pixels %08x %08x\n", k, (long)[cb4 status], p4px[0], p4px[1]);
 				}
 			}
-		}
-		/*
+			/*
 		 * Round 5: minimal vertex programs, one operation apart, to isolate each instruction form of the A11 vertex ISA
 		 * (vertex id, buffer load with a stride, plain exports, one multiply, one add).
 		 */
@@ -346,6 +345,7 @@ main(void)
 				}
 			} else {
 				LOG("S8MTL: round 5 library failed: %s\n", e5 ? [[e5 description] UTF8String] : "?");
+			}
 			}
 		}
 		struct fam { const char *src; int gx, gy, tx, ty; } fams[] = {
