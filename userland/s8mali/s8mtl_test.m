@@ -395,6 +395,78 @@ main(void)
 					}
 				}
 			}
+			/*
+			 * Round 7: vertex uniforms of known size and value (buffer 1), an interleaved 32-byte vertex, and a 4x4 matrix: to fix the uniform-push record
+			 * layout (destination register, count, address) and the attribute fetch with a stride other than 16.
+			 */
+			{
+				NSError *e7 = nil;
+				NSString *s7 = @"#include <metal_stdlib>\nusing namespace metal;\n"
+				    "struct V { float4 pos [[position]]; float4 col; };\n"
+				    "struct IV { float4 pos; float4 col; };\n"
+				    "vertex V xA(uint vid [[vertex_id]], constant float4 *vb [[buffer(0)]], constant float4 &u [[buffer(1)]]) { V o; o.pos = float4(vb[vid].xy * u.xy, 0.0, 1.0); o.col = u; return o; }\n"
+				    "vertex V xB(uint vid [[vertex_id]], constant float4 *vb [[buffer(0)]], constant float4x4 &m [[buffer(1)]]) { V o; o.pos = m * float4(vb[vid].xy, 0.0, 1.0); o.col = float4(0.5, 0.5, 0.5, 1.0); return o; }\n"
+				    "vertex V xC(uint vid [[vertex_id]], constant IV *vb [[buffer(0)]]) { V o; o.pos = float4(vb[vid].pos.xy, 0.0, 1.0); o.col = vb[vid].col; return o; }\n"
+				    "vertex V xD(uint vid [[vertex_id]], constant float4 *vb [[buffer(0)]], constant float4 &u [[buffer(1)]], constant float4 &v [[buffer(2)]]) { V o; o.pos = float4(vb[vid].xy * u.xy + v.zw, 0.0, 1.0); o.col = v; return o; }\n"
+				    "fragment float4 fsc(V in [[stage_in]]) { return in.col; }\n";
+				id<MTLLibrary> l7 = [dev newLibraryWithSource:s7 options:nil error:&e7];
+
+				if (l7 != nil) {
+					const char *xn[] = { "xA", "xB", "xC", "xD" };
+					float tri7[3][4] = { { -0.5f, -0.5f, 0.25f, 0.5f }, { 0.5f, -0.5f, 0.75f, 0.125f }, { 0.0f, 0.5f, 0.375f, 0.625f } };
+					float itri[3][8] = { { -0.5f, -0.5f, 0.0f, 1.0f, 0.9f, 0.1f, 0.2f, 1.0f }, { 0.5f, -0.5f, 0.0f, 1.0f, 0.1f, 0.9f, 0.2f, 1.0f },
+					                     { 0.0f, 0.5f, 0.0f, 1.0f, 0.1f, 0.2f, 0.9f, 1.0f } };
+					float u1[4] = { 0.5f, 0.75f, 1.7f, 2.9f };
+					float mtx[16] = { 0.5f, 0.0f, 0.0f, 0.0f, 0.0f, 0.25f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.1f, 0.2f, 0.0f, 1.0f };
+					float v2[4] = { 0.3f, 0.6f, 0.125f, -0.25f };
+
+					for (int k = 0; k < 4; k++) {
+						MTLRenderPipelineDescriptor *p7 = [[MTLRenderPipelineDescriptor alloc] init];
+
+						p7.vertexFunction = [l7 newFunctionWithName:[NSString stringWithUTF8String:xn[k]]];
+						p7.fragmentFunction = [l7 newFunctionWithName:@"fsc"];
+						p7.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+						id<MTLRenderPipelineState> ps7 = [dev newRenderPipelineStateWithDescriptor:p7 error:&e7];
+
+						if (ps7 == nil) {
+							LOG("S8MTL: round 7 pipeline %s failed\n", xn[k]);
+							continue;
+						}
+						MTLRenderPassDescriptor *rp7 = [MTLRenderPassDescriptor renderPassDescriptor];
+
+						rp7.colorAttachments[0].texture = tex;
+						rp7.colorAttachments[0].loadAction = MTLLoadActionClear;
+						rp7.colorAttachments[0].storeAction = MTLStoreActionStore;
+						rp7.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+						id<MTLCommandBuffer> cb7 = [q commandBuffer];
+						id<MTLRenderCommandEncoder> en7 = [cb7 renderCommandEncoderWithDescriptor:rp7];
+
+						LOG("S8MTL: ==== vertex scene %s\n", xn[k]);
+						[en7 setRenderPipelineState:ps7];
+						if (k == 2) {
+							[en7 setVertexBytes:itri length:sizeof(itri) atIndex:0];
+						} else {
+							[en7 setVertexBytes:tri7 length:sizeof(tri7) atIndex:0];
+						}
+						if (k == 0 || k == 3) {
+							[en7 setVertexBytes:u1 length:sizeof(u1) atIndex:1];
+						}
+						if (k == 1) {
+							[en7 setVertexBytes:mtx length:sizeof(mtx) atIndex:1];
+						}
+						if (k == 3) {
+							[en7 setVertexBytes:v2 length:sizeof(v2) atIndex:2];
+						}
+						[en7 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+						[en7 endEncoding];
+						[cb7 commit];
+						for (int w = 0; w < 5 && [cb7 status] < MTLCommandBufferStatusCompleted; w++) {
+							sleep(1);
+						}
+						LOG("S8MTL: vertex scene %s status %ld\n", xn[k], (long)[cb7 status]);
+					}
+				}
+			}
 			}
 		}
 		struct fam { const char *src; int gx, gy, tx, ty; } fams[] = {
