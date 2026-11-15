@@ -1,6 +1,6 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..2698537
+index 0000000..c13071e
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
 @@ -0,0 +1,1186 @@
@@ -613,7 +613,7 @@ index 0000000..2698537
 +	}
 +	if ((uint64_t)w * w != npx || !findResRegion(vtxVa, &vbase, &voff, &vlen) || !findResRegion(fragVa, &fbase, &foff, &flen) ||
 +	    !findResMem(vbVa, &vbm, &vbavail)) {
-+		if (OSIncrementAtomic((SInt32 *)&logged) < 60) {
++		if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
 +			IOLog("S8AGX: exec: draw skipped (target %llu px not square or program/vertex buffer not found)\n", (unsigned long long)npx);
 +		}
 +		return;
@@ -633,7 +633,7 @@ index 0000000..2698537
 +		uint32_t nvar = 0, unknownOp = 0;
 +
 +		if ((prim != 6 && prim != 9) || count < 3 || count > 64 || (uint64_t)count * 16 > vbavail) {
-+			if (OSIncrementAtomic((SInt32 *)&logged) < 60) {
++			if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
 +				IOLog("S8AGX: exec: draw %d prim %u count %u not handled\n", di, (unsigned)prim, (unsigned)count);
 +			}
 +			continue;
@@ -666,7 +666,7 @@ index 0000000..2698537
 +			}
 +			vok[vid] = true;
 +		}
-+		if (unknownOp != 0 && OSIncrementAtomic((SInt32 *)&logged) < 60) {
++		if (unknownOp != 0 && OSIncrementAtomic((SInt32 *)&logged) < 400) {
 +			IOLog("S8AGX: exec: vertex program has an instruction the interpreter does not know (0x%02x)\n", (unsigned)unknownOp);
 +		}
 +		uint32_t before = dc.pixels;
@@ -685,7 +685,7 @@ index 0000000..2698537
 +				break;
 +			}
 +		}
-+		if (OSIncrementAtomic((SInt32 *)&logged) < 60) {
++		if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
 +			IOLog("S8AGX: exec: draw %d prim %u count %u: %u pixels written (fragment unknown op 0x%02x)\n", di, (unsigned)prim, (unsigned)count,
 +			    (unsigned)(dc.pixels - before), (unsigned)dc.unknown);
 +		}
@@ -779,7 +779,7 @@ index 0000000..2698537
 +					break;                          /* an instruction the executor does not know yet */
 +				}
 +			}
-+			if (!ok && OSIncrementAtomic((SInt32 *)&logged) < 60) {
++			if (!ok && OSIncrementAtomic((SInt32 *)&logged) < 400) {
 +				IOLog("S8AGX: exec: fragment program at 0x%llx is not a constant-colour one (first byte 0x%02x), pass cleared only\n",
 +				    (unsigned long long)fragVa, (unsigned)p[0]);
 +			}
@@ -815,11 +815,11 @@ index 0000000..2698537
 +					if (drawable) {
 +						executeDraws(px, tavail / 4, vtxVa, vbVa, vp, fragVa, (const uint32_t *)draws, ndraws);
 +					}
-+					if (OSIncrementAtomic((SInt32 *)&logged) < 60) {
++					if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
 +						IOLog("S8AGX: exec: pass target 0x%llx (0x%llx B) clear %08x%s -> pixel %08x\n", (unsigned long long)tva,
 +						    (unsigned long long)tavail, (unsigned)cc, haveColor ? " + constant fragment colour" : "", (unsigned)fill);
 +					}
-+				} else if (OSIncrementAtomic((SInt32 *)&logged) < 60) {
++				} else if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
 +					IOLog("S8AGX: exec: pass target 0x%llx has no stand-in memory (caller memory?)\n", (unsigned long long)tva);
 +				}
 +			}
