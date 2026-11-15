@@ -1202,10 +1202,10 @@ index 0000000..9118c23
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
 diff --git a/iokit/Kernel/arm/s8gfx_frag.h b/iokit/Kernel/arm/s8gfx_frag.h
 new file mode 100755
-index 0000000..d3c4257
+index 0000000..f512123
 --- /dev/null
 +++ b/iokit/Kernel/arm/s8gfx_frag.h
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,206 @@
 +/*
 + * Fragment program interpreter for the A11 (G10) shader subset decoded so far (tools/agx-emu.py is its Python twin, validated on the render scenes).
 + * Integer-only (s8gfx_sf.h), no libc, so it builds into the kernel and into the host test (scratch/agx/frag_test.c).
@@ -1236,6 +1236,7 @@ index 0000000..d3c4257
 +	f32b exp[16];
 +	uint32_t expmask;
 +	int nfetch;
++	unsigned pc_end;                /* byte offset just past the end instruction of the last successful run */
 +};
 +
 +static inline f32b
@@ -1346,9 +1347,10 @@ index 0000000..d3c4257
 +				c->r[k] = c->fetch[k];
 +			}
 +			pc += 20;
-+		} else if (op == 0xc2 && pc + 4 <= len && b[1] == 0x00 && b[2] == 0x00 && b[3] == 0x00) {
-+			pc += 4;                                        /* the extra 4-byte filler that sometimes precedes the prologue */
++		} else if (op == 0xc2 && pc + 4 <= len && b[3] == 0x00) {
++			pc += 4;                                        /* c2 xx yy 00: filler / register-copy form seen around the prologue; treated as a no-op for now */
 +		} else if (op == 0x08 && pc + 4 <= len && b[1] == 0x01) {
++			c->pc_end = pc + 4;
 +			return c->stored || c->expmask != 0;
 +		} else {
 +			c->unknown = op;
@@ -1388,6 +1390,22 @@ index 0000000..d3c4257
 +				n++;
 +			}
 +			return s;
++		}
++	}
++	/* no fetch prologue: the earliest start in [off-0x20, off] whose run completes with a position export and reaches past the entry pointer
++	 * (an earlier shader's own end instruction stops a run before the pointer, so it cannot be mistaken for this one) */
++	for (q = off >= 0x20 ? off - 0x20 : 0; q <= off; q++) {
++		struct s8f_ctx c;
++		f32b zero[4] = { 0, 0, 0, 0 };
++		unsigned i;
++
++		for (i = 0; i < sizeof(c); i++) {
++			((uint8_t *)&c)[i] = 0;
++		}
++		c.fetch = zero;
++		c.nfetch = 4;
++		if (s8f_run(&c, m + q, len - q) && (c.expmask & 0xf) == 0xf && q + c.pc_end > off) {
++			return q;
 +		}
 +	}
 +	return off;
