@@ -86,6 +86,22 @@ main(void)
 			td.storageMode = MTLStorageModeShared;
 			id<MTLTexture> tex = [dev newTextureWithDescriptor:td];
 			LOG("S8MTL: render target %p\n", (__bridge void *)tex);
+			/* the texture of the "TEX:" scenes: 4x4 RGBA8, a known gradient with a varying alpha */
+			id<MTLTexture> srctex = nil;
+			{
+				MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
+				sd.usage = MTLTextureUsageShaderRead;
+				sd.storageMode = MTLStorageModeShared;
+				srctex = [dev newTextureWithDescriptor:sd];
+				uint8_t pat[4 * 4 * 4];
+				for (int y = 0; y < 4; y++) {
+					for (int x = 0; x < 4; x++) {
+						uint8_t *p = pat + (y * 4 + x) * 4;
+						p[0] = (uint8_t)(x * 80 + 15); p[1] = (uint8_t)(y * 80 + 15); p[2] = (uint8_t)(255 - x * 40 - y * 20); p[3] = (uint8_t)(255 - (x + y) * 30);
+					}
+				}
+				[srctex replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:pat bytesPerRow:16];
+			}
 			struct rv { const char *name; const char *frag; float cr, cg, cb; int draw; int blend; } rvs[] = {
 				{ "clear only black", "return float4(1,0,0,1);", 0, 0, 0, 0, 0 },
 				{ "clear only 0.25/0.5/0.75", "return float4(1,0,0,1);", 0.25f, 0.5f, 0.75f, 0, 0 },
@@ -113,14 +129,30 @@ main(void)
 				{ "discard", "if (in.col.x < 0.5) discard_fragment(); return float4(1,0,0,1);", 0, 0, 0, 1, 0 },
 				{ "sin", "return float4(sin(in.col.x*3.0)*0.5+0.5, 0, 0, 1);", 0, 0, 0, 1, 0 },
 				{ "floor", "return float4(floor(in.col.x*4.0)/4.0, 0, 0, 1);", 0, 0, 0, 1, 0 },
+				/* round 3: texture sampling ("TEX:" scenes get a 4x4 RGBA8 texture bound at index 0) and integer / conversion forms */
+				{ "tex nearest", "TEX:return t.sample(sn, in.col.xy);", 0, 0, 0, 1, 0 },
+				{ "tex linear", "TEX:return t.sample(sl, in.col.xy);", 0, 0, 0, 1, 0 },
+				{ "tex tint", "TEX:return t.sample(sn, in.col.xy) * float4(1, 0.5, 0.25, 1);", 0, 0, 0, 1, 0 },
+				{ "tex premult", "TEX:float4 c = t.sample(sn, in.col.xy); return float4(c.rgb * c.a, c.a);", 0, 0, 0, 1, 0 },
+				{ "tex blend over", "TEX:return t.sample(sn, in.col.xy);", 1, 1, 1, 1, 1 },
+				{ "uint bitops", "uint u = uint(in.col.x * 255.0); return float4(float(u & 0xF0u) / 255.0, float((u << 1) & 0xFFu) / 255.0, float(u >> 4) / 15.0, 1);", 0, 0, 0, 1, 0 },
+				{ "int compare select", "int i = int(in.col.x * 8.0); return i > 3 ? float4(1,0,0,1) : float4(0,0,1,1);", 0, 0, 0, 1, 0 },
+				{ "fract abs", "return float4(fract(in.col.x * 4.0), abs(in.col.y - 0.5) * 2.0, 0, 1);", 0, 0, 0, 1, 0 },
+				{ "pow", "return float4(pow(in.col.x, 2.2), 0, 0, 1);", 0, 0, 0, 1, 0 },
+				{ "unorm pack", "return float4(float(uint(in.col.x * 255.0)) / 255.0, 0, 0, 1);", 0, 0, 0, 1, 0 },
 			};
 			int rcount = (int)(sizeof(rvs) / sizeof(rvs[0]));
 			for (int r = 0; r < rcount && tex != nil && q != nil; r++) {
 				NSError *rerr = nil;
+				BOOL istex = strncmp(rvs[r].frag, "TEX:", 4) == 0;
+				const char *body = istex ? rvs[r].frag + 4 : rvs[r].frag;
 				NSString *rsrc = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\n"
 				    "struct V { float4 pos [[position]]; float4 col; };\n"
 				    "vertex V vs(uint vid [[vertex_id]]) { float2 p[3] = { float2(-1,-1), float2(3,-1), float2(-1,3) }; V o; o.pos = float4(p[vid], 0, 1); o.col = float4(p[vid] * 0.5 + 0.5, 0.25, 1); return o; }\n"
-				    "fragment float4 fs(V in [[stage_in]]) { %s }\n", rvs[r].frag];
+				    "fragment float4 fs(V in [[stage_in]]%s) { %s%s }\n",
+				    istex ? ", texture2d<float> t [[texture(0)]]" : "",
+				    istex ? "constexpr sampler sn(filter::nearest, address::clamp_to_edge); constexpr sampler sl(filter::linear, address::clamp_to_edge); " : "",
+				    body];
 				LOG("S8MTL: ==== render %d: %s\n", r, rvs[r].name);
 				id<MTLLibrary> rl = [dev newLibraryWithSource:rsrc options:nil error:&rerr];
 				if (rl == nil) {
@@ -153,6 +185,9 @@ main(void)
 				id<MTLRenderCommandEncoder> renc = [rcb renderCommandEncoderWithDescriptor:rp];
 				if (rvs[r].draw) {
 					[renc setRenderPipelineState:rps];
+					if (istex && srctex != nil) {
+						[renc setFragmentTexture:srctex atIndex:0];
+					}
 					[renc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 				}
 				[renc endEncoding];
