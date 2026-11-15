@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..501c8e9
+index 0000000..6a1ba6f
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,825 @@
+@@ -0,0 +1,989 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -190,6 +190,8 @@ index 0000000..501c8e9
 +	uint64_t fGpuVa;                /* next GPU virtual address to give a resource (0 = not started) */
 +
 +	IOReturn createShmem(IOExternalMethodArguments * args);
++	void executePasses(void);
++	bool findResMem(uint64_t va, uint8_t ** mem, uint64_t * avail);
 +	void dumpSparse(const char * what, uint32_t region, uint32_t id, uint32_t type, uint64_t va, const uint8_t * m, size_t len);
 +	IOReturn allocShmem(uint64_t size, uint64_t * userAddress);
 +	void releaseShmem(void);
@@ -476,6 +478,159 @@ index 0000000..501c8e9
 +	}
 +}
 +
++/*
++ * MILESTONE 1 executor (software, in the kernel, the first real pixels of the AGX stand-in; analysis/agx-kernel-interface.md 17f):
++ * for a submit of the process named by boot-arg s8agxexec (default s8mtl_test) find the render pass descriptors in the resources the process
++ * created, clear their render target, and run the user fragment program when it is a constant-colour one (immediate loads + tile store).
++ * No floating point in the kernel: floats are handled as bit patterns.
++ */
++static char gExecName[32] = "s8mtl_test";
++
++/* float bits -> 8-bit unorm, round half up, integer arithmetic only */
++static uint8_t
++agx_f32_unorm8(uint32_t b)
++{
++	uint32_t e = (b >> 23) & 0xff;
++	uint64_t mant;
++	uint32_t shift;
++	uint64_t r;
++
++	if (b >> 31) {
++		return 0;                       /* negative */
++	}
++	if (e == 0xff) {
++		return (b & 0x7fffff) ? 0 : 255;        /* NaN, +inf */
++	}
++	if (e >= 127) {
++		return 255;                     /* >= 1.0 */
++	}
++	if (e == 0) {
++		return 0;
++	}
++	mant = (b & 0x7fffff) | 0x800000;
++	shift = 23 + (127 - e);
++	if (shift >= 62) {
++		return 0;
++	}
++	r = (mant * 255 + (1ULL << (shift - 1))) >> shift;
++	return r > 255 ? 255 : (uint8_t)r;
++}
++
++bool
++AGXDeviceUserClient::findResMem(uint64_t va, uint8_t ** mem, uint64_t * avail)
++{
++	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
++		uint32_t r = fResShm[n - 1];
++
++		if (r != 0xffffffffu && r < fShmemCount && fShmemBuf[r] != NULL) {
++			uint64_t base = fResVa[n - 1], len = fShmemBuf[r]->getLength();
++
++			if (va >= base && va < base + len) {
++				*mem = (uint8_t *)fShmemBuf[r]->getBytesNoCopy() + (va - base);
++				*avail = base + len - va;
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++void
++AGXDeviceUserClient::executePasses(void)
++{
++	static volatile SInt32 logged;
++	uint64_t fragVa = 0;
++	uint32_t color = 0;
++	bool haveColor = false;
++
++	/* the user fragment-state record {0x0009051f, program VA low (bit 0 = flag), [extra], 0x108}: the last one wins */
++	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
++		uint32_t r = fResShm[n - 1];
++
++		if (r == 0xffffffffu || r >= fShmemCount || fShmemBuf[r] == NULL) {
++			continue;
++		}
++		const uint32_t * d = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
++		uint64_t nd = fShmemBuf[r]->getLength() / 4;
++
++		for (uint64_t i = 0; i + 4 < nd; i++) {
++			if (d[i] == 0x0009051fu && (d[i + 2] == 0x108u || d[i + 3] == 0x108u)) {
++				fragVa = 0x100000000ULL | (d[i + 1] & ~1u);
++			}
++		}
++	}
++	if (fragVa != 0) {
++		uint8_t * p;
++		uint64_t avail;
++
++		if (findResMem(fragVa, &p, &avail)) {
++			uint32_t reg[8] = { 0 };
++			uint64_t pc = 0;
++			bool ok = false;
++
++			for (int step = 0; step < 64 && pc + 8 <= avail; step++) {
++				const uint8_t * b = p + pc;
++
++				if (b[0] == 0x52) {                     /* mov_imm: 52 <reg*2> <imm32> */
++					reg[(b[1] / 2) & 7] = b[2] | (b[3] << 8) | (b[4] << 16) | ((uint32_t)b[5] << 24);
++					pc += 6;
++				} else if (b[0] == 0x48) {              /* wait_pix */
++					pc += 4;
++				} else if (b[0] == 0x38) {              /* wait */
++					pc += 2;
++				} else if (b[0] == 0x09) {              /* st_tile: the colour is r0..r3 (RGBA) */
++					color = agx_f32_unorm8(reg[2]) | (agx_f32_unorm8(reg[1]) << 8) | (agx_f32_unorm8(reg[0]) << 16) |
++					    ((uint32_t)agx_f32_unorm8(reg[3]) << 24);
++					haveColor = ok = true;
++					break;
++				} else {
++					break;                          /* an instruction the executor does not know yet */
++				}
++			}
++			if (!ok && OSIncrementAtomic((SInt32 *)&logged) < 60) {
++				IOLog("S8AGX: exec: fragment program at 0x%llx is not a constant-colour one (first byte 0x%02x), pass cleared only\n",
++				    (unsigned long long)fragVa, (unsigned)p[0]);
++			}
++		}
++	}
++	/* the render pass descriptors: fb05050a 00007e01 ... clear RGBA floats at +0x38, target record 1fe3050a 000007e0 <VA>>4 at +0x48 */
++	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
++		uint32_t r = fResShm[n - 1];
++
++		if (r == 0xffffffffu || r >= fShmemCount || fShmemBuf[r] == NULL) {
++			continue;
++		}
++		const uint32_t * d = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
++		uint64_t nd = fShmemBuf[r]->getLength() / 4;
++
++		for (uint64_t i = 0; i + 0x16 < nd; i++) {
++			if (d[i] == 0xfb05050au && d[i + 1] == 0x00007e01u && d[i + 0x12] == 0x1fe3050au && d[i + 0x13] == 0x7e0u) {
++				uint64_t tva = (uint64_t)d[i + 0x14] << 4;
++				uint32_t cc = agx_f32_unorm8(d[i + 14]) << 16 | agx_f32_unorm8(d[i + 15]) << 8 | agx_f32_unorm8(d[i + 16]) |
++				    ((uint32_t)agx_f32_unorm8(d[i + 17]) << 24);      /* BGRA8: B = bits 0-7 */
++				uint32_t fill = haveColor ? color : cc;
++				uint8_t * t;
++				uint64_t tavail;
++
++				/* BGRA byte order in memory: B G R A; cc above has R in bits 16-23 and B in 0-7 as little-endian BGRA */
++				if (findResMem(tva, &t, &tavail)) {
++					uint32_t * px = (uint32_t *)t;
++
++					for (uint64_t k = 0; k < tavail / 4; k++) {
++						px[k] = fill;
++					}
++					if (OSIncrementAtomic((SInt32 *)&logged) < 60) {
++						IOLog("S8AGX: exec: pass target 0x%llx (0x%llx B) clear %08x%s -> pixel %08x\n", (unsigned long long)tva,
++						    (unsigned long long)tavail, (unsigned)cc, haveColor ? " + constant fragment colour" : "", (unsigned)fill);
++					}
++				} else if (OSIncrementAtomic((SInt32 *)&logged) < 60) {
++					IOLog("S8AGX: exec: pass target 0x%llx has no stand-in memory (caller memory?)\n", (unsigned long long)tva);
++				}
++			}
++		}
++	}
++}
++
 +/* One completion record (0x20 B: cookie, two timestamps, status) into the notification queue of a command queue. */
 +bool
 +AGXDeviceUserClient::postCompletion(uint32_t cmdQueue, uint64_t cookie, uint64_t t1, uint64_t t2, uint32_t status)
@@ -708,6 +863,14 @@ index 0000000..501c8e9
 +		if (esize < 0x20 || count == 0 || count * esize > args->structureInputSize) {
 +			return kIOReturnBadArgument;
 +		}
++		{
++			char xname[32] = "?";
++
++			proc_selfname(xname, sizeof(xname));
++			if (strncmp(xname, gExecName, strlen(gExecName)) == 0) {
++				executePasses();        /* before the completion records: the caller reads the target once it sees them */
++			}
++		}
 +		for (uint64_t i = 0; i < count; i++) {
 +			const uint8_t * e = in + i * esize;
 +			uint64_t t = mach_absolute_time();
@@ -810,6 +973,7 @@ index 0000000..501c8e9
 +		return;
 +	}
 +	PE_parse_boot_argn("s8agxdump", gDumpName, sizeof(gDumpName));
++	PE_parse_boot_argn("s8agxexec", gExecName, sizeof(gExecName));
 +	for (int i = 0; i < 600 && (provider = IOService::getPlatform()) == NULL; i++) {
 +		IOSleep(100);
 +	}
