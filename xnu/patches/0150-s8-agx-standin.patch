@@ -1,6 +1,6 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..6d81d81
+index 0000000..1c31dc7
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
 @@ -0,0 +1,246 @@
@@ -152,7 +152,7 @@ index 0000000..6d81d81
 +AGXDeviceUserClient::registerNotificationPort(mach_port_t port, UInt32 type, UInt32 refCon)
 +{
 +	if (agx_log_ok()) {
-+		IOLog("S8AGX: registerNotificationPort port 0x%x type %u refCon 0x%x\n", (unsigned)port, (unsigned)type, (unsigned)refCon);
++		IOLog("S8AGX: registerNotificationPort port %p type %u refCon 0x%x\n", (void *)port,(unsigned)type, (unsigned)refCon);
 +	}
 +	return kIOReturnSuccess;
 +}
