@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..029184d
+index 0000000..b5c91d8
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,1315 @@
+@@ -0,0 +1,1358 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -199,7 +199,9 @@ index 0000000..029184d
 +	bool findResMem(uint64_t va, uint8_t ** mem, uint64_t * avail);
 +	bool findResRegion(uint64_t va, const uint8_t ** base, uint64_t * off, uint64_t * len);
 +	void logPrograms(void);
-+	void executeDraws(uint32_t * target, uint64_t npx, uint64_t vtxVa, uint64_t vbVa, const uint32_t * vp, uint64_t fragVa, const uint32_t * dr, int ndraws);
++	static uint32_t agxRd(void * ctx, uint64_t va);
++	void executeDraws(uint32_t * target, uint64_t npx, uint64_t vtxVa, uint64_t vbVa, const uint32_t * vp, uint64_t fragVa, const uint32_t * dr, int ndraws,
++	    const uint32_t * uni);
 +	void dumpSparse(const char * what, uint32_t region, uint32_t id, uint32_t type, uint64_t va, const uint8_t * m, size_t len);
 +	IOReturn allocShmem(uint64_t size, uint64_t * userAddress);
 +	void releaseShmem(void);
@@ -572,7 +574,8 @@ index 0000000..029184d
 +struct agx_seen { uint32_t n, kind, val; uint64_t i; };
 +static struct agx_seen gSeenRec[128];
 +static int gNSeenRec;
-+static uint64_t gLastVtx, gLastFrag;
++static uint64_t gLastVtx, gLastFrag, gLastIdx;
++static uint32_t gLastRes;
 +
 +static bool
 +agx_rec_changed(uint32_t n, uint64_t i, uint32_t kind, uint32_t val)
@@ -621,6 +624,19 @@ index 0000000..029184d
 +	} else if (fc.unknown != 0) {
 +		dc->unknown = fc.unknown;
 +	}
++}
++
++uint32_t
++AGXDeviceUserClient::agxRd(void * ctx, uint64_t va)
++{
++	AGXDeviceUserClient * self = (AGXDeviceUserClient *)ctx;
++	uint8_t * p;
++	uint64_t avail;
++
++	if (self->findResMem(va, &p, &avail) && avail >= 4) {
++		return *(const uint32_t *)p;
++	}
++	return 0;
 +}
 +
 +/*
@@ -700,14 +716,12 @@ index 0000000..029184d
 + */
 +void
 +AGXDeviceUserClient::executeDraws(uint32_t * target, uint64_t npx, uint64_t vtxVa, uint64_t vbVa, const uint32_t * vp, uint64_t fragVa,
-+    const uint32_t * dr, int ndraws)
++    const uint32_t * dr, int ndraws, const uint32_t * uni)
 +{
 +	static volatile SInt32 logged;
 +	const uint8_t * vbase;
 +	const uint8_t * fbase;
-+	const uint8_t * vbuf;
-+	uint64_t voff, vlen, foff, flen, vbavail;
-+	uint8_t * vbm;
++	uint64_t voff, vlen, foff, flen;
 +	unsigned vstart;
 +	int w = 1;
 +	struct agx_draw_ctx dc;
@@ -715,14 +729,13 @@ index 0000000..029184d
 +	while ((uint64_t)w * w < npx) {
 +		w++;
 +	}
-+	if ((uint64_t)w * w != npx || !findResRegion(vtxVa, &vbase, &voff, &vlen) || !findResRegion(fragVa, &fbase, &foff, &flen) ||
-+	    !findResMem(vbVa, &vbm, &vbavail)) {
++	(void)vbVa;
++	if ((uint64_t)w * w != npx || !findResRegion(vtxVa, &vbase, &voff, &vlen) || !findResRegion(fragVa, &fbase, &foff, &flen)) {
 +		if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
 +			IOLog("S8AGX: exec: draw skipped (target %llu px not square or program/vertex buffer not found)\n", (unsigned long long)npx);
 +		}
 +		return;
 +	}
-+	vbuf = vbm;
 +	vstart = s8v_find_start(vbase, (unsigned)(vlen > 0xffffffffULL ? 0xffffffffU : vlen), (unsigned)voff);
 +	dc.frag = fbase + foff;
 +	dc.fraglen = (uint32_t)(flen - foff > 0x400 ? 0x400 : flen - foff);
@@ -736,7 +749,7 @@ index 0000000..029184d
 +		bool vok[64];
 +		uint32_t nvar = 0, unknownOp = 0;
 +
-+		if ((prim != 6 && prim != 9) || count < 3 || count > 64 || (uint64_t)count * 16 > vbavail) {
++		if ((prim != 6 && prim != 9) || count < 3 || count > 64) {
 +			if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
 +				IOLog("S8AGX: exec: draw %d prim %u count %u not handled\n", di, (unsigned)prim, (unsigned)count);
 +			}
@@ -744,18 +757,18 @@ index 0000000..029184d
 +		}
 +		for (uint32_t vid = 0; vid < count; vid++) {
 +			struct s8f_ctx c;
-+			f32b fetch[4];
 +
 +			bzero(&c, sizeof(c));
-+			memcpy(fetch, vbuf + vid * 16, 16);
-+			c.fetch = fetch;
-+			c.nfetch = 4;
++			memcpy(c.uni, uni, sizeof(c.uni));
++			c.rd = agxRd;
++			c.rdctx = this;
++			c.vid = vid;
 +			vok[vid] = false;
 +			if (!s8f_run(&c, vbase + vstart, (unsigned)(vlen - vstart > 0x400 ? 0x400 : vlen - vstart)) || (c.expmask & 0xf) != 0xf) {
 +				unknownOp = c.unknown ? c.unknown : 0xff;
 +				if (vid == 0 && OSIncrementAtomic((SInt32 *)&logged) < 400) {
-+					IOLog("S8AGX: exec: vertex program at 0x%llx start +%u: exports 0x%x, fetch %08x %08x, program bytes %02x %02x %02x %02x %02x %02x %02x %02x\n",
-+					    (unsigned long long)vtxVa, vstart, (unsigned)c.expmask, (unsigned)fetch[0], (unsigned)fetch[1], vbase[vstart], vbase[vstart + 1],
++					IOLog("S8AGX: exec: vertex program at 0x%llx start +%u: exports 0x%x, uniforms %08x %08x, program bytes %02x %02x %02x %02x %02x %02x %02x %02x\n",
++					    (unsigned long long)vtxVa, vstart, (unsigned)c.expmask, (unsigned)c.uni[0], (unsigned)c.uni[2], vbase[vstart], vbase[vstart + 1],
 +					    vbase[vstart + 2], vbase[vstart + 3], vbase[vstart + 4], vbase[vstart + 5], vbase[vstart + 6], vbase[vstart + 7]);
 +				}
 +				continue;
@@ -808,7 +821,9 @@ index 0000000..029184d
 +{
 +	static volatile SInt32 logged;
 +	uint64_t fragVa = 0;
-+	uint64_t vtxVa = 0, vbVa = 0;
++	uint64_t vtxVa = 0, vbVa = 0, vtxIdx = 0;
++	uint32_t vtxRes = 0;
++	uint32_t uni[128];
 +	uint32_t vp[4] = { 0, 0, 0, 0 };
 +	struct { uint32_t prim, count, inst; } draws[8];
 +	int ndraws = 0;
@@ -829,6 +844,8 @@ index 0000000..029184d
 +		for (uint64_t i = 1; i + 10 < nd; i++) {
 +			if ((d[i] == 0x0001001fu || d[i] == 0x0001002fu) && d[i + 2] == 0x108u && agx_rec_changed(n, i, 1, d[i + 1])) {
 +				vtxVa = 0x100000000ULL | (d[i + 1] & ~1u);
++				vtxRes = n;
++				vtxIdx = i;
 +			}
 +			if (d[i - 1] == 0xc00u && d[i + 1] == 1u && d[i + 2] == 0xc00u && d[i + 3] == 0x80000001u) {
 +				vbVa = 0x100000000ULL | d[i];
@@ -864,8 +881,34 @@ index 0000000..029184d
 +	}
 +	if (vtxVa != 0) {
 +		gLastVtx = vtxVa;
++		gLastRes = vtxRes;
++		gLastIdx = vtxIdx;
 +	} else {
 +		vtxVa = gLastVtx;
++		vtxRes = gLastRes;
++		vtxIdx = gLastIdx;
++	}
++	/* the uniform-push records right before the vertex state record fill the uniform file: {w0, w1}, address (w1 << 8) | (w0 >> 24 & 0xfe),
++	 * size (w0 >> 20 & 0x1f) halves (0 = 32), destination half (w0 >> 8 & 0xff), type w0 & 0xf = 3 */
++	bzero(uni, sizeof(uni));
++	if (vtxVa != 0 && vtxRes != 0 && vtxRes <= kResMax && fResShm[vtxRes - 1] != 0xffffffffu && fResShm[vtxRes - 1] < fShmemCount &&
++	    fShmemBuf[fResShm[vtxRes - 1]] != NULL) {
++		const uint32_t * dd = (const uint32_t *)fShmemBuf[fResShm[vtxRes - 1]]->getBytesNoCopy();
++
++		for (int64_t k = (int64_t)vtxIdx - 2, cnt = 0; k >= 0 && cnt < 8; k -= 2, cnt++) {
++			if ((dd[k] & 0xf) != 3 || (dd[k + 1] >> 24) != 1) {
++				break;
++			}
++			uint64_t pva = ((uint64_t)dd[k + 1] << 8) | ((dd[k] >> 24) & 0xfe);
++			uint32_t halves = (dd[k] >> 20) & 0x1f, dest = (dd[k] >> 8) & 0xff;
++
++			if (halves == 0) {
++				halves = 32;
++			}
++			for (uint32_t j = 0; j < halves / 2 && dest + 2 * j < 128; j++) {
++				uni[dest + 2 * j] = agxRd(this, pva + 4 * j);
++			}
++		}
 +	}
 +	if (fragVa != 0) {
 +		gLastFrag = fragVa;
@@ -939,7 +982,7 @@ index 0000000..029184d
 +						px[k] = fill;
 +					}
 +					if (drawable) {
-+						executeDraws(px, tavail / 4, vtxVa, vbVa, vp, fragVa, (const uint32_t *)draws, ndraws);
++						executeDraws(px, tavail / 4, vtxVa, vbVa, vp, fragVa, (const uint32_t *)draws, ndraws, uni);
 +					}
 +					if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
 +						IOLog("S8AGX: exec: pass target 0x%llx (0x%llx B) clear %08x%s -> pixel %08x\n", (unsigned long long)tva,
@@ -1321,10 +1364,10 @@ index 0000000..029184d
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
 diff --git a/iokit/Kernel/arm/s8gfx_frag.h b/iokit/Kernel/arm/s8gfx_frag.h
 new file mode 100755
-index 0000000..d34a141
+index 0000000..e9c10b8
 --- /dev/null
 +++ b/iokit/Kernel/arm/s8gfx_frag.h
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,236 @@
 +/*
 + * Fragment program interpreter for the A11 (G10) shader subset decoded so far (tools/agx-emu.py is its Python twin, validated on the render scenes).
 + * Integer-only (s8gfx_sf.h), no libc, so it builds into the kernel and into the host test (scratch/agx/frag_test.c).
@@ -1356,6 +1399,13 @@ index 0000000..d34a141
 +	uint32_t expmask;
 +	int nfetch;
 +	unsigned pc_end;                /* byte offset just past the end instruction of the last successful run */
++	/* vertex stage with the uniform file: uni[] is indexed by 16-bit half index (even indices hold the 32-bit words), pushed by the uniform-push records;
++	 * rd reads a 32-bit word at a GPU virtual address (vertex attribute fetch); vid and stride address the vertex */
++	uint32_t uni[128];
++	uint32_t (*rd)(void * rdctx, uint64_t va);
++	void * rdctx;
++	uint32_t vid;
++	uint32_t stride;
 +};
 +
 +static inline f32b
@@ -1459,7 +1509,29 @@ index 0000000..d34a141
 +				c->expmask |= 1u << (slot - 0x40);
 +			}
 +			pc += 4;
-+		} else if (op == 0xc2 && pc + 20 <= len && b[1] == 0x02 && b[4] == 0x0e && b[10] == 0x05 && b[18] == 0x38) {
++		} else if (c->rd != 0 && (op == 0xc2 || op == 0x42) && pc + 4 <= len && b[3] == 0x00) {
++			/* c2 dst src 00: copy the 32-bit uniform at half index src into the register at half index dst */
++			c->r[(b[1] / 2) & (S8F_REGS - 1)] = c->uni[b[2] & 127];
++			pc += 4;
++		} else if (c->rd != 0 && op == 0x0e && pc + 6 <= len) {
++			c->stride = (uint32_t)b[5] * 4;                 /* 0e 00 c0 ca 1a 04: the vertex address multiply-add, stride 16 in these programs */
++			pc += 6;
++		} else if (c->rd != 0 && op == 0x8e && pc + 8 <= len) {
++			c->stride = b[3];                               /* 8e 00 ca <stride> 26 80 c0 00 (stride 32 = 0x20 in the interleaved probe) */
++			pc += 8;
++		} else if (c->rd != 0 && (op == 0x05 || op == 0x85) && pc + 8 <= len) {
++			/* device_load (8 B): 05 <8*dst+1> <byte offset> 05 00 <c4|c8> <NN> 00; components = 2 + bit6 + bit7 of NN; address = pointer in uniform
++			 * halves 0..3 + vid * stride + offset */
++			int n = 2 + ((b[6] >> 6) & 1) + ((b[6] >> 7) & 1);
++			unsigned dst = (b[1] - 1) / 8;
++			uint64_t base = (uint64_t)c->uni[0] | ((uint64_t)c->uni[2] << 32);
++			uint64_t va = base + (uint64_t)c->vid * c->stride + b[2];
++
++			for (int k = 0; k < n; k++) {
++				c->r[(dst + k) & (S8F_REGS - 1)] = c->rd(c->rdctx, va + 4 * (uint64_t)k);
++			}
++			pc += 8;
++		} else if (c->rd == 0 && op == 0xc2 && pc + 20 <= len && b[1] == 0x02 && b[4] == 0x0e && b[10] == 0x05 && b[18] == 0x38) {
 +			/* vertex fetch prologue (20 B): c2 02 02 00 | 0e 00 c0 ca 1a 04 | 05 01 00 05 00 cX NN 00 | 38 00; components loaded = 2 + bit6 + bit7 of NN */
 +			int n = 2 + ((b[16] >> 6) & 1) + ((b[16] >> 7) & 1);
 +
@@ -1489,16 +1561,16 @@ index 0000000..d34a141
 +static inline unsigned
 +s8v_find_start(const uint8_t * m, unsigned len, unsigned off)
 +{
-+	static const uint8_t sig[12] = { 0xc2, 0x02, 0x02, 0x00, 0x0e, 0x00, 0xc0, 0xca, 0x1a, 0x04, 0x05, 0x01 };
++	static const uint8_t sig[5] = { 0xc2, 0x02, 0x02, 0x00, 0x0e };    /* 0x0e or 0x8e (the address multiply-add) follows */
 +	unsigned lo = off >= 0x30 ? off - 0x30 : 0;      /* the entry pointer lands inside the prologue or up to ~0x20 bytes into the constant run */
 +	unsigned q;
 +
 +	for (q = lo; q <= off + 0x40 && q + 12 <= len; q++) {
 +		unsigned k;
 +
-+		for (k = 0; k < 12 && m[q + k] == sig[k]; k++) {
++		for (k = 0; k < 4 && m[q + k] == sig[k]; k++) {
 +		}
-+		if (k == 12) {
++		if (k == 4 && (m[q + 4] == 0x0e || m[q + 4] == 0x8e)) {
 +			unsigned s = q;
 +			int n = 0;
 +
