@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..63b93da
+index 0000000..e9ff1d3
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,1239 @@
+@@ -0,0 +1,1307 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -198,6 +198,7 @@ index 0000000..63b93da
 +	void executePasses(void);
 +	bool findResMem(uint64_t va, uint8_t ** mem, uint64_t * avail);
 +	bool findResRegion(uint64_t va, const uint8_t ** base, uint64_t * off, uint64_t * len);
++	void logPrograms(void);
 +	void executeDraws(uint32_t * target, uint64_t npx, uint64_t vtxVa, uint64_t vbVa, const uint32_t * vp, uint64_t fragVa, const uint32_t * dr, int ndraws);
 +	void dumpSparse(const char * what, uint32_t region, uint32_t id, uint32_t type, uint64_t va, const uint8_t * m, size_t len);
 +	IOReturn allocShmem(uint64_t size, uint64_t * userAddress);
@@ -492,6 +493,7 @@ index 0000000..63b93da
 + * No floating point in the kernel: floats are handled as bit patterns.
 + */
 +static char gExecName[32] = "s8mtl_test";
++static char gProgName[32] = "";                 /* boot-arg s8agxprogs=<process prefix>: log the bytes of every new shader that process submits */
 +
 +/* float bits -> 8-bit unorm, round half up, integer arithmetic only */
 +static uint8_t
@@ -618,6 +620,69 @@ index 0000000..63b93da
 +		dc->pixels++;
 +	} else if (fc.unknown != 0) {
 +		dc->unknown = fc.unknown;
++	}
++}
++
++/*
++ * Shader corpus: every vertex (0x0001001f/2f) and fragment (0x0009051f/851f/011f) state record that points at a program not logged yet gets its first
++ * 0x100 bytes printed ("S8AGX: P <v|f> <va> +<start> <hex 32 B>", 8 lines per program), so the instruction forms of real clients can be decoded offline.
++ */
++void
++AGXDeviceUserClient::logPrograms(void)
++{
++	static uint64_t seen[400];
++	static int nseen;
++	static volatile SInt32 budget;
++
++	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
++		uint32_t r = fResShm[n - 1];
++
++		if (r == 0xffffffffu || r >= fShmemCount || fShmemBuf[r] == NULL) {
++			continue;
++		}
++		const uint32_t * d = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
++		uint64_t nd = fShmemBuf[r]->getLength() / 4;
++
++		for (uint64_t i = 0; i + 4 < nd; i++) {
++			bool vtx = (d[i] == 0x0001001fu || d[i] == 0x0001002fu) && d[i + 2] == 0x108u;
++			bool frg = (d[i] == 0x0009051fu || d[i] == 0x0009851fu || d[i] == 0x0009011fu) && (d[i + 2] == 0x108u || d[i + 3] == 0x108u);
++
++			if (!vtx && !frg) {
++				continue;
++			}
++			uint64_t va = 0x100000000ULL | (d[i + 1] & ~1u);
++			bool dup = false;
++
++			for (int k = 0; k < nseen; k++) {
++				if (seen[k] == (va | (vtx ? 1 : 0))) {
++					dup = true;
++					break;
++				}
++			}
++			if (dup || nseen >= 400 || OSAddAtomic(8, (SInt32 *)&budget) > 3200) {
++				continue;
++			}
++			seen[nseen++] = va | (vtx ? 1 : 0);
++			const uint8_t * base;
++			uint64_t off, len;
++
++			if (!findResRegion(va, &base, &off, &len)) {
++				continue;
++			}
++			unsigned start = vtx ? s8v_find_start(base, (unsigned)(len > 0xffffffffULL ? 0xffffffffU : len), (unsigned)off) : (unsigned)off;
++			unsigned from = start > 0x20 ? start - 0x20 : 0;       /* a little context before (the constant-setup run) */
++
++			for (unsigned o = from; o < from + 0x120 && o + 32 <= len; o += 32) {
++				char hex[65];
++
++				for (int k = 0; k < 32; k++) {
++					hex[k * 2] = "0123456789abcdef"[base[o + k] >> 4];
++					hex[k * 2 + 1] = "0123456789abcdef"[base[o + k] & 15];
++				}
++				hex[64] = 0;
++				IOLog("S8AGX: P %c 0x%llx entry %u start %u o %u %s\n", vtx ? 'v' : 'f', (unsigned long long)va, (unsigned)off, start, o, hex);
++			}
++		}
 +	}
 +}
 +
@@ -1118,6 +1183,8 @@ index 0000000..63b93da
 +			proc_selfname(xname, sizeof(xname));
 +			if (strncmp(xname, gExecName, strlen(gExecName)) == 0) {
 +				executePasses();        /* before the completion records: the caller reads the target once it sees them */
++			} else if (gProgName[0] != 0 && strncmp(xname, gProgName, strlen(gProgName)) == 0) {
++				logPrograms();          /* corpus of the shaders a real client (the compositor) submits */
 +			}
 +		}
 +		for (uint64_t i = 0; i < count; i++) {
@@ -1223,6 +1290,7 @@ index 0000000..63b93da
 +	}
 +	PE_parse_boot_argn("s8agxdump", gDumpName, sizeof(gDumpName));
 +	PE_parse_boot_argn("s8agxexec", gExecName, sizeof(gExecName));
++	PE_parse_boot_argn("s8agxprogs", gProgName, sizeof(gProgName));
 +	PE_parse_boot_argn("s8agxskip", &gSkip, sizeof(gSkip));
 +	for (int i = 0; i < 600 && (provider = IOService::getPlatform()) == NULL; i++) {
 +		IOSleep(100);
@@ -1245,10 +1313,10 @@ index 0000000..63b93da
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
 diff --git a/iokit/Kernel/arm/s8gfx_frag.h b/iokit/Kernel/arm/s8gfx_frag.h
 new file mode 100755
-index 0000000..f512123
+index 0000000..d34a141
 --- /dev/null
 +++ b/iokit/Kernel/arm/s8gfx_frag.h
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,207 @@
 +/*
 + * Fragment program interpreter for the A11 (G10) shader subset decoded so far (tools/agx-emu.py is its Python twin, validated on the render scenes).
 + * Integer-only (s8gfx_sf.h), no libc, so it builds into the kernel and into the host test (scratch/agx/frag_test.c).
@@ -1332,7 +1400,8 @@ index 0000000..f512123
 +			if (b[4] & 0x20) {
 +				s1 = s8f_src(c, b, 3, 0);
 +			} else {
-+				s1 = sf_minifloat((uint8_t)(b[3] | ((b[4] >> 6) << 6)));
++				/* 8-bit minifloat: bits 0-5 in byte 3, bits 6-7 in bits 4-5 of byte 5 (seen with 2.0 = 0x40 in the vertex col*2 shader) */
++				s1 = sf_minifloat((uint8_t)(b[3] | (((b[5] >> 4) & 3) << 6)));
 +			}
 +			if (b[4] & 0x02) {
 +				a = sf_neg(a);
