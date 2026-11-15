@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..8bda559
+index 0000000..760119d
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,374 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -148,6 +148,14 @@ index 0000000..8bda559
 +
 +	UInt32 fType;
 +	task_t fTask;
++	/* shared memory the kernel gave this client (selector 0xd): kernel buffer + its mapping in the client's task */
++	enum { kShmemMax = 64 };
++	IOBufferMemoryDescriptor * fShmemBuf[kShmemMax];
++	IOMemoryMap * fShmemMap[kShmemMax];
++	UInt32 fShmemCount;
++
++	IOReturn createShmem(IOExternalMethodArguments * args);
++	void releaseShmem(void);
 +
 +public:
 +	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
@@ -177,12 +185,76 @@ index 0000000..8bda559
 +	return true;
 +}
 +
++void
++AGXDeviceUserClient::releaseShmem(void)
++{
++	for (UInt32 i = 0; i < fShmemCount && i < kShmemMax; i++) {
++		if (fShmemMap[i] != NULL) {
++			fShmemMap[i]->release();
++			fShmemMap[i] = NULL;
++		}
++		if (fShmemBuf[i] != NULL) {
++			fShmemBuf[i]->release();
++			fShmemBuf[i] = NULL;
++		}
++	}
++	fShmemCount = 0;
++}
++
++/*
++ * Selector 13 (IOGPUDeviceCreateDeviceShmem in IOGPU): scalars { size, type }, 16 bytes out = { user address (u64), size (u32), id (u32) }.
++ * The kernel allocates zeroed memory and maps it into the calling task; userland keeps it for the device's lifetime.
++ */
++IOReturn
++AGXDeviceUserClient::createShmem(IOExternalMethodArguments * args)
++{
++	uint64_t size;
++	uint64_t type;
++	IOBufferMemoryDescriptor * buf;
++	IOMemoryMap * map;
++	uint8_t * out;
++
++	if (args->scalarInputCount < 2 || args->structureOutput == NULL || args->structureOutputSize < 16) {
++		return kIOReturnBadArgument;
++	}
++	size = args->scalarInput[0] & 0xffffffffULL;
++	type = args->scalarInput[1] & 0xffffffffULL;
++	if (size == 0 || size > (64ULL << 20) || fShmemCount >= kShmemMax) {
++		IOLog("S8AGX: shmem request refused: size 0x%llx type %llu (have %u)\n", size, type, (unsigned)fShmemCount);
++		return kIOReturnNoResources;
++	}
++	size = (size + 0x3fffULL) & ~0x3fffULL;
++	buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, (vm_size_t)size, 0x4000);
++	if (buf == NULL) {
++		return kIOReturnNoMemory;
++	}
++	bzero(buf->getBytesNoCopy(), (size_t)size);
++	map = buf->createMappingInTask(fTask, 0, kIOMapAnywhere);
++	if (map == NULL) {
++		buf->release();
++		IOLog("S8AGX: shmem mapping into the client failed (size 0x%llx type %llu)\n", size, type);
++		return kIOReturnVMError;
++	}
++	fShmemBuf[fShmemCount] = buf;
++	fShmemMap[fShmemCount] = map;
++	fShmemCount++;
++	out = (uint8_t *)args->structureOutput;
++	bzero(out, args->structureOutputSize);
++	*(uint64_t *)out = (uint64_t)map->getVirtualAddress();
++	*(uint32_t *)(out + 8) = (uint32_t)size;
++	*(uint32_t *)(out + 12) = fShmemCount;
++	IOLog("S8AGX: shmem #%u type %llu size 0x%llx -> user address 0x%llx\n", (unsigned)fShmemCount, type, size,
++	    (unsigned long long)map->getVirtualAddress());
++	return kIOReturnSuccess;
++}
++
 +IOReturn
 +AGXDeviceUserClient::clientClose(void)
 +{
 +	if (agx_log_ok()) {
 +		IOLog("S8AGX: user client closed, type %u\n", (unsigned)fType);
 +	}
++	releaseShmem();
 +	if (!isInactive()) {
 +		terminate();
 +	}
@@ -249,8 +321,23 @@ index 0000000..8bda559
 +			IOLog("S8AGX:    struct[%u] = %s\n", args->structureInputSize, hex);
 +		}
 +	}
++	if (selector == 0xd) {
++		return createShmem(args);
++	}
 +	if (args->scalarOutput != NULL) {
 +		bzero(args->scalarOutput, args->scalarOutputCount * sizeof(uint64_t));
++	}
++	if (selector == 0 && args->structureOutput != NULL && args->structureOutputSize >= 0x40) {
++		/*
++		 * IOGPU's device info (dev+0xa0 ..): [0x20] = shared memory size, [0x28] = largest single resource. Zeros here made Metal's
++		 * shared-memory pools fail before any kernel call. Values: 1.5 GiB shared, 1 GiB per resource (the S8 has 2 GiB for iOS).
++		 */
++		uint8_t * o = (uint8_t *)args->structureOutput;
++
++		bzero(o, args->structureOutputSize);
++		*(uint64_t *)(o + 0x20) = 0x60000000ULL;
++		*(uint64_t *)(o + 0x28) = 0x40000000ULL;
++		return kIOReturnSuccess;
 +	}
 +	if (args->structureOutput != NULL && args->structureOutputSize != 0) {
 +		bzero(args->structureOutput, args->structureOutputSize);
