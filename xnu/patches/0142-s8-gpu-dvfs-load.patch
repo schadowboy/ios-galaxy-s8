@@ -24,7 +24,7 @@ index 9b939f1..00e249d 100644
 +uint32_t
 +s8_gpu_cap_khz(void)
 +{
-+	static const int trip[3] = { 85, 95, 105 };
++	int trip[3] = { 85, 95, 105 }; { uint32_t b = 0; if (PE_parse_boot_argn("s8gputrip", &b, sizeof(b)) && b != 0) { trip[0] = (int)b; trip[1] = (int)b + 10; trip[2] = (int)b + 20; } } /* s8gputrip=<C>: test the cap at lower temperatures */
 +	static const uint32_t rate[4] = { 546000, 455000, 338000, 260000 };
 +	static int level;
 +	int t = s8_gpu_temp_c;
