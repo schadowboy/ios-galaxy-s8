@@ -1,8 +1,63 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 5bd24a7..51d7bb3 100644
+index 5bd24a7..89f127c 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -318,6 +318,24 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+@@ -22,6 +22,11 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #endif
+ 
+ extern "C" void sweet_secondary_entry(void);
++
++#if defined(DREAMLTE)
++/* Kernel mapping of the low page 0x8f000000 (entry trampoline + start.s breadcrumbs of every core at +0x100 + slot * 0x20). */
++static vm_offset_t sweet_tramp_va;
++#endif
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ #if defined(A5XELTE)
+ extern "C" void a5xelte_send_self_ipi(void);
+@@ -190,15 +195,34 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		}
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
+ 		nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
++		bool skipped = false;
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog(CPU_PORT_NAME " CPU: cpu=%u mpidr=0x%x NOT alive after 10s\n",
+ 				    i, topology->cpus[i].phys_id);
++#if defined(DREAMLTE)
++				if (topology->cpus[i].phys_id < 0x100 && sweet_tramp_va != 0) {
++					/*
++					 * A Mongoose core that does not come up must not stop the boot (a panic this early cannot be saved): report how
++					 * far it got (start.s breadcrumbs) and carry on without it, so the log survives and shows the reason.
++					 */
++					for (unsigned int s = 0; s < 8; s++) {
++						volatile uint64_t *c = (volatile uint64_t *)(sweet_tramp_va + 0x100 + s * 0x20);
++						IOLog(CPU_PORT_NAME " CPU: crumb slot %u stage %llu midr 0x%llx el 0x%llx\n", s, c[0], c[1], c[2]);
++					}
++					IOLog(CPU_PORT_NAME " CPU: cpu=%u (Mongoose) skipped, boot continues without it\n", i);
++					skipped = true;
++					break;
++				}
++#endif
+ 				panic(CPU_PORT_NAME " CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
+ 			}
+ 			IOSleep(1);
+ 		}
++		if (skipped) {
++			continue;
++		}
+ 		IOLog(CPU_PORT_NAME " CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
+ 	}
+@@ -308,6 +332,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		const uint64_t tramp_pa = 0x8f000000ULL;
+ 		if (tramp == 0) {
+ 			tramp = ml_io_map(tramp_pa, 0x1000);
++			sweet_tramp_va = tramp;
+ 		}
+ 		volatile uint32_t *t = (volatile uint32_t *)tramp;
+ 		t[0] = 0x58000041;              /* ldr x1, #8 */
+@@ -318,6 +343,24 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
  		IOLog(CPU_PORT_NAME " CPU: cpu=%u entry 0x%llx via low trampoline 0x%llx\n",
  		    getCPUNumber(), (uint64_t)entry, tramp_pa);
  		entry = (vm_offset_t)tramp_pa;
@@ -27,7 +82,7 @@ index 5bd24a7..51d7bb3 100644
  		static vm_offset_t pmu;
  		if (pmu == 0) {
  			pmu = ml_io_map(0x16480000, 0x10000);
-@@ -343,6 +361,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+@@ -343,6 +386,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
  		}
  		IOLog(CPU_PORT_NAME " CPU: cpu=%u first CPU_ON rc=%d, PMU power-up cfg=0x%x status=0x%x\n",
  		    getCPUNumber(), rc0, cfg[0], cfg[1]);
@@ -35,3 +90,65 @@ index 5bd24a7..51d7bb3 100644
  	}
  #endif
  	__builtin_arm_dsb(DSB_SY);
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 1606c91..0b54a55 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -42,6 +42,33 @@
+ 
+ 
+ 
++/*
++ * DREAMLTE breadcrumbs: a core on its way up writes {stage, MIDR_EL1, CurrentEL} into its own 0x20-byte slot of the low page
++ * 0x8f000100 + slot * 0x20 (slot = Aff0 | (Aff1 & 1) << 2: Mongoose 0..3, A53 4..7) while the MMU is still off, so the primary can say
++ * how far a core got when it never comes alive. Uses x16/x17 only. Stages: 1 sweet_secondary_entry, 2 EL1 entry, 3 before MMU enable.
++ */
++#if defined(DREAMLTE)
++.macro SWEET_CRUMB
++	mrs		x16, MPIDR_EL1
++	ubfx	x17, x16, #8, #1
++	and		x16, x16, #3
++	orr		x16, x16, x17, lsl #2
++	lsl		x16, x16, #5
++	MOV64	x17, 0x8f000100
++	add		x16, x16, x17
++	mov		x17, #$0
++	str		x17, [x16, #0]
++	mrs		x17, MIDR_EL1
++	str		x17, [x16, #8]
++	mrs		x17, CurrentEL
++	str		x17, [x16, #16]
++	dsb		sy
++.endmacro
++#else
++.macro SWEET_CRUMB
++.endmacro
++#endif
++
+ .macro MSR_VBAR_EL1_X0
+ #if defined(KERNEL_INTEGRITY_KTRR)
+ 	mov	x1, lr
+@@ -288,6 +315,7 @@ LEXT(bootstrap_instructions)
+ 	.align 2
+ 	.globl EXT(sweet_secondary_entry)
+ LEXT(sweet_secondary_entry)
++	SWEET_CRUMB 1
+ 	msr		DAIFSet, #0xf
+ 	mrs		x1, CurrentEL
+ 	cmp		x1, #0x4
+@@ -326,6 +354,7 @@ LEXT(sweet_secondary_entry)
+ Lsweet_secondary_bad_el:
+ 	b		.
+ Lsweet_secondary_el1:
++	SWEET_CRUMB 2
+ 	/* x0 is deliberately unused; reset_vector selects CPU data by MPIDR. */
+ 	msr		SPSel, #1
+ 	b		EXT(LowResetVectorBase)
+@@ -885,6 +914,7 @@ common_start:
+ 	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
+ #endif /* HAS_APPLE_PAC */
+ 
++	SWEET_CRUMB 3
+ 	// Enable caches, MMU, ROP and JOP
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
