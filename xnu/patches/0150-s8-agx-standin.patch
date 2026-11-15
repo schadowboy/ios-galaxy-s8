@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..1c31dc7
+index 0000000..8bda559
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,287 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -72,6 +72,10 @@ index 0000000..1c31dc7
 +
 +public:
 +	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	/* log which registry properties userland reads (and which of them are missing): that is what Metal sets itself up from */
++	virtual OSPtr<OSObject> copyProperty(const OSSymbol * aKey) const APPLE_KEXT_OVERRIDE;
++	virtual OSPtr<OSObject> copyProperty(const OSString * aKey) const APPLE_KEXT_OVERRIDE;
++	virtual OSPtr<OSObject> copyProperty(const char * aKey) const APPLE_KEXT_OVERRIDE;
 +};
 +
 +class AGXAcceleratorG10P_B0 : public AGXAccelerator
@@ -97,6 +101,43 @@ index 0000000..1c31dc7
 +	setName("AGXAcceleratorG10P_B0");
 +	registerService();
 +	return true;
++}
++
++static volatile SInt32 gAgxPropLogged;
++
++static void
++agx_log_property(const char * key, bool found)
++{
++	if (key != NULL && OSIncrementAtomic((SInt32 *)&gAgxPropLogged) < 300) {
++		IOLog("S8AGX: property '%s' %s\n", key, found ? "found" : "MISSING");
++	}
++}
++
++OSPtr<OSObject>
++AGXAccelerator::copyProperty(const OSSymbol * aKey) const
++{
++	OSPtr<OSObject> r = IOService::copyProperty(aKey);
++
++	agx_log_property(aKey ? aKey->getCStringNoCopy() : NULL, r != NULL);
++	return r;
++}
++
++OSPtr<OSObject>
++AGXAccelerator::copyProperty(const OSString * aKey) const
++{
++	OSPtr<OSObject> r = IOService::copyProperty(aKey);
++
++	agx_log_property(aKey ? aKey->getCStringNoCopy() : NULL, r != NULL);
++	return r;
++}
++
++OSPtr<OSObject>
++AGXAccelerator::copyProperty(const char * aKey) const
++{
++	OSPtr<OSObject> r = IOService::copyProperty(aKey);
++
++	agx_log_property(aKey, r != NULL);
++	return r;
 +}
 +
 +/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
