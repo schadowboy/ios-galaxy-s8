@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..c13071e
+index 0000000..cb9ff86
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,1186 @@
+@@ -0,0 +1,1196 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -649,6 +649,11 @@ index 0000000..c13071e
 +			vok[vid] = false;
 +			if (!s8f_run(&c, vbase + vstart, (unsigned)(vlen - vstart > 0x400 ? 0x400 : vlen - vstart)) || (c.expmask & 0xf) != 0xf) {
 +				unknownOp = c.unknown ? c.unknown : 0xff;
++				if (vid == 0 && OSIncrementAtomic((SInt32 *)&logged) < 400) {
++					IOLog("S8AGX: exec: vertex program at 0x%llx start +%u: exports 0x%x, fetch %08x %08x, program bytes %02x %02x %02x %02x %02x %02x %02x %02x\n",
++					    (unsigned long long)vtxVa, vstart, (unsigned)c.expmask, (unsigned)fetch[0], (unsigned)fetch[1], vbase[vstart], vbase[vstart + 1],
++					    vbase[vstart + 2], vbase[vstart + 3], vbase[vstart + 4], vbase[vstart + 5], vbase[vstart + 6], vbase[vstart + 7]);
++				}
 +				continue;
 +			}
 +			f32b iw = sf_div(SF_ONE, c.exp[3]);
@@ -801,6 +806,11 @@ index 0000000..c13071e
 +				uint32_t cc = agx_f32_unorm8(d[i + 14]) << 16 | agx_f32_unorm8(d[i + 15]) << 8 | agx_f32_unorm8(d[i + 16]) |
 +				    ((uint32_t)agx_f32_unorm8(d[i + 17]) << 24);      /* BGRA8: B = bits 0-7 */
 +				bool drawable = vtxVa != 0 && vbVa != 0 && ndraws > 0 && fragVa != 0;
++
++				if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
++					IOLog("S8AGX: exec: pass state: vertex 0x%llx buffer 0x%llx draws %d fragment 0x%llx viewport %08x %08x %08x %08x\n", (unsigned long long)vtxVa,
++					    (unsigned long long)vbVa, ndraws, (unsigned long long)fragVa, (unsigned)vp[0], (unsigned)vp[1], (unsigned)vp[2], (unsigned)vp[3]);
++				}
 +				uint32_t fill = (haveColor && !drawable) ? color : cc;
 +				uint8_t * t;
 +				uint64_t tavail;
