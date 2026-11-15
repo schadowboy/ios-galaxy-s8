@@ -810,6 +810,129 @@ void wifi_link(void (*kv)(const char *, uint64_t), void (*out)(const char *), vo
 	fl(flush);
 }
 
+/*
+ * mngsexp=7: what stock Linux does before its first big-core CPU_ON (analysis: scratch/bigcore/notes.md; ref s8kernel-tgp-p
+ * arch/arm64/kernel/smp.c:530-547, drivers/soc/samsung/exynos-cpumap.c:19-81): the CPUMAP SMC (x0 = -10, x1 = n) for every
+ * cpu, whose result is how EL3 hands out the MPIDRs. Then one plain CPU_ON for Mongoose core 0. Reads only plus those SMCs.
+ */
+#define SMC_CMD_CPUMAP	((uint64_t)(int64_t)-10)
+#define CHIPID_LOT	0x10000004UL
+#define GICD_BASE	0x10201000UL
+
+static void mexp7_lot_id(char out[6])
+{
+	uint32_t v = rd(CHIPID_LOT), r = 0;
+
+	for (unsigned i = 0; i < 32; i++)
+		r |= ((v >> i) & 1u) << (31 - i);
+	r = (r >> 11) & 0x1fffff;
+	for (int i = 4; i >= 1; i--) {
+		uint32_t m = r % 36;
+
+		r /= 36;
+		out[i] = (char)(m < 10 ? m + '0' : m - 10 + 'A');
+	}
+	out[0] = 'N';
+	out[5] = 0;
+}
+
+static void mexp7_snap(uint32_t *buf)	/* PMU INFORM0..15 */
+{
+	/* the INFORM registers at PMU+0x800 are not readable here (the read ended the boot in the first mngsexp=7 runs) */
+	for (unsigned i = 0; i < 16; i++)
+		buf[i] = 0;
+}
+
+static void mngs_exp7(void (*kv)(const char *, uint64_t), void (*out)(const char *), void (*flush)(void), unsigned mode)
+{
+	char lot[6];
+	uint32_t s0[16], s1[16];
+
+	out("MEXP7: begin\n");
+	kv("MEXP7: CHIPID+4 raw", rd(CHIPID_LOT));
+	mexp7_lot_id(lot);
+	out("MEXP7: lot id ");
+	out(lot);
+	out("\n");
+	kv("MEXP7: GICD_CTLR", rd(GICD_BASE + 0x000));
+	kv("MEXP7: GICD_TYPER", rd(GICD_BASE + 0x004));
+	kv("MEXP7: 0x1438 ECMU_CL0 SYS_PWR", rd(PMU + 0x1438));
+	kv("MEXP7: 0x1384 QCH_ECMU_CL0", rd(PMU + 0x1384));
+	kv("MEXP7: 0x13f8 CLKSTOP_OPEN_CL0", rd(PMU + 0x13f8));
+	kv("MEXP7: 0x14b8 CLKSTOP_CL0", rd(PMU + 0x14b8));
+	kv("MEXP7: 0x143c ECMU_CL1 SYS_PWR", rd(PMU + 0x143c));
+	kv("MEXP7: noncpu cfg 0x2400", rd(PMU + 0x2400));
+	kv("MEXP7: l2 cfg 0x2600", rd(PMU + 0x2600));
+	kv("MEXP7: cl1 noncpu st 0x2424", rd(PMU + 0x2424));
+	kv("MEXP7: cl1 l2 st 0x2624", rd(PMU + 0x2624));
+	fl(flush);
+
+	/* 1. the SMCs Linux issues before the first secondary CPU_ON (mode 8: only n < 4, mode 9: n <= 4 and stop) */
+	for (uint64_t n = 0; n < 8; n++) {
+		if (mode == 8 && n >= 4)
+			break;
+		if (mode == 9 && n > 4)
+			break;
+		out("MEXP7: CPUMAP call\n");
+		fl(flush);
+		int64_t h = smc3(SMC_CMD_CPUMAP, n, 0, 0);
+
+		kv("MEXP7: CPUMAP (n<<32|ret)", (n << 32) | (uint32_t)h);
+		fl(flush);
+	}
+	if (mode == 9) {
+		out("MEXP7: mode 9 stops after CPUMAP(4)\n");
+		fl(flush);
+		return;
+	}
+
+	/* 2. Mongoose core 0, plain CPU_ON as Linux / S-Boot do, then watch 300 ms */
+	for (unsigned i = 0; i < 16; i++)
+		smp_flags[i] = 0;
+	dc_civac_range(smp_entry3, 256);
+	dc_civac_range((const void *)smp_flags, 128);
+	mexp7_snap(s0);
+	out("MEXP7: calling CPU_ON(0x000)\n");
+	fl(flush);
+	int64_t rcm = smc3(PSCI_CPU_ON, 0x000, (uintptr_t)smp_entry3, 0);
+
+	mexp7_snap(s1);
+	kv("MEXP7: MNGS 0x000 CPU_ON rc", (uint64_t)rcm);
+	for (unsigned i = 0; i < 16; i++)
+		if (s0[i] != s1[i])
+			kv("MEXP7: INFORM changed (idx<<32|new)", ((uint64_t)i << 32) | s1[i]);
+	fl(flush);
+	kv("MEXP7: core0 st right after", rd(CPU_STAT(0)));
+	kv("MEXP7: seq st right after", rd(PMU + 0x2484));
+	kv("MEXP7: noncpu st right after", rd(PMU + 0x2404));
+	kv("MEXP7: l2 st right after", rd(PMU + 0x2604));
+	fl(flush);
+	int up = wait_flag_inv(0, 300);
+
+	kv("MONGOOSE STARTED", up);
+	fl(flush);
+	for (unsigned s = 8; s < 11; s++)
+		__asm__ volatile("dc ivac, %0; dsb sy" :: "r"(&smp_flags[s]) : "memory");
+	kv("MEXP7: MIDR_EL1", smp_flags[8]);
+	kv("MEXP7: CurrentEL", smp_flags[9]);
+	kv("MEXP7: MPIDR_EL1", smp_flags[10]);
+	kv("MEXP7: core0 st", rd(CPU_STAT(0)));
+	kv("MEXP7: seq st", rd(PMU + 0x2484));
+	kv("MEXP7: noncpu st", rd(PMU + 0x2404));
+	kv("MEXP7: l2 st", rd(PMU + 0x2604));
+	fl(flush);
+	/* a second CPU_ON: -4 (ALREADY_ON) or -5 (ON_PENDING) would prove EL3 tracked the first one */
+	kv("MEXP7: MNGS 2nd CPU_ON rc", (uint64_t)smc3(PSCI_CPU_ON, 0x000, (uintptr_t)smp_entry3, 0));
+	fl(flush);
+	kv("MEXP7: AFFINITY_INFO 0x000", (uint64_t)smc3(0xc4000004UL, 0x000, 0, 0));
+	kv("MEXP7: PSCI_VERSION", (uint64_t)smc3(0x84000000UL, 0, 0, 0));
+	fl(flush);
+	smp_flags[11] = 1;	/* release the stub if it ever ran */
+	__asm__ volatile("dc civac, %0; dsb sy" :: "r"(&smp_flags[11]) : "memory");
+	out("MEXP7: done\n");
+	fl(flush);
+}
+
 /* mode 0 = original behaviour; 2 = switch the CPUCL0 clock before CPU_ON; 3 = observable stub */
 void mngs_probe_x(void (*kv)(const char *, uint64_t), void (*out)(const char *),
 		  void (*flush)(void), unsigned mode)
@@ -817,6 +940,10 @@ void mngs_probe_x(void (*kv)(const char *, uint64_t), void (*out)(const char *),
 	const int obs = mode >= 3;	/* 3 and 4 both use the observable stub + cache clean */
 	const void *entry = obs ? (const void *)smp_entry3 : (const void *)smp_entry;
 	out("MNGS probe (Mongoose cluster 0)\n");
+	if (mode >= 7) {
+		mngs_exp7(kv, out, flush, mode);
+		return;
+	}
 	kv("seq st", rd(PMU + 0x2484));
 	kv("seq opt", rd(PMU + 0x2488));
 	kv("qch", rd(PMU + 0x3c24));

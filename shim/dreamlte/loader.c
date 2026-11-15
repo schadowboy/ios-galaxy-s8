@@ -512,7 +512,7 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 			continue;
 		for (int d = i + 8; d < BOOT_LINE_LENGTH && p->cmdline[d] >= '0' && p->cmdline[d] <= '9'; d++)
 			mexp = mexp * 10 + (uint32_t)(p->cmdline[d] - '0');
-		if (mexp > 6)
+		if (mexp > 9)
 			mexp = 0;
 		break;
 	}
