@@ -247,6 +247,66 @@ static void s8_boot_cpu_reset(void *opaque)
     }
 }
 
+/* ---------------------------------------------------------------------- *
+ * GICD shim.  The kernel (pe_fiq.c) runs as a non-secure GICv2 client: it
+ * sets IGROUPR0 bits 30/1 (group 1) and then enables the distributor and the
+ * CPU interface with CTLR = 1.  On the phone's GIC-400 those writes are
+ * non-secure views (IGROUPR is RAZ/WI, CTLR bit 0 = EnableGrp1).  QEMU's
+ * arm_gic without security extensions behaves as the secure view: the IGROUPR
+ * write really moves the timer PPI to group 1, but CTLR = 1 only enables
+ * group 0, so the interrupt is never signalled and the kernel idles forever
+ * with the timer pending.  The shim forwards everything to the real GICD
+ * region but makes IGROUPR (0x080-0x0ff) RAZ/WI, so every interrupt stays in
+ * group 0 and is delivered as IRQ (GICC_CTLR.FIQEn is never set).
+ * ---------------------------------------------------------------------- */
+typedef struct S8GicdShim {
+    MemoryRegion iomem;
+    MemoryRegion *gicd;
+} S8GicdShim;
+
+static MemTxResult s8_gicd_shim_read(void *opaque, hwaddr off, uint64_t *data,
+                                     unsigned size, MemTxAttrs attrs)
+{
+    S8GicdShim *sh = opaque;
+
+    if (off >= 0x080 && off < 0x100) {
+        *data = 0;
+        return MEMTX_OK;
+    }
+    return memory_region_dispatch_read(sh->gicd, off, data,
+                                       size_memop(size), attrs);
+}
+
+static MemTxResult s8_gicd_shim_write(void *opaque, hwaddr off, uint64_t val,
+                                      unsigned size, MemTxAttrs attrs)
+{
+    S8GicdShim *sh = opaque;
+
+    if (off >= 0x080 && off < 0x100) {
+        return MEMTX_OK;
+    }
+    return memory_region_dispatch_write(sh->gicd, off, val,
+                                        size_memop(size), attrs);
+}
+
+static const MemoryRegionOps s8_gicd_shim_ops = {
+    .read_with_attrs = s8_gicd_shim_read,
+    .write_with_attrs = s8_gicd_shim_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+static void s8_gicd_shim_create(MemoryRegion *gicd, hwaddr base)
+{
+    S8GicdShim *sh = g_new0(S8GicdShim, 1);
+
+    sh->gicd = gicd;
+    memory_region_init_io(&sh->iomem, NULL, &s8_gicd_shim_ops, sh,
+                          "s8.gicd-shim", 0x1000);
+    memory_region_add_subregion(get_system_memory(), base, &sh->iomem);
+}
+
 static void s8_init(MachineState *machine)
 {
     S8MachineState *s = S8_A5XELTE_MACHINE(machine);
@@ -315,7 +375,7 @@ static void s8_init(MachineState *machine)
     qdev_prop_set_bit(s->gic, "has-security-extensions", false);
     gicbusdev = SYS_BUS_DEVICE(s->gic);
     sysbus_realize_and_unref(gicbusdev, &error_fatal);
-    sysbus_mmio_map(gicbusdev, 0, S8_GICD_BASE);
+    s8_gicd_shim_create(sysbus_mmio_get_region(gicbusdev, 0), S8_GICD_BASE);
     sysbus_mmio_map(gicbusdev, 1, S8_GICC_BASE);
 
     for (i = 0; i < smp_cpus; i++) {
