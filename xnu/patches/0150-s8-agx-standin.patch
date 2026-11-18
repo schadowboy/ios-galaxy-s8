@@ -1364,10 +1364,10 @@ index 0000000..b5c91d8
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
 diff --git a/iokit/Kernel/arm/s8gfx_frag.h b/iokit/Kernel/arm/s8gfx_frag.h
 new file mode 100755
-index 0000000..e9c10b8
+index 0000000..4f56062
 --- /dev/null
 +++ b/iokit/Kernel/arm/s8gfx_frag.h
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,240 @@
 +/*
 + * Fragment program interpreter for the A11 (G10) shader subset decoded so far (tools/agx-emu.py is its Python twin, validated on the render scenes).
 + * Integer-only (s8gfx_sf.h), no libc, so it builds into the kernel and into the host test (scratch/agx/frag_test.c).
@@ -1476,7 +1476,11 @@ index 0000000..e9c10b8
 +			} else {
 +				s1 = sf_minifloat((uint8_t)(b[3] | ((b[4] >> 6) << 6)));
 +			}
-+			s2 = sf_minifloat(b[5]);
++			if (b[6] & 0x04) {
++				s2 = c->r[((b[5] & 0x3f) / 2) & (S8F_REGS - 1)];        /* third operand is a register (matrix rows, bias from a uniform) */
++			} else {
++				s2 = sf_minifloat(b[5]);
++			}
 +			if (b[7] & 0x80) {
 +				s2 = sf_neg(s2);
 +			}
