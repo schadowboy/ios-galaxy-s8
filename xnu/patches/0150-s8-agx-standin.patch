@@ -1387,10 +1387,10 @@ index 0000000..0cc93fa
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
 diff --git a/iokit/Kernel/arm/s8gfx_frag.h b/iokit/Kernel/arm/s8gfx_frag.h
 new file mode 100755
-index 0000000..b6d97a1
+index 0000000..a8200ee
 --- /dev/null
 +++ b/iokit/Kernel/arm/s8gfx_frag.h
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,275 @@
 +/*
 + * Fragment program interpreter for the A11 (G10) shader subset decoded so far (tools/agx-emu.py is its Python twin, validated on the render scenes).
 + * Integer-only (s8gfx_sf.h), no libc, so it builds into the kernel and into the host test (scratch/agx/frag_test.c).
@@ -1470,9 +1470,9 @@ index 0000000..b6d97a1
 +
 +			for (int k = 0; k < nch; k++) {
 +				if (b[1] & 2) {
-+					c->r[(dreg / 2 + k) & (S8F_REGS - 1)] = c->varying[k];
++					c->r[(dreg / 2 + k) & (S8F_REGS - 1)] = c->varying ? c->varying[k] : 0;
 +				} else {
-+					c->h[(dreg + k) & (S8F_REGS * 2 - 1)] = c->varying[k];
++					c->h[(dreg + k) & (S8F_REGS * 2 - 1)] = c->varying ? c->varying[k] : 0;
 +				}
 +			}
 +			pc += 8;
@@ -1649,7 +1649,7 @@ index 0000000..b6d97a1
 +	 * (an earlier shader's own end instruction stops a run before the pointer, so it cannot be mistaken for this one) */
 +	for (q = off >= 0x20 ? off - 0x20 : 0; q <= off; q++) {
 +		struct s8f_ctx c;
-+		f32b zero[4] = { 0, 0, 0, 0 };
++		f32b zero[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 +		unsigned i;
 +
 +		for (i = 0; i < sizeof(c); i++) {
@@ -1657,6 +1657,7 @@ index 0000000..b6d97a1
 +		}
 +		c.fetch = zero;
 +		c.nfetch = 4;
++		c.varying = zero;               /* a candidate that starts on an interpolation instruction must not read a null array */
 +		if (s8f_run(&c, m + q, len - q) && (c.expmask & 0xf) == 0xf && q + c.pc_end > off) {
 +			return q;
 +		}
