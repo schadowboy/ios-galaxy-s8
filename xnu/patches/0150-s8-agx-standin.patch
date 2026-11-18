@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..3a977e3
+index 0000000..0cc93fa
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,1363 @@
+@@ -0,0 +1,1381 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -198,6 +198,7 @@ index 0000000..3a977e3
 +	void executePasses(void);
 +	bool findResMem(uint64_t va, uint8_t ** mem, uint64_t * avail);
 +	bool findResRegion(uint64_t va, const uint8_t ** base, uint64_t * off, uint64_t * len);
++	uint32_t progHash(uint64_t va);
 +	void logPrograms(void);
 +	static uint32_t agxRd(void * ctx, uint64_t va);
 +	void executeDraws(uint32_t * target, uint64_t npx, uint64_t vtxVa, uint64_t vbVa, const uint32_t * vp, uint64_t fragVa, const uint32_t * dr, int ndraws,
@@ -567,6 +568,23 @@ index 0000000..3a977e3
 +	return false;
 +}
 +
++/* FNV-1a over the first 0x80 bytes at a program address: the compiler reuses addresses, so a changed program at the same pointer must still count as changed */
++uint32_t
++AGXDeviceUserClient::progHash(uint64_t va)
++{
++	const uint8_t * base;
++	uint64_t off, len;
++	uint32_t h = 2166136261u;
++
++	if (!findResRegion(va, &base, &off, &len)) {
++		return 0;
++	}
++	for (uint64_t k = 0; k < 0x80 && off + k < len; k++) {
++		h = (h ^ base[off + k]) * 16777619u;
++	}
++	return h;
++}
++
 +/*
 + * Old state records stay in memory after a pipeline change, so "the last one in memory" is often stale. Remember what every record slot held at the
 + * previous scan: a slot whose program pointer changed is the pipeline the caller just set; with no change the previous choice stays.
@@ -844,7 +862,7 @@ index 0000000..3a977e3
 +		uint64_t nd = fShmemBuf[r]->getLength() / 4;
 +
 +		for (uint64_t i = 1; i + 10 < nd; i++) {
-+			if ((d[i] == 0x0001001fu || d[i] == 0x0001002fu) && d[i + 2] == 0x108u && agx_rec_changed(n, i, 1, d[i + 1]) && (0x100000000ULL | (d[i + 1] & ~1u)) > vtxVa) {
++			if ((d[i] == 0x0001001fu || d[i] == 0x0001002fu) && d[i + 2] == 0x108u && agx_rec_changed(n, i, 1, d[i + 1] ^ progHash(0x100000000ULL | (d[i + 1] & ~1u))) && (0x100000000ULL | (d[i + 1] & ~1u)) > vtxVa) {
 +				/* among the records that changed, the newest pipeline is the one compiled last = the highest program address */
 +				vtxVa = 0x100000000ULL | (d[i + 1] & ~1u);
 +				vtxRes = n;
@@ -878,7 +896,7 @@ index 0000000..3a977e3
 +
 +		for (uint64_t i = 0; i + 4 < nd; i++) {
 +			if ((d[i] == 0x0009051fu || d[i] == 0x0009851fu || d[i] == 0x0009052fu || d[i] == 0x0009852fu || d[i] == 0x0009055fu || d[i] == 0x0009012fu) &&
-+			    (d[i + 2] == 0x108u || d[i + 3] == 0x108u) && agx_rec_changed(n, i, 2, d[i + 1]) &&
++			    (d[i + 2] == 0x108u || d[i + 3] == 0x108u) && agx_rec_changed(n, i, 2, d[i + 1] ^ progHash(0x100000000ULL | (d[i + 1] & ~1u))) &&
 +			    (0x100000000ULL | (d[i + 1] & ~1u)) > fragVa) {
 +				fragVa = 0x100000000ULL | (d[i + 1] & ~1u);
 +			}
