@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..b5c91d8
+index 0000000..66c42fa
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,1358 @@
+@@ -0,0 +1,1360 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -617,6 +617,8 @@ index 0000000..b5c91d8
 +
 +	bzero(&fc, sizeof(fc));
 +	fc.varying = v;
++	fc.tile = dc->target[py * dc->w + px];          /* ld_tile reads the destination pixel (blending) */
++	fc.has_tile = 1;
 +	if (s8f_run(&fc, dc->frag, dc->fraglen) && fc.stored) {
 +		dc->target[py * dc->w + px] = (uint32_t)sf_to_unorm8(fc.out[2]) | ((uint32_t)sf_to_unorm8(fc.out[1]) << 8) |
 +		    ((uint32_t)sf_to_unorm8(fc.out[0]) << 16) | ((uint32_t)sf_to_unorm8(fc.out[3]) << 24);
@@ -1364,10 +1366,10 @@ index 0000000..b5c91d8
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
 diff --git a/iokit/Kernel/arm/s8gfx_frag.h b/iokit/Kernel/arm/s8gfx_frag.h
 new file mode 100755
-index 0000000..4f56062
+index 0000000..6d39a2a
 --- /dev/null
 +++ b/iokit/Kernel/arm/s8gfx_frag.h
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,255 @@
 +/*
 + * Fragment program interpreter for the A11 (G10) shader subset decoded so far (tools/agx-emu.py is its Python twin, validated on the render scenes).
 + * Integer-only (s8gfx_sf.h), no libc, so it builds into the kernel and into the host test (scratch/agx/frag_test.c).
@@ -1406,6 +1408,9 @@ index 0000000..4f56062
 +	void * rdctx;
 +	uint32_t vid;
 +	uint32_t stride;
++	/* fragment blending: the destination pixel as stored (BGRA8, little endian word) for ld_tile; has_tile = 0 leaves registers alone */
++	uint32_t tile;
++	int has_tile;
 +};
 +
 +static inline f32b
@@ -1503,6 +1508,18 @@ index 0000000..4f56062
 +			c->out[2] = c->r[2];
 +			c->out[3] = c->r[3];
 +			c->stored = 1;
++			pc += 8;
++		} else if (op == 0x79 && pc + 8 <= len && c->has_tile) {
++			/* ld_tile (8 B): 79 02 00 00 00 00 fa ff loads the destination pixel into r0..r3 = R, G, B, A as floats (BGRA8 target); the compositor's blend
++			 * shaders use four of these with other flag bytes, which are not decoded yet (they leave the registers unchanged here) */
++			if (b[6] == 0xfa && b[7] == 0xff) {
++				f32b k = 0x437f0000u;                          /* 255.0f */
++
++				c->r[0] = sf_div(sf_from_i64((c->tile >> 16) & 0xff), k);
++				c->r[1] = sf_div(sf_from_i64((c->tile >> 8) & 0xff), k);
++				c->r[2] = sf_div(sf_from_i64(c->tile & 0xff), k);
++				c->r[3] = sf_div(sf_from_i64((c->tile >> 24) & 0xff), k);
++			}
 +			pc += 8;
 +		} else if (op == 0x01 || op == 0x81) {                  /* export (vertex stage): 01 <8*reg+1> <slot> 80 */
 +			unsigned slot = b[2];
