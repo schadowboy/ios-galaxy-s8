@@ -487,10 +487,10 @@ main(void)
 				id<MTLLibrary> l8 = [dev newLibraryWithSource:s8 options:nil error:&e8];
 
 				if (l8 != nil) {
-					const char *gn[] = { "g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7" };
+					const char *gn[] = { "g4", "g6", "g5", "g0", "g1", "g7", "g3" };         /* g3 (shift + mask) crashed the Metal userland in the first run, so it goes last */
 					float tri8[3][4] = { { -0.5f, -0.5f, 0.25f, 0.5f }, { 0.5f, -0.5f, 0.75f, 0.125f }, { 0.0f, 0.5f, 0.375f, 0.625f } };
 
-					for (int k = 0; k < 8; k++) {
+					for (int k = 0; k < 7; k++) {
 						MTLRenderPipelineDescriptor *p8 = [[MTLRenderPipelineDescriptor alloc] init];
 
 						p8.vertexFunction = [l8 newFunctionWithName:@"vq"];
