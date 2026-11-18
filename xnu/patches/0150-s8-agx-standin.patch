@@ -1,6 +1,6 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..66c42fa
+index 0000000..7f79341
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
 @@ -0,0 +1,1360 @@
@@ -678,7 +678,7 @@ index 0000000..66c42fa
 +					break;
 +				}
 +			}
-+			if (dup || nseen >= 400 || OSAddAtomic(8, (SInt32 *)&budget) > 3200) {
++			if (dup || nseen >= 400 || OSAddAtomic(24, (SInt32 *)&budget) > 12000) {
 +				continue;
 +			}
 +			seen[nseen++] = va | (vtx ? 1 : 0);
@@ -691,7 +691,7 @@ index 0000000..66c42fa
 +			unsigned start = vtx ? s8v_find_start(base, (unsigned)(len > 0xffffffffULL ? 0xffffffffU : len), (unsigned)off) : (unsigned)off;
 +			unsigned from = start > 0x20 ? start - 0x20 : 0;       /* a little context before (the constant-setup run) */
 +
-+			for (unsigned o = from; o < from + 0x120 && o + 32 <= len; o += 32) {
++			for (unsigned o = from; o < from + 0x300 && o + 32 <= len; o += 32) {
 +				char hex[65];
 +
 +				for (int k = 0; k < 32; k++) {
@@ -1366,10 +1366,10 @@ index 0000000..66c42fa
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
 diff --git a/iokit/Kernel/arm/s8gfx_frag.h b/iokit/Kernel/arm/s8gfx_frag.h
 new file mode 100755
-index 0000000..6d39a2a
+index 0000000..2c59379
 --- /dev/null
 +++ b/iokit/Kernel/arm/s8gfx_frag.h
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,257 @@
 +/*
 + * Fragment program interpreter for the A11 (G10) shader subset decoded so far (tools/agx-emu.py is its Python twin, validated on the render scenes).
 + * Integer-only (s8gfx_sf.h), no libc, so it builds into the kernel and into the host test (scratch/agx/frag_test.c).
@@ -1401,6 +1401,7 @@ index 0000000..6d39a2a
 +	uint32_t expmask;
 +	int nfetch;
 +	unsigned pc_end;                /* byte offset just past the end instruction of the last successful run */
++	unsigned pc_fail;               /* byte offset of the instruction the interpreter did not know */
 +	/* vertex stage with the uniform file: uni[] is indexed by 16-bit half index (even indices hold the 32-bit words), pushed by the uniform-push records;
 +	 * rd reads a 32-bit word at a GPU virtual address (vertex attribute fetch); vid and stride address the vertex */
 +	uint32_t uni[128];
@@ -1567,6 +1568,7 @@ index 0000000..6d39a2a
 +			return c->stored || c->expmask != 0;
 +		} else {
 +			c->unknown = op;
++			c->pc_fail = pc;
 +			return 0;
 +		}
 +	}
