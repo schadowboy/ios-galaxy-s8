@@ -467,6 +467,65 @@ main(void)
 					}
 				}
 			}
+			/*
+			 * Round 8: fragment programs with packed-byte and integer paths, to decode the forms the compositor's blend shaders use
+			 * (framebuffer fetch [[color(0)]], pack / unpack, integer multiply-add, bit operations, half math).
+			 */
+			{
+				NSError *e8 = nil;
+				NSString *s8 = @"#include <metal_stdlib>\nusing namespace metal;\n"
+				    "struct V { float4 pos [[position]]; float4 col; };\n"
+				    "vertex V vq(uint vid [[vertex_id]], constant float4 *vb [[buffer(0)]]) { V o; o.pos = float4(vb[vid].xy, 0.0, 1.0); o.col = float4(vb[vid].zw, 0.25, 1.0); return o; }\n"
+				    "fragment float4 g0(V in [[stage_in]], float4 dst [[color(0)]]) { return dst * 0.5 + in.col * 0.5; }\n"
+				    "fragment float4 g1(V in [[stage_in]], float4 dst [[color(0)]]) { return float4(dst.rgb * (1.0 - in.col.a) + in.col.rgb * in.col.a, 1.0); }\n"
+				    "fragment float4 g2(V in [[stage_in]]) { uint p = pack_float_to_unorm4x8(in.col); return unpack_unorm4x8_to_float(p); }\n"
+				    "fragment float4 g3(V in [[stage_in]]) { uint p = pack_float_to_unorm4x8(in.col); uint q = (p >> 1) & 0x7f7f7f7fu; return unpack_unorm4x8_to_float(q); }\n"
+				    "fragment float4 g4(V in [[stage_in]]) { uint a = uint(in.col.x * 255.0); uint b = a * 3u + 7u; return float4(float(b) / 1024.0, float(a) / 255.0, 0.0, 1.0); }\n"
+				    "fragment float4 g5(V in [[stage_in]]) { uint p = pack_float_to_unorm4x8(in.col); uint q = p ^ 0xff00ff00u; return unpack_unorm4x8_to_float(q); }\n"
+				    "fragment float4 g6(V in [[stage_in]]) { half4 h = half4(in.col) * 0.5h + 0.25h; return float4(h); }\n"
+				    "fragment float4 g7(V in [[stage_in]], float4 dst [[color(0)]]) { uint p = pack_float_to_unorm4x8(dst); uint q = (p & 0x00ff00ffu) | 0x80000000u; return unpack_unorm4x8_to_float(q) * in.col; }\n";
+				id<MTLLibrary> l8 = [dev newLibraryWithSource:s8 options:nil error:&e8];
+
+				if (l8 != nil) {
+					const char *gn[] = { "g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7" };
+					float tri8[3][4] = { { -0.5f, -0.5f, 0.25f, 0.5f }, { 0.5f, -0.5f, 0.75f, 0.125f }, { 0.0f, 0.5f, 0.375f, 0.625f } };
+
+					for (int k = 0; k < 8; k++) {
+						MTLRenderPipelineDescriptor *p8 = [[MTLRenderPipelineDescriptor alloc] init];
+
+						p8.vertexFunction = [l8 newFunctionWithName:@"vq"];
+						p8.fragmentFunction = [l8 newFunctionWithName:[NSString stringWithUTF8String:gn[k]]];
+						p8.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+						id<MTLRenderPipelineState> ps8 = [dev newRenderPipelineStateWithDescriptor:p8 error:&e8];
+
+						if (ps8 == nil) {
+							LOG("S8MTL: round 8 pipeline %s failed: %s\n", gn[k], e8 ? [[e8 description] UTF8String] : "?");
+							continue;
+						}
+						MTLRenderPassDescriptor *rp8 = [MTLRenderPassDescriptor renderPassDescriptor];
+
+						rp8.colorAttachments[0].texture = tex;
+						rp8.colorAttachments[0].loadAction = MTLLoadActionClear;
+						rp8.colorAttachments[0].storeAction = MTLStoreActionStore;
+						rp8.colorAttachments[0].clearColor = MTLClearColorMake(0.5, 0.25, 0.75, 1);
+						id<MTLCommandBuffer> cb8 = [q commandBuffer];
+						id<MTLRenderCommandEncoder> en8 = [cb8 renderCommandEncoderWithDescriptor:rp8];
+
+						LOG("S8MTL: ==== fragment scene %s\n", gn[k]);
+						[en8 setRenderPipelineState:ps8];
+						[en8 setVertexBytes:tri8 length:sizeof(tri8) atIndex:0];
+						[en8 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+						[en8 endEncoding];
+						[cb8 commit];
+						for (int w = 0; w < 5 && [cb8 status] < MTLCommandBufferStatusCompleted; w++) {
+							sleep(1);
+						}
+						LOG("S8MTL: fragment scene %s status %ld\n", gn[k], (long)[cb8 status]);
+					}
+				} else {
+					LOG("S8MTL: round 8 library failed: %s\n", e8 ? [[e8 description] UTF8String] : "?");
+				}
+			}
 			}
 		}
 		struct fam { const char *src; int gx, gy, tx, ty; } fams[] = {
