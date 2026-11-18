@@ -1,6 +1,6 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..0cc93fa
+index 0000000..2be8942
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
 @@ -0,0 +1,1381 @@
@@ -568,7 +568,7 @@ index 0000000..0cc93fa
 +	return false;
 +}
 +
-+/* FNV-1a over the first 0x80 bytes at a program address: the compiler reuses addresses, so a changed program at the same pointer must still count as changed */
++/* FNV-1a over the first 0x10 bytes at a program address: the compiler reuses addresses, so a changed program at the same pointer must still count as changed */
 +uint32_t
 +AGXDeviceUserClient::progHash(uint64_t va)
 +{
@@ -579,7 +579,7 @@ index 0000000..0cc93fa
 +	if (!findResRegion(va, &base, &off, &len)) {
 +		return 0;
 +	}
-+	for (uint64_t k = 0; k < 0x80 && off + k < len; k++) {
++	for (uint64_t k = 0; k < 0x10 && off + k < len; k++) {   /* only the first bytes: programs are packed back to back, a longer window reads the neighbours */
 +		h = (h ^ base[off + k]) * 16777619u;
 +	}
 +	return h;
