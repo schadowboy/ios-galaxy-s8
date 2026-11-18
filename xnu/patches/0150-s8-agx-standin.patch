@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..6885a50
+index 0000000..3a977e3
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,1361 @@
+@@ -0,0 +1,1363 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -844,7 +844,8 @@ index 0000000..6885a50
 +		uint64_t nd = fShmemBuf[r]->getLength() / 4;
 +
 +		for (uint64_t i = 1; i + 10 < nd; i++) {
-+			if ((d[i] == 0x0001001fu || d[i] == 0x0001002fu) && d[i + 2] == 0x108u && agx_rec_changed(n, i, 1, d[i + 1])) {
++			if ((d[i] == 0x0001001fu || d[i] == 0x0001002fu) && d[i + 2] == 0x108u && agx_rec_changed(n, i, 1, d[i + 1]) && (0x100000000ULL | (d[i + 1] & ~1u)) > vtxVa) {
++				/* among the records that changed, the newest pipeline is the one compiled last = the highest program address */
 +				vtxVa = 0x100000000ULL | (d[i + 1] & ~1u);
 +				vtxRes = n;
 +				vtxIdx = i;
@@ -877,7 +878,8 @@ index 0000000..6885a50
 +
 +		for (uint64_t i = 0; i + 4 < nd; i++) {
 +			if ((d[i] == 0x0009051fu || d[i] == 0x0009851fu || d[i] == 0x0009052fu || d[i] == 0x0009852fu || d[i] == 0x0009055fu || d[i] == 0x0009012fu) &&
-+			    (d[i + 2] == 0x108u || d[i + 3] == 0x108u) && agx_rec_changed(n, i, 2, d[i + 1])) {
++			    (d[i + 2] == 0x108u || d[i + 3] == 0x108u) && agx_rec_changed(n, i, 2, d[i + 1]) &&
++			    (0x100000000ULL | (d[i + 1] & ~1u)) > fragVa) {
 +				fragVa = 0x100000000ULL | (d[i + 1] & ~1u);
 +			}
 +		}
