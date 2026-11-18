@@ -39,7 +39,13 @@ jobs:
           mkdir -p "$RUNNER_TEMP/ldid"
           # Procursus ldid; asset name by host arch
           if [ "$(uname -m)" = arm64 ]; then PAT='ldid_macosx_arm64'; else PAT='ldid_macosx_x86_64'; fi
-          gh release download -R ProcursusTeam/ldid --pattern "$PAT" -D "$RUNNER_TEMP/ldid" --clobber
+          if command -v gh >/dev/null 2>&1; then
+            gh release download -R ProcursusTeam/ldid --pattern "$PAT" -D "$RUNNER_TEMP/ldid" --clobber
+          else
+            # self-hosted Mac without the GitHub CLI: resolve the asset URL through the public API
+            URL=$(curl -fsSL https://api.github.com/repos/ProcursusTeam/ldid/releases/latest | grep browser_download_url | grep "/$PAT\"" | head -1 | cut -d'"' -f4)
+            curl -fsSL -o "$RUNNER_TEMP/ldid/$PAT" "$URL"
+          fi
           mv "$RUNNER_TEMP/ldid/$PAT" "$RUNNER_TEMP/ldid/ldid"
           chmod +x "$RUNNER_TEMP/ldid/ldid"
           "$RUNNER_TEMP/ldid/ldid" 2>&1 | head -3 || true
