@@ -60,6 +60,9 @@ struct s8f_ctx {
 	uint32_t (*trd)(void * ctx, uint64_t va);
 	void * trdctx;
 	unsigned ntex_missing;
+	int sel_pending;                /* the 4-byte compare-select pair 1e/23 (vertex-id strips): condition seen, waiting for the values */
+	int sel_c;
+	unsigned sel_d;
 	unsigned fn_missing;            /* unary function ops (0x0a) whose function has no implementation (passed through) */
 	unsigned last_iter;             /* half index of the destination of the last iter: the coordinates a texture_sample reads (ASSUMED) */
 	uint32_t hit[256];              /* executed instructions by opcode (coverage runner) */
@@ -153,7 +156,7 @@ s8f_len(const uint8_t * b, unsigned avail)
 	if (op == 0x79 || op == 0x09 || op == 0x89 || op == 0xc6 || op == 0xca || op == 0x31) {
 		return 8;
 	}
-	if (op == 0xf9 || op == 0xf6 || op == 0x76 || op == 0xfa || op == 0x7a) {
+	if (op == 0xf9 || op == 0xf6 || op == 0x76 || op == 0xfa || op == 0x7a || op == 0x1a || op == 0x5a) {      /* 1a/5a: `1a 31 c0 c0 24 c0 c0 00` 8 B with the operand pair repeated (blur programs) */
 		return 8;                       /* f9 = ld_tile (second family), f6/76 = f16 three-source ALU, fa/7a = f16 ALU: 8 bytes (every program walk that contains them lands on the entry/end) */
 	}
 	if (op == 0x75) {
@@ -874,7 +877,7 @@ s8f_run(struct s8f_ctx * c, const uint8_t * p, unsigned len)
 				c->expmask |= 1u << (slot - 0x40);
 			}
 			pc += 4;
-		} else if (c->rd != 0 && (op == 0xc2 || op == 0x42) && pc + 4 <= len && b[3] == 0x00) {
+		} else if (c->rd != 0 && (op == 0xc2 || op == 0x42) && pc + 4 <= len) {          /* b3 = 0x04 occurs in the compositor strips (`c2 02 00 04`): same copy */
 			/* c2 dst src 00: copy the 32-bit uniform at half index src into the register at half index dst */
 			c->r[(b[1] / 2) & (S8F_REGS - 1)] = c->uni[b[2] & 127];
 			pc += 4;
@@ -948,11 +951,22 @@ s8f_run(struct s8f_ctx * c, const uint8_t * p, unsigned len)
 			pc += 20;
 		} else if (op == 0xc2 && pc + 4 <= len && b[3] == 0x00) {
 			pc += 4;                                        /* c2 xx yy 00: filler / register-copy form seen around the prologue; treated as a no-op for now */
-		} else if ((op == 0x1e || op == 0x20 || op == 0x23 || op == 0x26 || op == 0x12 || op == 0x16) && s8f_len(b, len - pc) != 0 && s8f_len(b, len - pc) <= len - pc) {
+		} else if ((op == 0x1e || op == 0x20 || op == 0x23 || op == 0x26 || op == 0x16 || op == 0xde) && s8f_len(b, len - pc) != 0 && s8f_len(b, len - pc) <= len - pc) {
 			/* imadd with a literal (`1e .. 60 00` + `20 c0 <imm32>`): the vertex address multiply, stride = the literal (ASSUMED: the literal is the byte stride of
 			 * the attribute stream); the 4-byte 1e/23 pair and the 6-byte `20` literal word are skipped (ASSUMED no-ops for the position math) */
 			unsigned n = s8f_len(b, len - pc);
 
+			if (op == 0x1e && n == 4) {
+				/* `1e D C 00` + `23 X Y 00`: compact integer compare-select of the vertex-id strip programs (after `7e .. 83 00` = vid & 1, vid & 2):
+				 * r[D >> 3] = (r[C] != 0) ? r[X] : r[Y]. The vertex data are the rect (x0, y0, x1, y1) in r0..r3 (device_load of 4 floats), so this selects x1/x0 and y1/y0 per corner.
+				 * ASSUMED field roles (the pair is a 2-instruction select: condition in the first, the two values in the second), verified on the capture21 strips (4 corners of the rect) */
+				c->sel_pending = 1;
+				c->sel_d = (b[1] >> 3) & (S8F_REGS - 1);
+				c->sel_c = c->r[((b[2] & 0x3f) >> 1) & (S8F_REGS - 1)] != 0;
+			} else if (op == 0x23 && c->sel_pending) {
+				c->r[c->sel_d] = c->sel_c ? c->r[((b[1] & 0x3f) >> 1) & (S8F_REGS - 1)] : c->r[((b[2] & 0x3f) >> 1) & (S8F_REGS - 1)];
+				c->sel_pending = 0;
+			}
 			if (op == 0x1e && n == 6 && pc + 12 <= len && b[6] == 0x20 && b[7] == 0xc0 && c->rd != 0) {
 				c->stride = (uint32_t)b[8] | ((uint32_t)b[9] << 8) | ((uint32_t)b[10] << 16) | ((uint32_t)b[11] << 24);
 			}
@@ -961,6 +975,9 @@ s8f_run(struct s8f_ctx * c, const uint8_t * p, unsigned len)
 		} else if (op == 0x08 && pc + 4 <= len && b[1] == 0x01) {
 			c->pc_end = pc + 4;
 			return c->stored || c->expmask != 0;
+		} else if ((op == 0x7e || op == 0xbe || op == 0x6e || op == 0x2e || op == 0x82 || op == 0x92 || op == 0x12 || op == 0x7a || op == 0xfa || op == 0x1a || op == 0x5a || op == 0x0a) && (c->rd != 0 || c->fetch != 0) && s8f_step_frag(c, b, len - pc) != 0) {
+			/* integer glue of the vertex-id programs (bitop vid & 1, bfeil, convert): the same forms as in fragment programs */
+			pc += s8f_len(b, len - pc);
 		} else {
 			c->unknown = op;
 			c->pc_fail = pc;
@@ -1076,6 +1093,14 @@ s8f_start_image(const uint8_t * m, unsigned len, unsigned block, unsigned entry,
  * (c2 00 00 00) and the contiguous run of mov_imm (52 .. 6 bytes) before it. Without a prologue the entry is used as is.
  * m = memory of the region, len = its length, off = pointer offset in it; returns the start offset.
  */
+static inline uint32_t
+s8f_rd_zero(void * ctx, uint64_t va)
+{
+	(void)ctx;
+	(void)va;
+	return 0;
+}
+
 static inline unsigned
 s8v_find_start(const uint8_t * m, unsigned len, unsigned off)
 {
@@ -1104,19 +1129,27 @@ s8v_find_start(const uint8_t * m, unsigned len, unsigned off)
 	}
 	/* no fetch prologue: the earliest start in [off-0x20, off] whose run completes with a position export and reaches past the entry pointer
 	 * (an earlier shader's own end instruction stops a run before the pointer, so it cannot be mistaken for this one) */
-	for (q = off >= 0x20 ? off - 0x20 : 0; q <= off; q++) {
+	for (q = off >= 0x60 ? off - 0x60 : 0; q <= off; q++) {          /* 0x60 (was 0x20): the vid-driven strips enter 0x2c bytes after their first instruction */
 		struct s8f_ctx c;
 		f32b zero[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 		unsigned i;
+		int mode;
 
-		for (i = 0; i < sizeof(c); i++) {
-			((uint8_t *)&c)[i] = 0;
-		}
-		c.fetch = zero;
-		c.nfetch = 4;
-		c.varying = zero;               /* a candidate that starts on an interpolation instruction must not read a null array */
-		if (s8f_run(&c, m + q, len - q) && (c.expmask & 0xf) == 0xf && q + c.pc_end > off) {
-			return q;
+		for (mode = 0; mode < 2; mode++) {      /* 0: fetch mode (test-app programs), 1: the uniform/device-load mode of the compositor's programs (8e imadd + device_load) */
+			for (i = 0; i < sizeof(c); i++) {
+				((uint8_t *)&c)[i] = 0;
+			}
+			c.varying = zero;               /* a candidate that starts on an interpolation instruction must not read a null array */
+			if (mode == 0) {
+				c.fetch = zero;
+				c.nfetch = 4;
+			} else {
+				c.rd = s8f_rd_zero;
+				c.stride = 16;
+			}
+			if (s8f_run(&c, m + q, len - q) && (c.expmask & 0xf) == 0xf && q + c.pc_end > off) {
+				return q;
+			}
 		}
 	}
 	return off;
