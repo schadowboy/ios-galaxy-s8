@@ -550,6 +550,8 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 			if (k[m] || (i && p->cmdline[i - 1] != ' '))
 				continue;
 			wp = p->cmdline[i + 10] >= '1' && p->cmdline[i + 10] <= '9' ? p->cmdline[i + 10] - '0' : 0;
+			if (wp && p->cmdline[i + 11] >= '0' && p->cmdline[i + 11] <= '9')	/* two digits: wifiprobe=10 (W3a) */
+				wp = wp * 10 + (p->cmdline[i + 11] - '0');
 			break;
 		}
 		if (wp == 1)
@@ -559,9 +561,12 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 		else if (wp >= 3) {
 			extern void wifi_link(void (*)(const char *, uint64_t), void (*)(const char *), void (*)(void), unsigned);
 			wifi_link(kv, out, gpu0_flush, (unsigned)wp);
-			if (wp == 9) {	/* W2a (tools/wifi-w2/W2-PLAN.md): stage 8 above left the firmware running; MSGBUF: MAC + version */
+			if (wp == 9 || wp == 10) {	/* W2a (tools/wifi-w2/W2-PLAN.md): stage 8 above left the firmware running; MSGBUF: MAC + version */
 				extern void wifi_w2(void (*)(const char *, uint64_t), void (*)(const char *), void (*)(void));
+				extern void wifi_w3(void (*)(const char *, uint64_t), void (*)(const char *), void (*)(void));
 				wifi_w2(kv, out, gpu0_flush);
+				if (wp == 10)	/* W3a (tools/wifi-w2/W3-PLAN.md): radio up + scan */
+					wifi_w3(kv, out, gpu0_flush);
 			}
 		}
 	}

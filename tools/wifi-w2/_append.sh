@@ -7,8 +7,8 @@ if grep -q "BEGIN wifi_w2.c" "$F"; then
   sed -i '/^\/\* ==== BEGIN wifi_w2.c/,$d' "$F"
 fi
 {
-  echo "/* ==== BEGIN wifi_w2.c (copy of tools/wifi-w2/wifi_w2.c; edit THERE and re-run tools/wifi-w2/_append.sh) ==== */"
-  cat $W/tools/wifi-w2/wifi_w2.c
+  echo "/* ==== BEGIN wifi_w2.c (copy of tools/wifi-w2/wifi_w2.c + wifi_w3.c; edit THERE and re-run tools/wifi-w2/_append.sh) ==== */"
+  cat $W/tools/wifi-w2/wifi_w2.c $W/tools/wifi-w2/wifi_w3.c
   echo "/* ==== END wifi_w2.c ==== */"
 } >> "$F"
 grep -c "BEGIN wifi_w2.c" "$F"

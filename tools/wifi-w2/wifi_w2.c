@@ -93,7 +93,8 @@
 #define L_IOCT_REQ	0x12000u	/* ioctl request payload (the firmware DMA-reads it) */
 #define L_RESP0		0x14000u	/* ioctl response buffers, 8192 bytes each */
 #define L_RESP1		0x16000u
-#define L_TOTAL		0x18000u
+#define L_EVENT		0x18000u	/* W3c: 8 event buffers of 2048 bytes (DHD_FLOWRING_RX_BUFPOST_PKTSZ) */
+#define L_TOTAL		0x1C000u
 #define IOCT_REQ_MAX	2048u
 #define RESP_SZ		8192u
 #define PKTID_RESP0	0x101u
@@ -379,34 +380,51 @@ struct w2_resp {
 	uint32_t resp_len, pktid, trans;
 };
 
-/* one ioctl round trip: iovar 'name' with cmd (GET_VAR), reply into response buffer *respoff; waits up to timeout_ms */
-static int w2_iovar(const char *name, uint32_t cmd, uint32_t outlen, uint32_t timeout_ms, struct w2_resp *rs)
+static void (*w2_evhook)(uintptr_t item);	/* W3c: called for every MSG_TYPE_WL_EVENT item seen while waiting for an ioctl */
+static uint32_t w2_typecnt[64];			/* D2H control message types seen (index = msg_type & 63) */
+static uint32_t w2_rep_pktid, w2_rep_off;	/* response buffer to re-post before the next request (DHD re-posts after each completion) */
+static int w2_ready;				/* set by wifi_w2 once rings and host-ready are done: wifi_w3 needs it */
+static uint32_t w2_cons;			/* firmware console address */
+
+/* one ioctl round trip: command cmd, 'incopy' bytes of payload copied to the request buffer, input_buf_len = inlen,
+ * output_buf_len = outlen (reply goes to a posted response buffer, <= 8192); waits up to timeout_ms */
+static int w2_ioctl(uint32_t cmd, const char *label, const uint8_t *in, uint32_t incopy, uint32_t inlen,
+		    uint32_t outlen, uint32_t timeout_ms, struct w2_resp *rs)
 {
 	struct w2_ring *rq = &w2_rg[0], *cp = &w2_rg[2];
 	uintptr_t it, req = W2_DMA_BASE + L_IOCT_REQ;
 	uint64_t t0;
-	uint32_t i, len, trans, rdold;
+	uint32_t i, trans, rdold;
 	int fetched = 0;
 
 	rs->ack = rs->cmplt = 0;
 	rs->ack_status = rs->status = 0;
 	rs->resp_len = rs->pktid = rs->trans = 0;
 
-	/* payload: the iovar name, NUL terminated, rest zero */
+	if (w2_rep_pktid) {
+		(void)w2_post_resp(w2_rep_pktid, w2_rep_off);
+		w2_rep_pktid = 0;
+	}
+	/* payload, rest of the request buffer zero */
 	for (i = 0; i < IOCT_REQ_MAX; i += 4)
 		w2_wr(req + i, 0);
-	for (len = 0; name[len]; len++)
-		*(volatile uint8_t *)(req + len) = (uint8_t)name[len];
-	len++;
-	if (outlen > IOCT_REQ_MAX)
-		outlen = IOCT_REQ_MAX;
+	if (incopy > IOCT_REQ_MAX)
+		incopy = IOCT_REQ_MAX;
+	for (i = 0; i < incopy; i++)
+		*(volatile uint8_t *)(req + i) = in[i];
+	if (inlen > 2008)	/* DHD MSGBUF_IOCTL_MAX_RQSTLEN: 2048 - 40 */
+		inlen = 2008;
+	if (outlen > RESP_SZ)
+		outlen = RESP_SZ;
 	trans = ++w2_trans;
 	w2_k("W2: ioctl request, cmd", cmd);
-	w2_out("W2:   iovar ");
-	w2_out(name);
+	w2_out("W2:   ");
+	w2_out(label);
 	w2_out("\n");
 	w2_k("W2:   trans_id", trans);
-	w2_k("W2:   input/output buffer length", outlen);
+	w2_k("W2:   input_buf_len", inlen);
+	w2_k("W2:   output_buf_len", outlen);
+	w2_dsb();
 
 	it = w2_h2d_begin(rq, MT_IOCTLPTR_REQ);
 	if (!it)
@@ -414,7 +432,7 @@ static int w2_iovar(const char *name, uint32_t cmd, uint32_t outlen, uint32_t ti
 	rdold = w2_t16(rq->ridx);
 	w2_wr(it + 4, IOCTL_REQ_PKTID);			/* request_id */
 	w2_wr(it + 8, cmd);				/* cmd */
-	w2_wr(it + 12, trans | (outlen << 16));		/* trans_id, input_buf_len (DHD: both = len) */
+	w2_wr(it + 12, trans | (inlen << 16));		/* trans_id, input_buf_len */
 	w2_wr(it + 16, outlen);				/* output_buf_len, rsvd */
 	w2_wr(it + 24, (uint32_t)req);			/* host_input_buf_addr low (8-byte aligned) */
 	w2_wr(it + 28, (uint32_t)(req >> 32));
@@ -432,6 +450,8 @@ static int w2_iovar(const char *name, uint32_t cmd, uint32_t outlen, uint32_t ti
 		}
 		while ((d = w2_d2h_peek(cp)) != 0) {
 			uint32_t w0 = w2_rd(d), type = w0 & 0xff;
+
+			w2_typecnt[type & 63]++;
 
 			if (w2_nitems < 24) {
 				w2_nitems++;
@@ -452,6 +472,8 @@ static int w2_iovar(const char *name, uint32_t cmd, uint32_t outlen, uint32_t ti
 				rs->resp_len = w3 & 0xffff;
 				rs->trans = w3 >> 16;
 				rs->pktid = w2_rd(d + 4);
+				w2_rep_pktid = rs->pktid == PKTID_RESP1 ? PKTID_RESP1 : PKTID_RESP0;
+				w2_rep_off = rs->pktid == PKTID_RESP1 ? L_RESP1 : L_RESP0;
 				w2_k("W2:   ioctl COMPLETE, status", (uint64_t)(int64_t)rs->status);
 				w2_k("W2:     resp_len", rs->resp_len);
 				w2_k("W2:     trans_id", rs->trans);
@@ -460,7 +482,10 @@ static int w2_iovar(const char *name, uint32_t cmd, uint32_t outlen, uint32_t ti
 			} else if (type == MT_GEN_STATUS || type == MT_RING_STATUS) {
 				w2_k("W2:   firmware status message, status", w2_rd(d + 8) & 0xffff);
 			} else if (type == MT_WL_EVENT) {
-				w2_out("W2:   (a WLC event arrived: no event buffers were posted by us, so this is unexpected)\n");
+				if (w2_evhook)
+					w2_evhook(d);
+				else
+					w2_out("W2:   (a WLC event arrived while no event handler is installed)\n");
 			}
 			w2_d2h_done(cp);
 			w2_fl();
@@ -473,6 +498,16 @@ static int w2_iovar(const char *name, uint32_t cmd, uint32_t outlen, uint32_t ti
 	w2_k("W2:   request consumed by chip", fetched);
 	w2_k("W2:   ack seen", rs->ack);
 	return -2;
+}
+
+/* WLC_GET_VAR style call: iovar 'name' (+ nothing else), input_buf_len = output_buf_len = outlen as in W2a */
+static int w2_iovar(const char *name, uint32_t cmd, uint32_t outlen, uint32_t timeout_ms, struct w2_resp *rs)
+{
+	uint32_t n = 0;
+
+	while (name[n])
+		n++;
+	return w2_ioctl(cmd, name, (const uint8_t *)name, n + 1, outlen, outlen, timeout_ms, rs);
 }
 
 static void w2_dump_state(const char *why)
@@ -718,6 +753,9 @@ void wifi_w2_at(void (*kv)(const char *, uint64_t), void (*out)(const char *), v
 	rc = w2_post_resp(PKTID_RESP0, L_RESP0);
 	rc |= w2_post_resp(PKTID_RESP1, L_RESP1);
 	kv("W2: response buffers posted (0 = ok)", (uint64_t)(int64_t)rc);
+	w2_rep_pktid = 0;
+	w2_cons = cons;
+	w2_ready = (rc == 0);
 	{
 		uint64_t t0 = w2_ticks();
 

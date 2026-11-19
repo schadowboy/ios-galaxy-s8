@@ -3,8 +3,8 @@
 W=/mnt/c/github/ios-s8/upstream/.claude/worktrees/gpu-stress
 CC=aarch64-linux-gnu-gcc
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-tree-loop-distribute-patterns -march=armv8-a -Wall -Wextra -Werror"
-mkdir -p /tmp/w2chk
-$CC $CFLAGS -c $W/tools/wifi-w2/wifi_w2.c -o /tmp/w2chk/wifi_w2.o && echo COMPILE_OK
+mkdir -p /tmp/w2chk; cat $W/tools/wifi-w2/wifi_w2.c $W/tools/wifi-w2/wifi_w3.c > /tmp/w2chk/all.c
+$CC $CFLAGS -c /tmp/w2chk/all.c -o /tmp/w2chk/wifi_w2.o && echo COMPILE_OK
 echo "ABS64 relocs: $(aarch64-linux-gnu-readelf -r /tmp/w2chk/wifi_w2.o | grep -c ABS64)"
 aarch64-linux-gnu-nm /tmp/w2chk/wifi_w2.o
 aarch64-linux-gnu-objdump -d /tmp/w2chk/wifi_w2.o | grep -c "bl.*memset\|bl.*memcpy"

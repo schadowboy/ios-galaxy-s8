@@ -12,3 +12,9 @@ wifi_fw_end:
 wifi_nvram:
 	.incbin "fw/wifi_nvram.bin"
 wifi_nvram_end:
+	.balign 4
+	.global wifi_clm
+	.global wifi_clm_end
+wifi_clm:
+	.incbin "fw/wifi_clm.bin"
+wifi_clm_end:
