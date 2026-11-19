@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..f9a7d29
+index 0000000..eba7581
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,2379 @@
+@@ -0,0 +1,2412 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -55,7 +55,8 @@ index 0000000..f9a7d29
 +
 +static volatile SInt32 gAgxLogged;
 +static char gDumpName[32] = "s8mtl_test";      /* boot-arg s8agxdump=<process name prefix> */
-+static uint32_t gNoProgDump = 0;                /* boot-arg s8agxnoprog=1: do not dump the programs of executed draws */
++static uint32_t gKeepDither = 0;                /* boot-arg s8agxkeepdither=1: shade the dither pass too */
++static uint32_t gNoProgDump = 0;               /* boot-arg s8agxnoprog=1: do not dump the programs of executed draws */
 +static uint32_t gNoTex = 0;                    /* boot-arg s8agxnotex=1: do not dump caller-memory (texture) resources */
 +static uint8_t gNoRes[1024];                   /* boot-arg s8agxnores=<id>,<id>,...: resource ids that are never dumped (keeps the console ring from wrapping) */
 +static uint32_t gSkip = 0;                     /* boot-arg s8agxskip=<n>: do not dump the first n submits of that process (later rounds of the test) */
@@ -877,6 +878,7 @@ index 0000000..f9a7d29
 +	uint32_t firstOut, lastOut;     /* the first and the last stored pixel (diagnostics) */
 +	uint32_t texw[S8F_NTEX][6];     /* raw texture-state words of each bound texture (diagnostics: descriptor decoding) */
 +	uint32_t smpw[S8F_NTEX][2];     /* raw sampler words */
++	int workInit;                   /* the per-pixel context was initialised from the template for this draw */
 +	int constant;                   /* the program's output does not depend on varyings, tile, pixel position or textures: shaded once */
 +	int tileOnly;                   /* the output depends on the destination pixel only (no texture): cached per destination value */
 +	int cacheValid;
@@ -913,7 +915,20 @@ index 0000000..f9a7d29
 +			sa = dc->cacheCa;
 +			have = true;
 +		} else {
-+			memcpy(&fc, &dc->tmpl, sizeof(fc));
++			if (!dc->workInit) {
++				memcpy(&fc, &dc->tmpl, sizeof(fc));     /* once per draw: uniforms, textures, samplers are constant */
++				dc->workInit = 1;
++			} else {
++				bzero(fc.r, sizeof(fc.r));              /* per pixel: only what a run writes */
++				bzero(fc.out, sizeof(fc.out));
++				bzero(fc.scratch, sizeof(fc.scratch));
++				fc.stored = 0;
++				fc.unknown = 0;
++				fc.discard = 0;
++				fc.last_iter = 0;
++				fc.pc_fail = 0;
++				fc.pc_end = 0;
++			}
 +			fc.varying = v;
 +			fc.tile = dv;
 +			fc.has_tile = 1;
@@ -1257,6 +1272,23 @@ index 0000000..f9a7d29
 +					}
 +					if (d->fs.block != 0 && findResRegion(d->fs.block, &eb, &eo, &el)) {
 +						comp_dump_window(fSubmitDumps ? fSubmitDumps : 1, d->fs.block, eb, eo, el, 0x40, 0x1400);
++					}
++				}
++				if (!gKeepDither) {
++					/* the full-screen dither pass samples a 256x1 RGBA16F noise table (format 0x4642): invisible low-amplitude noise that costs a full-screen shading
++					 * pass each frame, skipped (boot-arg s8agxkeepdither=1 runs it) */
++					bool dither = false;
++
++					for (int ti = 0; ti < dc->tmpl.ntex; ti++) {
++						if (dc->tmpl.texd[ti].fmt == S8T_FMT_RGBA16F && dc->tmpl.texd[ti].height == 1) {
++							dither = true;
++						}
++					}
++					if (dither) {
++						if (OSIncrementAtomic((SInt32 *)&xlogged) < 600) {
++							IOLog("S8AGX: comp: pass %d draw %d: dither pass skipped\n", pi, di);
++						}
++						continue;
 +					}
 +				}
 +				dc->frag = fbase + fstart;
@@ -2340,6 +2372,7 @@ index 0000000..f9a7d29
 +	PE_parse_boot_argn("s8agxpx", &gPxBudget, sizeof(gPxBudget));
 +	PE_parse_boot_argn("s8agxnotex", &gNoTex, sizeof(gNoTex));
 +	PE_parse_boot_argn("s8agxnoprog", &gNoProgDump, sizeof(gNoProgDump));
++	PE_parse_boot_argn("s8agxkeepdither", &gKeepDither, sizeof(gKeepDither));
 +	{
 +		char nores[96] = "";
 +
