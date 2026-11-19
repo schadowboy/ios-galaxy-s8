@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..3cf3362
+index 0000000..2ef7ea2
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,2191 @@
+@@ -0,0 +1,2287 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -211,6 +211,7 @@ index 0000000..3cf3362
 +	static int streamRd(void * ctx, uint64_t va, uint32_t * out);
 +	void logCompositor(void);
 +	void execComposite(void);
++	bool compVertex(struct s8f_ctx & c, uint32_t vid, const uint8_t * code, unsigned codelen, const uint32_t * uni, const uint32_t * vp, struct s8r_vtx * out, uint32_t * nvar);
 +	void bindUniforms(const struct s8s_prog * pg, uint32_t * uni);
 +	bool fSurfDone[kSurfMax];       /* the first-use background fill of this surface was done */
 +
@@ -789,6 +790,35 @@ index 0000000..3cf3362
 +	}
 +}
 +
++/* run the vertex program for one vertex id and apply the viewport transform; false when it fails or exports no position */
++bool
++AGXDeviceUserClient::compVertex(struct s8f_ctx & c, uint32_t vid, const uint8_t * code, unsigned codelen, const uint32_t * uni, const uint32_t * vp, struct s8r_vtx * out,
++    uint32_t * nvar)
++{
++	bzero(&c, sizeof(c));
++	memcpy(c.uni, uni, sizeof(c.uni));
++	c.rd = agxRd;
++	c.rdctx = this;
++	c.vid = vid;
++	if (!s8f_run(&c, code, codelen) || (c.expmask & 0xf) != 0xf) {
++		return false;
++	}
++	f32b iw = sf_div(SF_ONE, c.exp[3]);
++
++	out->x = sf_fma(vp[1], sf_mul(c.exp[0], iw), vp[0]);
++	out->y = sf_fma(vp[3], sf_mul(c.exp[1], iw), vp[2]);
++	out->iw = iw;
++	*nvar = 0;
++	while (*nvar < S8R_MAXV && (c.expmask & (1u << (4 + *nvar)))) {
++		out->v[*nvar] = c.exp[4 + *nvar];
++		(*nvar)++;
++	}
++	for (uint32_t k = *nvar; k < S8R_MAXV; k++) {
++		out->v[k] = 0;
++	}
++	return true;
++}
++
 +/* one draw's per-pixel state: the fragment program, its uniforms/textures (template context) and the target */
 +struct comp_px {
 +	struct s8f_ctx tmpl;
@@ -1028,6 +1058,64 @@ index 0000000..3cf3362
 +				dc->tmpl.fetch = NULL;
 +				dc->tmpl.trd = agxRd;
 +				dc->tmpl.trdctx = this;
++				bzero(vok, kMaxVtx);
++				/* vertex pre-pass: all vertices of the draw, so the quad extent is known before the textures are bound (a 1:1 layer texture is exactly as big as its quad) */
++				{
++					uint32_t nvid = d->count;
++
++					if (d->kind == S8S_DRAW_INDEXED) {
++						nvid = 0;
++						for (uint32_t pos = 0; pos < d->count; pos++) {
++							uint8_t * ip;
++							uint64_t ia;
++
++							if (resolveVa(d->index_va + 2ULL * pos, &ip, &ia) && ia >= 2 && (uint32_t)*(const uint16_t *)ip + 1 > nvid) {
++								nvid = (uint32_t)*(const uint16_t *)ip + 1;
++							}
++						}
++					}
++					if (nvid > (uint32_t)kMaxVtx) {
++						nvid = (uint32_t)kMaxVtx;
++					}
++					for (uint32_t vid = 0; vid < nvid; vid++) {
++						uint32_t nv = 0;
++
++						vok[vid] = 2;
++						dTried++;
++						if (!compVertex(dc->vwork, vid, vbase + vstart, (unsigned)(vlen - vstart > 0x400 ? 0x400 : vlen - vstart), uni, vp, &vt[vid], &nv)) {
++							if (dFail == 0) {
++								dUnk = dc->vwork.unknown;
++								dPc = dc->vwork.pc_fail;
++								dMask = dc->vwork.expmask;
++								dFail = 1;
++							}
++							continue;
++						}
++						nvar = nv;
++						dOk++;
++						if (dOk == 1) {
++							dX = sf_to_fixed(vt[vid].x, 4);
++							dY = sf_to_fixed(vt[vid].y, 4);
++							dW = dc->vwork.exp[3];
++						}
++						int32_t fx = sf_to_fixed(vt[vid].x, 0), fy = sf_to_fixed(vt[vid].y, 0);
++
++						if (!bbox || fx < bx0) {
++							bx0 = fx;
++						}
++						if (!bbox || fx > bx1) {
++							bx1 = fx;
++						}
++						if (!bbox || fy < by0) {
++							by0 = fy;
++						}
++						if (!bbox || fy > by1) {
++							by1 = fy;
++						}
++						bbox = 1;
++						vok[vid] = 1;
++					}
++				}
 +				for (uint32_t k = 0; k < d->fs.npush && dc->tmpl.ntex < S8F_NTEX; k++) {
 +					if (d->fs.push[k].type == S8S_PUSH_TEXTURE) {
 +						uint32_t w6[6];
@@ -1038,10 +1126,19 @@ index 0000000..3cf3362
 +						}
 +						memcpy(dc->texw[dc->tmpl.ntex], w6, sizeof(w6));
 +						ok = s8t_desc_decode(&dc->tmpl.texd[dc->tmpl.ntex], w6);
++						uint64_t r8tva = 0;
++
++						if ((w6[0] & 0xffff) == 0x8002 && s8s_texrec_va(w6, &r8tva)) {
++							/* single-channel layer texture (masks / glyphs): format code 0x8002; 1 byte per texel, linear, exactly as large as the quad that samples it 1:1
++							 * (evidence: 640x387 and 694x79 quads = the shaded pixel counts, and the backing buffers are too small for 4 bytes per texel) */
++							uint32_t tw = bbox ? (uint32_t)(bx1 - bx0) : p->width, th = bbox ? (uint32_t)(by1 - by0) : p->height;
++
++							s8t_desc_make(&dc->tmpl.texd[dc->tmpl.ntex], r8tva, tw, th, S8T_FMT_R8, S8T_LAYOUT_LINEAR, tw);
++						}
 +						{
 +							uint64_t tva = 0;
 +
-+							if (s8s_texrec_va(w6, &tva) || !ok) {
++							if (r8tva == 0 && (s8s_texrec_va(w6, &tva) || !ok)) {
 +								/* compositor records: address from the attachment form; size/format words are not decoded yet, so take them from the
 +								 * backing IOSurface (linear BGRA8 with its pitch) or, for other memory, from the pass size (ASSUMED) */
 +								uint32_t tw = p->width, th = p->height, tp = p->width * 4;
@@ -1089,7 +1186,6 @@ index 0000000..3cf3362
 +				dc->w = (int)p->width;
 +				dc->h = (int)p->height;
 +				dc->blend = (int)d->blend;
-+				bzero(vok, kMaxVtx);
 +
 +				/* constant-output probe: three runs with different varyings / destination pixel / position; identical outputs and no texture = a solid colour */
 +				if (dc->tmpl.ntex == 0) {
