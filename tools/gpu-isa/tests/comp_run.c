@@ -9,18 +9,46 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+struct s8f_ctx;
+static void trace_fn(struct s8f_ctx * c, unsigned pc, const unsigned char * b);
+static int g_trace_prog = -1, g_cur_prog;
+#define S8F_TRACE(c, pc, b) trace_fn(c, pc, b)
 #include "s8gfx_frag.h"
 
+/* -t N: instruction trace of program N (halves h0..h23 as f16 hex words) */
+static void trace_fn(struct s8f_ctx * c, unsigned pc, const unsigned char * b)
+{
+	unsigned i;
+
+	if (g_cur_prog != g_trace_prog) return;
+	printf("    %04x:", pc);
+	for (i = 0; i < 8; i++) printf(" %02x", b[i]);
+	printf(" |");
+	for (i = 0; i < 24; i++) printf(" %04x", s8f_gh(c, i));
+	printf("\n");
+}
+
+static int g_const_tex;
 static uint32_t texrd(void * ctx, uint64_t va)
 {
 	(void)ctx;
+	if (g_const_tex) return 0xffbf4080u;                    /* RGBA8 bytes 80 40 bf ff = (0.502, 0.251, 0.749, 1.0) */
 	return (uint32_t)(va * 2654435761u) | 0xff000000u;
 }
+static float tofl(f32b b) { float x; memcpy(&x, &b, 4); return x; }
+
+static const char * g_mode = "";
+static int g_const;
 
 int main(int argc, char ** argv)
 {
 	FILE * f = fopen(argv[1], "rb");
 	int verbose = argc > 2 && strcmp(argv[2], "-v") == 0;
+
+	/* -const: constant opaque texel (0.5, 0.25, 0.75, 1.0), transparent black destination, every uniform half = f16 1.0 (opacity 1, colour white): print
+	 * program -> output colour (the expected value of a correct compositor shader is the texel, or the layer colour * texel for modulated ones) */
+	if (argc > 2 && strcmp(argv[2], "-const") == 0) { g_const = 1; verbose = 1; g_mode = "const"; }
+	if (argc > 3 && strcmp(argv[2], "-const") == 0 && strcmp(argv[3], "-t") == 0) g_trace_prog = atoi(argv[4]);
 	char kind;
 	uint32_t entry, len;
 	int idx = 0, total = 0, end_n = 0, store_n = 0, stop_n = 0, clean_n = 0, tex_n = 0;
@@ -38,9 +66,11 @@ int main(int argc, char ** argv)
 		if (kind != 'f') { idx++; continue; }
 		memset(&c, 0, sizeof(c));
 		c.varying = vv;
-		c.tile = 0xff80c040u;
+		g_const_tex = g_const;
+		c.tile = g_const ? 0u : 0xff80c040u;
 		c.has_tile = 1;
-		for (i = 0; i < 128; i += 2) c.uni[i] = 0x3f000000u;
+		for (i = 0; i < 128; i += 2) c.uni[i] = g_const ? 0x3c003c00u : 0x3f000000u;
+		if (g_const) for (i = 1; i < 128; i += 2) c.uni[i] = 0x3c003c00u;
 		c.sr[48] = 3;
 		c.sr[49] = 5;
 		c.ntex = 1;
@@ -48,6 +78,7 @@ int main(int argc, char ** argv)
 		c.texs[0].mag_linear = c.texs[0].min_linear = 1;
 		c.trd = texrd;
 		total++;
+		g_cur_prog = idx;
 		{
 			int ok = s8f_run(&c, buf, len);
 
@@ -60,6 +91,8 @@ int main(int argc, char ** argv)
 			for (i = 0; i < 256; i++) ex[i] += c.hit[i];
 			if (verbose || !c.pc_end) {
 				printf("program %3d (%s, %u B): %s%s%s", idx, pad[0] == 1 ? "block" : "walk ", len, c.pc_end ? "end" : "STOP", ok && c.stored ? " +store" : "", any_assumed ? " (ASSUMED forms)" : " (decoded forms only)");
+				if (c.pc_end && ok && c.stored) printf("  -> rgba %.4f %.4f %.4f %.4f%s", tofl(c.out[0]), tofl(c.out[1]), tofl(c.out[2]), tofl(c.out[3]), c.ntex_missing ? " (texture missing)" : "");
+				if (c.pc_end && c.hit[0x21]) printf(" [%u samples, tex hits %u]", c.hit[0x21], c.hit[0x21]);
 				if (!c.pc_end) printf(" unknown 0x%02x at +0x%x:", c.unknown, c.pc_fail);
 				if (!c.pc_end) for (i = 0; i < 8; i++) printf(" %02x", buf[c.pc_fail + i]);
 				printf("\n");

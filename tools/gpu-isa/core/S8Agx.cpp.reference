@@ -515,6 +515,7 @@ AGXDeviceUserClient::dumpSparse(const char * what, uint32_t region, uint32_t id,
  * No floating point in the kernel: floats are handled as bit patterns.
  */
 static char gExecName[32] = "s8mtl_test";
+static char gExecName2[32] = "";                /* boot-arg s8agxexec2=<process prefix>: a second process whose submits are executed (SpringBoard) */
 static char gProgName[32] = "";                 /* boot-arg s8agxprogs=<process prefix>: log the bytes of every new shader that process submits */
 
 /* float bits -> 8-bit unorm, round half up, integer arithmetic only */
@@ -1860,7 +1861,7 @@ AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			char xname[32] = "?";
 
 			proc_selfname(xname, sizeof(xname));
-			if (strncmp(xname, gExecName, strlen(gExecName)) == 0) {
+			if (strncmp(xname, gExecName, strlen(gExecName)) == 0 || (gExecName2[0] != 0 && strncmp(xname, gExecName2, strlen(gExecName2)) == 0)) {
 				executePasses();        /* before the completion records: the caller reads the target once it sees them */
 			} else if (gProgName[0] != 0 && strncmp(xname, gProgName, strlen(gProgName)) == 0) {
 				logPrograms();          /* corpus of the shaders a real client (the compositor) submits */
@@ -1969,6 +1970,7 @@ S8AgxStart(void)
 	}
 	PE_parse_boot_argn("s8agxdump", gDumpName, sizeof(gDumpName));
 	PE_parse_boot_argn("s8agxexec", gExecName, sizeof(gExecName));
+	PE_parse_boot_argn("s8agxexec2", gExecName2, sizeof(gExecName2));
 	PE_parse_boot_argn("s8agxprogs", gProgName, sizeof(gProgName));
 	PE_parse_boot_argn("s8agxskip", &gSkip, sizeof(gSkip));
 	PE_parse_boot_argn("s8agxpx", &gPxBudget, sizeof(gPxBudget));

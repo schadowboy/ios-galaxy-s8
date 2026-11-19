@@ -60,6 +60,7 @@ struct s8f_ctx {
 	uint32_t (*trd)(void * ctx, uint64_t va);
 	void * trdctx;
 	unsigned ntex_missing;
+	unsigned fn_missing;            /* unary function ops (0x0a) whose function has no implementation (passed through) */
 	unsigned last_iter;             /* half index of the destination of the last iter: the coordinates a texture_sample reads (ASSUMED) */
 	uint32_t hit[256];              /* executed instructions by opcode (coverage runner) */
 	unsigned vaddr_reg1;            /* vertex stage: 1 + the register pair written by the last address imadd (the base of the following device_loads); 0 = none yet */
@@ -106,7 +107,10 @@ s8f_src(struct s8f_ctx * c, const uint8_t * b, int i, int src_is_half)
 	uint8_t idx = v & 0x3f;
 
 	if (src_is_half) {
-		return c->h[idx];
+		if (c->rd == 0 && c->fetch == 0) {
+			return sf_h2f(s8f_gh(c, idx));          /* fragment mode: the half registers alias the 32-bit file (f16 values) */
+		}
+		return c->h[idx];                               /* vertex mode: 16-bit device_load destinations widened to float */
 	}
 	return c->r[idx / 2];
 }
@@ -138,7 +142,7 @@ s8f_len(const uint8_t * b, unsigned avail)
 		return 4;
 	}
 	if (op == 0x51) {
-		return (b[1] & 1) ? 4 : 8;
+		return (b[3] & 0x80) ? 8 : 4;   /* iter: 8 B when b3 bit 7 is set (`51 02 01 80 00 00 10 00`), else 4 B (`51 13 81 00`, `51 28 05 00`; the Agent-J listing's 8-byte reading swallowed the next 4-byte op) */
 	}
 	if (op == 0x52 || op == 0xd2) {
 		return 6;
@@ -161,14 +165,17 @@ s8f_len(const uint8_t * b, unsigned avail)
 	if (op == 0x1e && b[3] == 0x00 && (b[1] & 1) == 1 && b[2] >= 0xc0) {
 		return 4;                       /* 1e 13 cc 00 / 1e 03 c8 00 */
 	}
+	if (op == 0x0a) {
+		return (b[1] & 0x80) ? 6 : 4;   /* unary function: 4 B `0a 01 c0 44` (scene 19 rcp), 6 B `0a c3 b8 c4 00 01` when the destination index is >= 16 */
+	}
 	if (op == 0x26) {
 		return 6;                       /* 26 00 00 00 00 80: 6-byte form of the long compositor vertex programs (semantics unknown) */
 	}
 	if (op == 0x12 || op == 0x92) {
 		return 4;                       /* 12 25 00 00 = 16-bit integer immediate move, 92 02 f8 5b = f16 immediate move (255.0) */
 	}
-	if (op == 0x16) {
-		return 8;                       /* 16 90 e7 e7 00 e7 e7 00 (semantics unknown) */
+	if (op == 0x16 || op == 0x56 || op == 0x96 || op == 0xd6 || op == 0x36 || op == 0xb6) {
+		return 8;                       /* 16 90 e7 e7 00 e7 e7 00, 56 0a 88 00 00 80 00 00: compare-select family (G13 icmpsel/fcmpsel layout, 8 B form) */
 	}
 	if (op == 0x20) {
 		return 6;                       /* `20 c0 <imm32>`: literal word that the preceding imadd (b4 & 0x60 == 0x60) takes as its operand */
@@ -188,6 +195,68 @@ s8f_len(const uint8_t * b, unsigned avail)
 		return 6;
 	}
 	return 0;
+}
+
+/* a < b on float bits (false when either is NaN; -0 == +0) */
+static inline int
+s8f_lt(f32b a, f32b b)
+{
+	int64_t ia = (a >> 31) ? -(int64_t)(a & 0x7fffffffu) : (int64_t)a;
+	int64_t ib = (b >> 31) ? -(int64_t)(b & 0x7fffffffu) : (int64_t)b;
+
+	if (sf_isnan(a) || sf_isnan(b)) {
+		return 0;
+	}
+	return ia < ib;
+}
+
+/* square root, correctly rounded to nearest (integer square root of the mantissa) */
+static inline f32b
+s8f_sqrt(f32b a)
+{
+	uint32_t e = (a >> 23) & 0xff;
+	uint64_t m, n, r, lo, hi;
+	int x;
+
+	if (sf_isnan(a)) {
+		return a;
+	}
+	if (e == 0) {
+		return a & 0x80000000u;                         /* zero and denormals -> signed zero */
+	}
+	if (a >> 31) {
+		return 0x7fc00000u;
+	}
+	if (e == 0xff) {
+		return a;
+	}
+	x = (int)e - 127;
+	m = (a & 0x7fffff) | 0x800000;
+	if (x & 1) {
+		m <<= 1;
+		x--;
+	}
+	n = m << 23;
+	lo = 0;
+	hi = (uint64_t)1 << 25;
+	while (lo < hi) {                                       /* floor(sqrt(n)) by bisection: r*r <= n */
+		uint64_t mid = (lo + hi + 1) >> 1;
+
+		if (mid * mid <= n) {
+			lo = mid;
+		} else {
+			hi = mid - 1;
+		}
+	}
+	r = lo;
+	if (n - r * r > r) {
+		r++;
+	}
+	if (r >= ((uint64_t)1 << 24)) {
+		r >>= 1;
+		x += 2;
+	}
+	return ((uint32_t)(x / 2 + 127) << 23) | (uint32_t)(r & 0x7fffff);
 }
 
 /* 16-bit float source byte: hint bits 0b10/0b11 -> half register (6-bit index), else the 8-bit minifloat immediate */
@@ -464,19 +533,76 @@ s8f_step_frag(struct s8f_ctx * c, const uint8_t * b, unsigned avail)
 		s8f_assume(c, op);                              /* family guess: 0x06 + bits 7:6 = fmul/fadd/ffma at 16 bit, like 0x0a for 32 bit (46 = fmul is only inferred) */
 		return n;
 	}
-	case 0xf6: case 0x76: {                                 /* 8 B with the operand pair repeated in b5/b6: ASSUMED f16 multiply D = a * b (b2, b3), second pair ignored */
-		f32b a = sf_h2f(s8f_gh(c, b[2] & 0x3f));
-		f32b bb = sf_h2f(s8f_gh(c, b[3] & 0x3f));
+	case 0xf6: case 0x76: {                                 /* f16 compare-select with the operand pair repeated as the select values: fa/7a at 16 bit: 76 = min, f6 = max,
+								 * D = (a < b ? a : b) / (a > b ? a : b); a = h[b2], b = h[b3] (register) or a minifloat immediate. PROVEN by the 32-bit twins (scene 21, isa_test);
+								 * the f16 form is the clamp(x, -0.7529, 1.251) of the compositor (constants 0xba06, 0x3d01 = the extended sRGB range) */
+		uint16_t ha = s8f_gh(c, b[2] & 0x3f);
+		uint16_t hb = (b[3] >> 6) >= 2 ? s8f_gh(c, b[3] & 0x3f) : sf_f2h(sf_minifloat(b[3]));
+		f32b a = sf_h2f(ha), bb = sf_h2f(hb);
+		int sel = (op == 0x76) ? s8f_lt(a, bb) : s8f_lt(bb, a);
 
-		s8f_sh(c, b[1] >> 2, sf_f2h(sf_mul(a, bb)));
-		s8f_assume(c, op);
+		s8f_sh(c, b[1] >> 2, sel ? ha : hb);
+		s8f_assume(c, op);                              /* f16 form: structure proven by the f32 twin, the compositor's use is consistent with a clamp */
 		return n;
 	}
-	case 0xfa: case 0x7a: case 0x1a: case 0x5a: {           /* 32-bit float multiply with the operand pair repeated (fa/7a 8 B, 1a/5a 6 B): ASSUMED D = a * b; dst register (b1 - 1) / 8 (bit 0 = 1) or b1 >> 3 */
+	case 0xfa: case 0x7a: {                                 /* f32 min (7a) / max (fa): scene 21 `min(x, 0.5)` = `7a 01 c0 20 04 c0 c4 00`, `max(y, 0.25)` = `fa 09 c2 10 04 c2 c4 00`; D = (a < b ? a : b) / (a > b ? a : b)
+								 * (the repeated b5/b6 are the compare-select's select values). B size rule as for fmul: b4 bit 5 = 32-bit register, b3 >= 0x80 = half register, else minifloat */
+		f32b a = c->r[((b[2] & 0x3f) >> 1) & (S8F_REGS - 1)];
+		f32b bb;
+		int sel;
+
+		if (b[4] & 0x20) {
+			bb = c->r[((b[3] & 0x3f) >> 1) & (S8F_REGS - 1)];
+		} else if ((b[3] >> 6) >= 2) {
+			bb = sf_h2f(s8f_gh(c, b[3] & 0x3f));
+		} else {
+			bb = sf_minifloat(b[3]);
+		}
+		sel = (op == 0x7a) ? s8f_lt(a, bb) : s8f_lt(bb, a);
+		c->r[(b[1] >> 3) & (S8F_REGS - 1)] = sel ? a : bb;
+		return n;
+	}
+	case 0x1a: case 0x5a: {                                 /* 6-byte relatives (`1a 41 5a 5a 24 5a`): ASSUMED f32 multiply D = a * b */
 		f32b a = c->r[((b[2] & 0x3f) >> 1) & (S8F_REGS - 1)];
 		f32b bb = c->r[((b[3] & 0x3f) >> 1) & (S8F_REGS - 1)];
 
 		c->r[(b[1] >> 3) & (S8F_REGS - 1)] = sf_mul(a, bb);
+		s8f_assume(c, op);
+		return n;
+	}
+	case 0x16: case 0x56: case 0x96: case 0xd6: case 0x36: case 0xb6: {   /* f16 compare-select, 8 B (G13 fcmpsel layout): D = (a cc b) ? x : y, a = h[b2], b = b3 (half register or minifloat), x = b5, y = b6 (same
+								 * encodings), cc = b7 >> 5 in G13 order (0 ==, 1 <, 2 >, 5 >=, 6 <=). ASSUMED (cc position and the 0x56 variant bit unproven) */
+		f32b a = sf_h2f(s8f_gh(c, b[2] & 0x3f));
+		f32b bb = s8f_h16src(c, b[3]);
+		uint16_t x = (b[5] >> 6) >= 2 ? s8f_gh(c, b[5] & 0x3f) : sf_f2h(sf_minifloat(b[5]));
+		uint16_t y = (b[6] >> 6) >= 2 ? s8f_gh(c, b[6] & 0x3f) : sf_f2h(sf_minifloat(b[6]));
+		int cc = b[7] >> 5, cond;
+
+		switch (cc) {
+		case 1: cond = s8f_lt(a, bb); break;
+		case 2: cond = s8f_lt(bb, a); break;
+		case 5: cond = !s8f_lt(a, bb) && !sf_isnan(a) && !sf_isnan(bb); break;
+		case 6: cond = !s8f_lt(bb, a) && !sf_isnan(a) && !sf_isnan(bb); break;
+		default: cond = !s8f_lt(a, bb) && !s8f_lt(bb, a) && !sf_isnan(a) && !sf_isnan(bb); break;
+		}
+		s8f_sh(c, b[1] >> 2, cond ? x : y);
+		s8f_assume(c, op);
+		return n;
+	}
+	case 0x0a: {                                            /* unary function (4 B `0a D S F`, 6 B with two more bytes): F & 0x3f = function: 0x04 rcp (scene 19 `0a 01 c0 44` = 1/(x+1) with the add before),
+								 * 0x0c sqrt, 0x2c exp2, 0x24 log2 (codes from scenes 18-20: `0a .. 4c`, `.. 6c`, `.. 64`); only rcp and sqrt are implemented. Source/dest: 32-bit regs b2/2, b1 >> 3 */
+		f32b a = c->r[((b[2] & 0x3f) >> 1) & (S8F_REGS - 1)];
+		f32b res;
+
+		switch (b[3] & 0x3f) {
+		case 0x04: res = sf_div(SF_ONE, a); break;
+		case 0x0c: res = s8f_sqrt(a); break;
+		default:                                        /* log2 (0x24), exp2 (0x2c), sin, floor, ... : no soft-float implementation yet: pass the source through and count it */
+			res = a;
+			c->fn_missing++;
+			break;
+		}
+		c->r[(b[1] >> 3) & (S8F_REGS - 1)] = res;
 		s8f_assume(c, op);
 		return n;
 	}
@@ -497,15 +623,39 @@ s8f_step_frag(struct s8f_ctx * c, const uint8_t * b, unsigned avail)
 		}
 		for (k = 0; k < 4; k++) {
 			if ((mask >> k) & 1) {
-				c->r[(d + j) & (S8F_REGS - 1)] = out4[k];
+				if (b[9] & 0x10) {                      /* b9 bit 4 (0x30 in every compositor sample, 0x20 in the f32 test scenes): the result is f16 into half registers d, d+1, ... */
+					s8f_sh(c, d + j, sf_f2h(out4[k]));
+				} else {
+					c->r[((d >> 1) + j) & (S8F_REGS - 1)] = out4[k];
+				}
 				j++;
 			}
 		}
 		s8f_assume(c, op);
 		return n;
 	}
-	case 0x82: case 0xa2:                                   /* get_sr, 16-bit: h[b1] = sr[b2] */
-		if (op == 0xa2 || op == 0x82) {
+	case 0x89: {                                            /* st_tile with half-register data: the channels selected by the mask b6 >> 4 (0xf = RGBA, 0x7 = RGB: `89 .. 70 ff`) come from consecutive f16 halves h0, h1, ...
+								 * (the compositor's pixel store; 0x09 = f32 r0..r3 in the test scenes); unselected channels: 0, alpha 1.0 (ASSUMED) */
+		unsigned mask = b[6] >> 4, k, j = 0;
+
+		for (k = 0; k < 4; k++) {
+			if ((mask >> k) & 1) {
+				c->out[k] = sf_h2f(s8f_gh(c, j));
+				j++;
+			} else {
+				c->out[k] = (k == 3) ? SF_ONE : SF_ZERO;
+			}
+		}
+		c->stored = 1;
+		s8f_assume(c, op);
+		return n;
+	}
+	case 0x82:                                              /* 16-bit uniform copy (ASSUMED, replaces the earlier get_sr reading): h[b1] = half b2 of the uniform file (`82 01 15 00` between the 32-bit `c2` copies of the colour block) */
+		s8f_sh(c, b[1], (uint16_t)(c->uni[b[2] & 127 & ~1] >> ((b[2] & 1) * 16)));
+		s8f_assume(c, op);
+		return n;
+	case 0xa2:                                              /* get_sr, 16-bit: h[b1] = sr[b2] */
+		if (op == 0xa2) {
 			s8f_sh(c, b[1], (uint16_t)c->sr[b[2]]);
 			s8f_assume(c, op);
 			return n;
@@ -614,22 +764,17 @@ s8f_run(struct s8f_ctx * c, const uint8_t * p, unsigned len)
 			int dreg = b[1] >> 2;
 
 			c->last_iter = (unsigned)dreg;
-			if (b[1] & 1) {                                 /* short iter (4 B, the texture coordinates): same fields as the long form, values from the caller's varyings (ASSUMED equal semantics) */
-				for (int k = 0; k < nch; k++) {
-					c->r[(dreg / 2 + k) & (S8F_REGS - 1)] = c->varying ? c->varying[k] : 0;
-				}
-				pc += 4;
-				continue;
-			}
-
+			/* the 4-byte form has the same fields as the 8-byte one (b1: half index << 2 | 32-bit flag << 1, b2 >> 6 = channel count); values from the caller's varyings */
 			for (int k = 0; k < nch; k++) {
 				if (b[1] & 2) {
 					c->r[(dreg / 2 + k) & (S8F_REGS - 1)] = c->varying ? c->varying[k] : 0;
+				} else if (c->rd == 0 && c->fetch == 0) {
+					s8f_sh(c, (unsigned)(dreg + k), sf_f2h(c->varying ? c->varying[k] : 0));    /* half destination: the interpolant rounded to f16 into the aliased register file */
 				} else {
 					c->h[(dreg + k) & (S8F_REGS * 2 - 1)] = c->varying ? c->varying[k] : 0;
 				}
 			}
-			pc += 8;
+			pc += (b[3] & 0x80) ? 8 : 4;
 		} else if (op == 0x4A || op == 0x8A) {                  /* fmul / fadd */
 			int d = (b[1] - 1) / 8;
 			int half_a = !(b[4] & 0x04) && (b[2] & 0x3f) >= 4;

@@ -257,6 +257,43 @@ static void t_resolve(const char * path)
 	fclose(f);
 }
 
+/* scene 19: return float4(1.0/(col.x + 1.0), col.y, col.z, 1) ; scene 21: return float4(min(col.x, 0.5), max(col.y, 0.25), 0, 1) (capture9) */
+static const uint8_t s19[] = {
+	0x51, 0x02, 0xc1, 0x80, 0x00, 0x00, 0x10, 0x00, 0x8a, 0x03, 0xc0, 0x30, 0x04, 0x00, 0x52, 0x06, 0x00, 0x00, 0x80, 0x3f, 0x0a, 0x01, 0xc0, 0x44,
+	0x48, 0x00, 0xc2, 0x00, 0x48, 0x0c, 0x00, 0x00, 0x09, 0x02, 0x00, 0x00, 0x00, 0x00, 0xf2, 0xff, 0x08, 0x01, 0x00, 0x00 };
+static const uint8_t s21[] = {
+	0x51, 0x02, 0x81, 0x80, 0x00, 0x00, 0x10, 0x00, 0xd2, 0x04, 0x00, 0x00, 0x00, 0x3f, 0x7a, 0x01, 0xc0, 0x20, 0x04, 0xc0, 0xc4, 0x00,
+	0xd2, 0x04, 0x00, 0x00, 0x80, 0x3e, 0xfa, 0x09, 0xc2, 0x10, 0x04, 0xc2, 0xc4, 0x00, 0x52, 0x04, 0x00, 0x00, 0x00, 0x00, 0x52, 0x06, 0x00, 0x00, 0x80, 0x3f,
+	0x48, 0x00, 0xc2, 0x00, 0x48, 0x0c, 0x00, 0x00, 0x09, 0x02, 0x00, 0x00, 0x00, 0x00, 0xf2, 0xff, 0x08, 0x01, 0x00, 0x00 };
+
+static void t_scene19_21(void)
+{
+	int bad19 = 0, bad21 = 0, badsq = 0;
+
+	for (int i = 0; i < 4000; i++) {
+		float col[4] = { rndf() * 2.0f - 0.5f, rndf() * 2.0f - 0.5f, rndf(), 1.0f };
+		struct s8f_ctx c;
+		float w19[4] = { 1.0f / (col[0] + 1.0f), col[1], col[2], 1.0f };
+		float w21[4] = { col[0] < 0.5f ? col[0] : 0.5f, col[1] > 0.25f ? col[1] : 0.25f, 0.0f, 1.0f };
+
+		runp(&c, s19, sizeof(s19), col, 0);
+		for (int k = 0; k < 4; k++) if (!c.stored || tof(c.out[k]) != w19[k]) { if (bad19 < 3) printf("  s19 ch %d got %.9g want %.9g\n", k, tof(c.out[k]), w19[k]); bad19++; }
+		runp(&c, s21, sizeof(s21), col, 0);
+		for (int k = 0; k < 4; k++) if (!c.stored || tof(c.out[k]) != w21[k]) { if (bad21 < 3) printf("  s21 ch %d got %.9g want %.9g\n", k, tof(c.out[k]), w21[k]); bad21++; }
+	}
+	/* sqrt unit test (the function code of the op is ASSUMED, the arithmetic is checked against the host sqrtf, correctly rounded) */
+	for (int i = 0; i < 200000; i++) {
+		float x = tof((uint32_t)(rnd() << 24) ^ (uint32_t)(rnd() << 8) ^ rnd()) ;
+
+		if (!(x > 1e-30f && x < 1e30f)) continue;
+		if (tof(s8f_sqrt(tob(x))) != sqrtf(x)) badsq++;
+	}
+	CHECK(bad19 == 0 && bad21 == 0 && badsq == 0, "scene 19/21/sqrt");
+	printf("scene 19 (rcp = 0a 01 c0 44, 1/(x+1)): %s\n", bad19 ? "FAIL" : "4000 inputs bit-exact against host division");
+	printf("scene 21 (min = 7a, max = fa with the repeated operand pair): %s\n", bad21 ? "FAIL" : "4000 inputs bit-exact against the host");
+	printf("s8f_sqrt vs sqrtf (200000 floats): %s\n", badsq ? "FAIL" : "bit-exact");
+}
+
 /* ---- texture_sample (0x21) through the ctx texture units: scenes 26 (nearest), 28 (tint), 29 (premultiply) of capture9 on a 4x4 Morton texture ----
  * expected values: independent Morton addressing (y in the low bit) and float math in the test; sampling is the hook of s8gfx_tex.h (nearest only here) */
 static uint32_t tex_words[16];
@@ -349,6 +386,7 @@ static void t_start(const char * path)
 
 int main(int argc, char ** argv)
 {
+	t_scene19_21();
 	t_tex(argc > 2 ? argv[2] : "../data/scenes.bin");
 	t_start(argc > 3 ? argv[3] : "../data/corpus_comp.bin");
 	t_f16();

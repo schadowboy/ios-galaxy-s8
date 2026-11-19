@@ -109,3 +109,24 @@ Experiments that would settle the ASSUMED compositor forms (fragment shaders cap
 3. unary `0a`: `float4(sqrt(x), 1.0/x, exp2(x), log2(x))` with x = 0.25 on separate shaders (one function each), read the function-code byte of each.
 4. `31` write: a fragment shader on a non-MSAA target outputting a constant, plus a variant with `[[color(1)]]` second attachment: the extra bytes in `31 01 .. 0a 10 d0 00 04` vs `31 01 0e 0a 00 ..` select the target/format.
 5. f9/79 sample/format split: MSAA 4x resolve of a target with distinct per-sample values (`[[sample_id]]`), expected resolved mean.
+
+## 7. Why the compositor drew black / garbage (2026-11-19, third pass; traces with comp_replay `-tf`, tests/comp_run.c `-const [-t N]`)
+Root causes found by tracing the first fragment of capture17 s8 pass 0 draw 1 and pass 1 draw 2:
+1. **Pixel store 0x89 reads f16 halves, not f32 registers.** `89 .. f0 ff` / `89 .. 70 ff` store the half registers h0.. (mask b6 >> 4, 0xf = RGBA, 0x7 = RGB); the old code stored the 32-bit words r0..r3 as floats
+   -> 3e-5, 0.0078, 0.03 (those are the f16 pairs 0x3004/0x3c00 read as f32). 0x09 (scene programs) stays f32. Same rule on the load side: `f9` = f16 ld_tile, `79 .. fa ff` = f32 (op bit 7 = 16-bit data).
+2. **texture_sample result placement**: dst = HALF index b1 >> 2, f16 when b9 bit 4 is set (0x30 in every compositor sample, 0x20 in the f32 scenes); the compositor's f16 consumers read h8 etc. The old code wrote f32 into r[b1>>2].
+3. **`f6/76` are not multiplies, they are f16 max/min (clamp)**: `f6 1e 88 84` = max(h8, K1), `76 1e c7 85` = min(h7, K2) with K1 = 0xba06 = -0.753, K2 = 0x3d01 = 1.251 (the two halves of the mov_imm `d2 .. 06 ba 01 3d`) = clamp to the extended sRGB range. PROVEN by the f32 twins:
+   scene 21 (`min(x, 0.5)` = `7a 01 c0 20 04 c0 c4 00`, `max(y, 0.25)` = `fa 09 c2 10 04 c2 c4 00`; the repeated b5/b6 are the select values of the compare-select) bit-exact in isa_test. `fa/7a` = f32 max/min, `f6/76` = f16 max/min.
+4. **iter length**: 8 bytes only when b3 bit 7 is set (`51 02 01 80 00 00 10 00`), else 4 bytes (`51 13 81 00`, `51 28 05 00`, `51 02 81 00`); the earlier 8-byte reading swallowed the next 4-byte op (`02 0a 08 00`, `48 00 c2 00`) and
+   desynchronised several programs (`c4`, `0x56` stops were artefacts). Interpolants into half destinations (b1 bit 1 clear) are rounded to f16 into the aliased register file.
+5. **register aliasing**: fragment mode now keeps ONE register file; half index i = low/high half of r[i/2]. `c->h[]` is only used by the vertex stage. `s8f_gh/s8f_sh` access halves.
+6. `e2 b1 sr 04` (get_sr 32-bit) with sr 0x10 / 0x11: pixel x / y (convert to float, times 1/32 = coordinates into a 32x32 repeat texture: the dither pattern of the second texture sample). **The glue must set `fc.sr[16] = px; fc.sr[17] = py`** (full pixel coordinates) in
+   addition to sr[48]/sr[49]. `82 b1 u 00` is a 16-bit UNIFORM copy (colour block between the `c2` 32-bit copies), not get_sr (a2 is get_sr).
+7. New forms: compare-select `16/56/96/d6/36/b6` (f16, b7 = cc; ASSUMED), unary `0a` (4 B, 6 B when b1 >= 0x80; rcp = code 0x04 PROVEN by scene 19, sqrt 0x0c, log2/exp2/others pass-through + `fn_missing` counter), `58` signal_pix.
+8. Texture coordinates of the 2nd sample (dither, `21 05 11 40 08 c8 00 80 00 30`) come from the sr-derived r0/r1, not the last iter: the sample's coordinate field is not decoded (b2 = 0x11 here, 0x00 for iter-coordinate samples); the stand-in still reads the last iter.
+
+Expected output for a CONSTANT opaque texel (0.502, 0.251, 0.749, 1.0), transparent-black destination, all uniform halves f16 1.0 (tests/hh_const.sh -> logs/_comp_const.txt, `comp_run corpus_comp.bin -const`):
+programs 7, 17, 19, 23 (plain texture -> pixel: `iter, sample, wait, 89`) output exactly the texel; 3, 5, 20, 33 (solid / interpolated colour) output the varying colour (0.3, 0.6, 0.25, 1); 0, 1, 2, 8, 12, 39 (alpha-mask / clamp programs) output white 1.0 for opaque input;
+9, 16, 24, 43 (layer blend with a second attachment load `f9 00 60 ..`) output 0 because the synthetic attachment tile is 0 (the programs multiply the vertex colour by that attachment's alpha); 6, 11, 21, 35, 38, 40, 41 depend on uniforms/ASSUMED forms and are out of range
+(unary functions passed through, uniform block of unknown layout): they are the next work items. 40 of 46 programs reach the end instruction, 37 store a pixel; replay: capture17 s8 17 fragments store (was 16), capture18 s11 9 (was 7).
+Open: compare-select cc position, the `f9 00 60 / 00 80` b2 field (tile attachment index?), `ee`, `c0`/`80` (record starts inside data), log2/exp2/sin/floor.
