@@ -559,6 +559,10 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 		else if (wp >= 3) {
 			extern void wifi_link(void (*)(const char *, uint64_t), void (*)(const char *), void (*)(void), unsigned);
 			wifi_link(kv, out, gpu0_flush, (unsigned)wp);
+			if (wp == 9) {	/* W2a (tools/wifi-w2/W2-PLAN.md): stage 8 above left the firmware running; MSGBUF: MAC + version */
+				extern void wifi_w2(void (*)(const char *, uint64_t), void (*)(const char *), void (*)(void));
+				wifi_w2(kv, out, gpu0_flush);
+			}
 		}
 	}
 	/* gpuprobe=1: Stage 0 GPU identity probe (default off, no behaviour change) */
