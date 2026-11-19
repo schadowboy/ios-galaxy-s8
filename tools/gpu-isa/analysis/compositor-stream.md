@@ -216,3 +216,20 @@ int  s8s_texrec_va(const uint32_t w[6], uint64_t *va);                          
 ```
 `struct s8s_draw` carries pass, stream address, kind, prim, count, instances, index VA, A/B words, vertex and fragment program (`struct s8s_prog`: entry, flags, extra, block, push list), fragment bind words,
 pipeline words + blend flag, sampler words, viewport floats and tile bounds. Memory use: about 1.3 KB per draw; the kernel should call `s8s_scan` once per pass with a pass-local buffer.
+
+## 11. capture18 re-run (coordinator's second capture, `s8agxnores=10,117,103,98,68,69,70,71`)
+
+Run: `wsl -u root -d Ubuntu -- env CAP=data/capture18 SESS="11 14" MERGE="/tmp/s8s/capture17/s10" bash tests/stream_test.sh` (`CAP`, `SESS`, `MERGE`, `V` env options; `MERGE` fills zero bytes of the program
+heaps res_3 / 10 / 59 / 68..77 from another snapshot). Per-draw lines `DL ... vs <entry>[walk-ok|no-bytes|FAIL] fs <entry>[walk-ok|entry-ok|no-bytes|unwalked]` in `/tmp/stream_capture18_s<N>.txt`
+(copies of the verbose output of sessions 11 and 14: `logs/_stream_capture18_s11.txt`, `_s14.txt`).
+
+* **Session 1 is intact** (res_3, res_59, res_72..76, res_4, res_11..25 first dumps), but the skip list removed regions that hold programs: **res_10 (0x1000e0000, program heap, 0x50000) and res_68..71
+  (0x1006b0000..0x100770000, program heaps, 4 x 0x30000)**; res_98 is the capture17 uniform ring (in this capture the ring is res_102 at 0x100a60000, which is dumped) and res_103 is now IOSurface 2 (0x100aa0000).
+  Resource ids moved between captures (the process creates resources in a different order); skip lists by id must be recomputed per capture, or better by VA: **keep 0x1000e0000 and 0x1006b0000..0x100770000 dumped,
+  skip only 0x100a60000-style rings if the budget needs it**.
+* The stream decodes as before: 10 live passes (the blocks with a head LINK; the following 14 blocks `776x24` at 0x5f18.. are stale / other-type blocks: they have no LINK, no END or an empty state, count them out),
+  per frame 68 draws (session 11) and 103 (session 14), all vertex buffers plausible in session 11 (59/59) and session 12.
+* Program bytes per draw (session 11, 68 draws, incl. the stale ones): vertex entries 23 walk to `08 01`, 12 FAIL (7 are the stale passes' empty slots, 5 are `100617b30` / `10061c8f0` (the res_75-block programs) whose walk from `s8v_find_start` fails: partial page or an unknown form, not examined further), **31 no bytes**. Fragment entries: 9 verified by the entry walk, 24 unwalked (unknown forms, or block-less start), **33 no bytes**. Session 14: vertex 32 ok / 14 FAIL / 56 no bytes; fragment 4 / 37 / 61.
+  The "no bytes" ones all lie in 0x1006df000-0x1006dffff, 0x10070e000-0x10070ffff, 0x10073e000-0x10073ffff (res_68..71, skipped) and, for 18 of capture17's, res_10: **so the new dump rule made program coverage worse for
+  the compositor draws, not better; programs of res_3 / res_59 / res_72..76 are present now** (res_59 programs 0x1006139b0, 0x100619ff0, 0x10061ee70 walk fine).
+* Fragment program forms, per-program disassembly and the work list: `analysis/compositor-frag-forms.md`. Sampled textures, their resources and IOSurface ids, and the descriptor words: section 4 of that file.

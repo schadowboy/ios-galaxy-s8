@@ -117,7 +117,7 @@ static int check_vertex(const struct s8s_draw * d, char * msg)
 	struct reg * r = findreg(d->vs.entry);
 	uint8_t * p = ptr(d->vs.entry, &avail);
 
-	if (!r || !p) { strcpy(msg, "unmapped"); return 0; }
+	if (!r || !p) { strcpy(msg, "region not in the capture"); return 3; }
 	off = (unsigned)(d->vs.entry - r->va);
 	if (iszero(r->m + off, 64 < avail ? 64 : avail)) { strcpy(msg, "program bytes not in the capture (zero)"); return 3; }
 	st = s8v_find_start(r->m, (unsigned)r->len, off);
@@ -134,7 +134,7 @@ static int check_fragment(const struct s8s_draw * d, char * msg)
 	struct reg * r = findreg(d->fs.entry);
 	unsigned off, end = 0;
 
-	if (!r) { strcpy(msg, "unmapped"); return 0; }
+	if (!r) { strcpy(msg, "region not in the capture"); return 3; }
 	off = (unsigned)(d->fs.entry - r->va);
 	if (iszero(r->m + off, 32 < r->len - off ? 32 : (unsigned)(r->len - off))) { strcpy(msg, "program bytes not in the capture (zero)"); return 3; }
 	if (d->fs.block && findreg(d->fs.block) == r) {
@@ -185,7 +185,7 @@ int main(int argc, char ** argv)
 	int i;
 
 	if (argc < 2) { fprintf(stderr, "usage: stream_decode <snapshot dir> [-v]\n"); return 2; }
-	verbose = argc > 2 && strcmp(argv[2], "-v") == 0;
+	for (i = 2; i < argc; i++) if (strcmp(argv[i], "-v") == 0) verbose = 1;
 	snprintf(path, sizeof(path), "%s/regions.txt", argv[1]);
 	f = fopen(path, "r");
 	if (!f) { fprintf(stderr, "no %s\n", path); return 2; }
@@ -206,6 +206,46 @@ int main(int argc, char ** argv)
 		nregs++;
 	}
 	fclose(f);
+	/* extra snapshot dirs (any argument that is not -v): merge ONLY the program heaps (res_3, res_10, res_59, res_68..77 by VA) into the primary memory where a byte is zero */
+	for (i = 2; i < argc; i++) {
+		int n0 = nregs, q;
+
+		if (argv[i][0] == '-') continue;
+		snprintf(path, sizeof(path), "%s/regions.txt", argv[i]);
+		f = fopen(path, "r");
+		if (!f) continue;
+		while (fgets(line, sizeof(line), f)) {
+			char nm[32];
+			unsigned long long va, len;
+			FILE * g;
+			uint8_t * buf;
+
+			if (sscanf(line, "%31s %llx %llx", nm, &va, &len) != 3) continue;
+			if (!(va == 0x100020000ULL || va == 0x1000e0000ULL || va == 0x100610000ULL || (va >= 0x1006b0000ULL && va < 0x100890000ULL))) continue;
+			snprintf(path, sizeof(path), "%s/%s.bin", argv[i], nm);
+			g = fopen(path, "rb");
+			if (!g) continue;
+			buf = (uint8_t *)calloc(1, len);
+			if (fread(buf, 1, len, g) < 1) {}
+			fclose(g);
+			for (q = 0; q < n0; q++) {
+				if (regs[q].va == va && regs[q].len == len) {
+					uint64_t b;
+
+					for (b = 0; b < len; b++) if (regs[q].m[b] == 0) regs[q].m[b] = buf[b];
+					break;
+				}
+			}
+			if (q == n0 && nregs < 256) {
+				snprintf(regs[nregs].name, sizeof(regs[nregs].name), "%s", nm);
+				regs[nregs].va = va; regs[nregs].len = len; regs[nregs].m = buf;
+				nregs++;
+				buf = 0;
+			}
+			if (buf) free(buf);
+		}
+		fclose(f);
+	}
 	if (!cl) { fprintf(stderr, "no shmem_100\n"); return 2; }
 
 	np = s8s_find_passes((const uint32_t *)cl, (uint32_t)(cllen / 4), passes, 32);
@@ -285,8 +325,8 @@ int main(int argc, char ** argv)
 					}
 				}
 				if (nt < 4) smp[nt][d->sampler[1] < 8 ? d->sampler[1] : 7]++;
-				printf("  DL p%d.%d %s prim %u n %u vs %llx fs %llx vb %llx %s%llx tex %d%s blend %u target %llx\n", p, i, d->kind == S8S_DRAW_INDEXED ? "idx" : "lst", d->prim, d->count,
-				    (unsigned long long)d->vs.entry, (unsigned long long)d->fs.entry, (unsigned long long)vbva, d->kind == S8S_DRAW_INDEXED ? "ib " : "",
+				printf("  DL p%d.%d %s prim %u n %u vs %llx[%s] fs %llx[%s] vb %llx %s%llx tex %d%s blend %u target %llx\n", p, i, d->kind == S8S_DRAW_INDEXED ? "idx" : "lst", d->prim, d->count,
+				    (unsigned long long)d->vs.entry, vv == 1 ? "walk-ok" : vv == 3 ? "no-bytes" : "FAIL", (unsigned long long)d->fs.entry, ff == 1 ? "walk-ok" : ff == 2 ? "entry-ok" : ff == 3 ? "no-bytes" : "unwalked", (unsigned long long)vbva, d->kind == S8S_DRAW_INDEXED ? "ib " : "",
 				    (unsigned long long)(d->kind == S8S_DRAW_INDEXED ? d->index_va : 0), nt, nt ? "" : "", d->blend, (unsigned long long)passes[p].target_va);
 				if (texva) printf("     texture0 at %llx\n", (unsigned long long)texva);
 			}

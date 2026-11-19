@@ -42,6 +42,7 @@
 #include "s8gfx_sf.h"          /* integer-only float, rasteriser and shader interpreter of the software executor (host-tested in scratch/agx) */
 #include "s8gfx_rast.h"
 #include "s8gfx_frag.h"
+#include "s8gfx_stream.h"       /* compositor command stream: passes, draws, pipeline slots */
 
 #define S8AGX_LOG_LIMIT 800
 
@@ -194,6 +195,14 @@ class AGXDeviceUserClient : public IOUserClient
 	uint32_t fSurfId[kSurfMax];
 	uint32_t fSurfN;
 	void fillSurfaceTargets(uint32_t pixel);
+	/* resources that are not kernel shared memory: IOSurface-backed (uptr = surface id) or the caller's own memory (uptr = user VA) */
+	enum { kVmMax = 192 };
+	struct agx_vm { uint64_t va, len, uptr; uint32_t surf; IOMemoryMap * map; };
+	struct agx_vm fVm[kVmMax];
+	uint32_t fVmN;
+	bool resolveVa(uint64_t va, uint8_t ** mem, uint64_t * avail);
+	static int streamRd(void * ctx, uint64_t va, uint32_t * out);
+	void logCompositor(void);
 
 	IOReturn createShmem(IOExternalMethodArguments * args);
 	void executePasses(void);
@@ -370,6 +379,12 @@ AGXDeviceUserClient::free(void)
 	if (fShmemMap != NULL) {
 		IODelete(fShmemMap, IOMemoryMap *, kShmemMax);
 		fShmemMap = NULL;
+	}
+	for (uint32_t k = 0; k < fVmN && k < kVmMax; k++) {
+		if (fVm[k].map != NULL) {
+			fVm[k].map->release();
+			fVm[k].map = NULL;
+		}
 	}
 	if (fResVa != NULL) {
 		IODelete(fResVa, uint64_t, kResMax);
@@ -654,10 +669,133 @@ AGXDeviceUserClient::agxRd(void * ctx, uint64_t va)
 	uint8_t * p;
 	uint64_t avail;
 
-	if (self->findResMem(va, &p, &avail) && avail >= 4) {
+	if (self->resolveVa(va, &p, &avail) && avail >= 4) {
 		return *(const uint32_t *)p;
 	}
 	return 0;
+}
+
+/* GPU VA -> kernel pointer: shared-memory resources first, then IOSurface-backed and caller-memory resources (mapped on first use) */
+bool
+AGXDeviceUserClient::resolveVa(uint64_t va, uint8_t ** mem, uint64_t * avail)
+{
+	if (findResMem(va, mem, avail)) {
+		return true;
+	}
+	for (uint32_t k = 0; k < fVmN && k < kVmMax; k++) {
+		struct agx_vm * v = &fVm[k];
+
+		if (va < v->va || va >= v->va + v->len) {
+			continue;
+		}
+		uint64_t off = va - v->va;
+
+		if (v->surf != 0) {
+			SweetSurface * ss = sweet_surface_copy(v->surf);
+			uintptr_t ka = ss ? ss->kernelAddress() : 0;
+			uint64_t sl = ss ? (uint64_t)ss->allocSize : 0;
+
+			if (ss != NULL) {
+				ss->release();
+			}
+			if (ka == 0 || off >= sl) {
+				return false;
+			}
+			*mem = (uint8_t *)ka + off;
+			*avail = sl - off;
+			return true;
+		}
+		if (v->map == NULL && v->uptr != 0 && fTask != NULL) {
+			IOMemoryDescriptor * md = IOMemoryDescriptor::withAddressRange(v->uptr, v->len, kIODirectionInOut, fTask);
+
+			if (md != NULL) {
+				if (md->prepare() == kIOReturnSuccess) {
+					v->map = md->map(kIOMapAnywhere);
+				}
+				md->release();      /* the map keeps the descriptor alive */
+			}
+		}
+		if (v->map == NULL) {
+			return false;
+		}
+		*mem = (uint8_t *)v->map->getVirtualAddress() + off;
+		*avail = v->len - off;
+		return true;
+	}
+	return false;
+}
+
+int
+AGXDeviceUserClient::streamRd(void * ctx, uint64_t va, uint32_t * out)
+{
+	AGXDeviceUserClient * self = (AGXDeviceUserClient *)ctx;
+	uint8_t * p;
+	uint64_t avail;
+
+	if (self->resolveVa(va, &p, &avail) && avail >= 4) {
+		*out = *(const uint32_t *)p;
+		return 1;
+	}
+	*out = 0;
+	return 0;
+}
+
+/* Walk the compositor passes of the kernel command list (shmem type 1) and log what resolves: a dry run of the draw executor. */
+void
+AGXDeviceUserClient::logCompositor(void)
+{
+	static volatile SInt32 clogged, frames;
+	static const int kMaxPass = 24, kMaxDraw = 48;
+	struct s8s_pass * passes;
+	struct s8s_draw * draws;
+
+	if (OSIncrementAtomic((SInt32 *)&frames) > 40) {
+		return;
+	}
+	passes = (struct s8s_pass *)IOMallocZero(sizeof(*passes) * kMaxPass);
+	draws = (struct s8s_draw *)IOMallocZero(sizeof(*draws) * kMaxDraw);
+	if (passes == NULL || draws == NULL) {
+		goto out;
+	}
+	for (uint32_t r = 0; r < fShmemCount && r < kShmemMax; r++) {
+		if (fShmemBuf[r] == NULL || fShmemType == NULL || fShmemType[r] != 1) {
+			continue;
+		}
+		const uint32_t * cl = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
+		int np = s8s_find_passes(cl, (uint32_t)(fShmemBuf[r]->getLength() / 4), passes, kMaxPass);
+
+		for (int pi = 0; pi < np; pi++) {
+			struct s8s_pass * p = &passes[pi];
+			struct s8s_stats st;
+			uint8_t * tp;
+			uint64_t ta = 0;
+
+			s8s_pass_target(streamRd, this, p);
+			bool tok = p->has_target && resolveVa(p->target_va, &tp, &ta);
+			int nd = s8s_scan(streamRd, this, p->stream, (uint32_t)pi, draws, kMaxDraw, &st);
+			int vsok = 0, fsok = 0;
+
+			for (int di = 0; di < nd; di++) {
+				uint8_t * q;
+				uint64_t a;
+
+				vsok += resolveVa(draws[di].vs.entry, &q, &a) ? 1 : 0;
+				fsok += resolveVa(draws[di].fs.entry, &q, &a) ? 1 : 0;
+			}
+			if (OSIncrementAtomic((SInt32 *)&clogged) < 200) {
+				IOLog("S8AGX: comp: shm %u pass %d %ux%u target 0x%llx %s (avail 0x%llx) draws %d (vs ok %d, fs ok %d) unknown words %u\n", (unsigned)r, pi,
+				    (unsigned)p->width, (unsigned)p->height, (unsigned long long)p->target_va, tok ? "mapped" : (p->has_target ? "UNMAPPED" : "none"),
+				    (unsigned long long)ta, nd, vsok, fsok, (unsigned)st.unknown_words);
+			}
+		}
+	}
+out:
+	if (passes != NULL) {
+		IOFree(passes, sizeof(*passes) * kMaxPass);
+	}
+	if (draws != NULL) {
+		IOFree(draws, sizeof(*draws) * kMaxDraw);
+	}
 }
 
 /*
@@ -890,6 +1028,7 @@ AGXDeviceUserClient::fillSurfaceTargets(uint32_t pixel)
 void
 AGXDeviceUserClient::executePasses(void)
 {
+	logCompositor();
 	if (fSurfN != 0) {
 		fillSurfaceTargets(0xffe09030u);        /* memory bytes 30 90 e0 ff: if the panel shows orange the format is BGRA, if blue it is RGBA */
 		/* compositor draw packets {0x00220000|0x00260000|0x001b0000, 0x6e44pp00, count, instances - 1}: log where they are (first few per call) */
@@ -1242,6 +1381,14 @@ AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		if (fResId <= kResMax) {
 			fResVa[fResId - 1] = va;
 			fResShm[fResId - 1] = dataRegion;
+		}
+		if (given && !sub && dataRegion == 0xffffffffu && fVmN < kVmMax) {
+			fVm[fVmN].va = va;
+			fVm[fVmN].len = size;
+			fVm[fVmN].uptr = uptr;
+			fVm[fVmN].surf = ((flags & 0x82) == 0x82 && uptr < 0x10000) ? (uint32_t)uptr : 0;
+			fVm[fVmN].map = NULL;
+			fVmN++;
 		}
 		if ((flags & 0x82) == 0x82 && uptr != 0 && uptr < 0x10000 && fSurfN < kSurfMax) {
 			/* an IOSurface as render target: the "user pointer" is the surface id (SWEET FB swap ... surface N) */
