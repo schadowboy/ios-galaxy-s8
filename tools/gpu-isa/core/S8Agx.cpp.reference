@@ -822,7 +822,7 @@ AGXDeviceUserClient::bindUniforms(const struct s8s_prog * pg, uint32_t * uni)
 		}
 		uint32_t halves = pu->halves ? pu->halves : 32;
 
-		for (uint32_t j = 0; j < halves / 2 && pu->dest + 2 * j < 128; j++) {
+		for (uint32_t j = 0; j < halves / 2 && pu->dest + 2 * j < S8F_NUNI; j++) {
 			uni[pu->dest + 2 * j] = agxRd(this, pu->va + 4 * j);
 		}
 	}
@@ -1050,7 +1050,7 @@ AGXDeviceUserClient::execComposite(void)
 				uint32_t vp[4];
 				uint32_t nvar = 0, idxmax = 0;
 				uint32_t ntri;
-				uint32_t uni[128];
+				uint32_t uni[S8F_NUNI];
 				uint32_t idxv[3];
 				uint32_t dTried = 0, dOk = 0, dFail = 0, dUnk = 0, dPc = 0, dMask = 0, dW = 0;
 				int32_t dX = 0, dY = 0;
@@ -1186,13 +1186,16 @@ AGXDeviceUserClient::execComposite(void)
 							uint32_t tw = bbox ? (uint32_t)(bx1 - bx0) : p->width, th = bbox ? (uint32_t)(by1 - by0) : p->height;
 							/* the 0x40-byte header in front of the texels: {2, 2, 0x40, 9, w_aligned, h, w, h, 1, ..}: real size w x h, row stride = width rounded up to 64;
 							 * the texels are alpha (A8: the sample returns (0,0,0,v)) */
-							uint32_t hw = agxRd(this, r8tva - 0x40 + 4 * 6), hh = agxRd(this, r8tva - 0x40 + 4 * 5);
+							uint32_t hw = agxRd(this, r8tva - 0x40 + 4 * 6), hh = agxRd(this, r8tva - 0x40 + 4 * 5), hW = agxRd(this, r8tva - 0x40 + 4 * 4);
 
 							uint32_t recw = ok == 0 ? dc->tmpl.texd[dc->tmpl.ntex].width : 0;      /* the record's own (row) width, before it is overwritten */
 
 							if (hw != 0 && hw <= 4096 && hh != 0 && hh <= 4096) {
 								tw = hw;
 								th = hh;
+								if (hW >= hw && hW <= 4096) {
+									tw = hW;        /* the sampler's normalised u spans the PADDED width (header dword 4): sampling at the nominal width clips the last glyph */
+								}
 							}
 							/* row stride = the larger of the record's width and the header width aligned to 32 (date: 694 -> 704, clock 720 -> 736 = the record width) */
 							uint32_t stride = (tw + 31) & ~31u;
@@ -1685,7 +1688,7 @@ AGXDeviceUserClient::executeDraws(uint32_t * target, uint64_t npx, uint64_t vtxV
 			struct s8f_ctx c;
 
 			bzero(&c, sizeof(c));
-			memcpy(c.uni, uni, sizeof(c.uni));
+			memcpy(c.uni, uni, 128 * sizeof(uint32_t));     /* the legacy test-pass path keeps a 128-entry file */
 			c.rd = agxRd;
 			c.rdctx = this;
 			c.vid = vid;

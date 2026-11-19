@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..2b4a07f
+index 0000000..b415874
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,2420 @@
+@@ -0,0 +1,2423 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -828,7 +828,7 @@ index 0000000..2b4a07f
 +		}
 +		uint32_t halves = pu->halves ? pu->halves : 32;
 +
-+		for (uint32_t j = 0; j < halves / 2 && pu->dest + 2 * j < 128; j++) {
++		for (uint32_t j = 0; j < halves / 2 && pu->dest + 2 * j < S8F_NUNI; j++) {
 +			uni[pu->dest + 2 * j] = agxRd(this, pu->va + 4 * j);
 +		}
 +	}
@@ -1056,7 +1056,7 @@ index 0000000..2b4a07f
 +				uint32_t vp[4];
 +				uint32_t nvar = 0, idxmax = 0;
 +				uint32_t ntri;
-+				uint32_t uni[128];
++				uint32_t uni[S8F_NUNI];
 +				uint32_t idxv[3];
 +				uint32_t dTried = 0, dOk = 0, dFail = 0, dUnk = 0, dPc = 0, dMask = 0, dW = 0;
 +				int32_t dX = 0, dY = 0;
@@ -1192,13 +1192,16 @@ index 0000000..2b4a07f
 +							uint32_t tw = bbox ? (uint32_t)(bx1 - bx0) : p->width, th = bbox ? (uint32_t)(by1 - by0) : p->height;
 +							/* the 0x40-byte header in front of the texels: {2, 2, 0x40, 9, w_aligned, h, w, h, 1, ..}: real size w x h, row stride = width rounded up to 64;
 +							 * the texels are alpha (A8: the sample returns (0,0,0,v)) */
-+							uint32_t hw = agxRd(this, r8tva - 0x40 + 4 * 6), hh = agxRd(this, r8tva - 0x40 + 4 * 5);
++							uint32_t hw = agxRd(this, r8tva - 0x40 + 4 * 6), hh = agxRd(this, r8tva - 0x40 + 4 * 5), hW = agxRd(this, r8tva - 0x40 + 4 * 4);
 +
 +							uint32_t recw = ok == 0 ? dc->tmpl.texd[dc->tmpl.ntex].width : 0;      /* the record's own (row) width, before it is overwritten */
 +
 +							if (hw != 0 && hw <= 4096 && hh != 0 && hh <= 4096) {
 +								tw = hw;
 +								th = hh;
++								if (hW >= hw && hW <= 4096) {
++									tw = hW;        /* the sampler's normalised u spans the PADDED width (header dword 4): sampling at the nominal width clips the last glyph */
++								}
 +							}
 +							/* row stride = the larger of the record's width and the header width aligned to 32 (date: 694 -> 704, clock 720 -> 736 = the record width) */
 +							uint32_t stride = (tw + 31) & ~31u;
@@ -1691,7 +1694,7 @@ index 0000000..2b4a07f
 +			struct s8f_ctx c;
 +
 +			bzero(&c, sizeof(c));
-+			memcpy(c.uni, uni, sizeof(c.uni));
++			memcpy(c.uni, uni, 128 * sizeof(uint32_t));     /* the legacy test-pass path keeps a 128-entry file */
 +			c.rd = agxRd;
 +			c.rdctx = this;
 +			c.vid = vid;
@@ -2426,10 +2429,10 @@ index 0000000..2b4a07f
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
 diff --git a/iokit/Kernel/arm/s8gfx_frag.h b/iokit/Kernel/arm/s8gfx_frag.h
 new file mode 100755
-index 0000000..1ac06a6
+index 0000000..79053ee
 --- /dev/null
 +++ b/iokit/Kernel/arm/s8gfx_frag.h
-@@ -0,0 +1,1160 @@
+@@ -0,0 +1,1161 @@
 +/*
 + * Fragment program interpreter for the A11 (G10) shader subset decoded so far (tools/agx-emu.py is its Python twin, validated on the render scenes).
 + * Integer-only (s8gfx_sf.h), no libc, so it builds into the kernel and into the host test (scratch/agx/frag_test.c).
@@ -2448,6 +2451,7 @@ index 0000000..1ac06a6
 +
 +#define S8F_REGS 64
 +#define S8F_NTEX 8
++#define S8F_NUNI 256                    /* uniform file size in half-register slots: the compositor fragment programs address up to half 0x116 (c2 b2 up to 0xfa) */
 +
 +struct s8f_ctx {
 +	f32b r[S8F_REGS];               /* 32-bit registers, index = half-register index / 2 */
@@ -2466,7 +2470,7 @@ index 0000000..1ac06a6
 +	unsigned pc_fail;               /* byte offset of the instruction the interpreter did not know */
 +	/* vertex stage with the uniform file: uni[] is indexed by 16-bit half index (even indices hold the 32-bit words), pushed by the uniform-push records;
 +	 * rd reads a 32-bit word at a GPU virtual address (vertex attribute fetch); vid and stride address the vertex */
-+	uint32_t uni[128];
++	uint32_t uni[S8F_NUNI];
 +	uint32_t (*rd)(void * rdctx, uint64_t va);
 +	void * rdctx;
 +	uint32_t vid;
@@ -3092,7 +3096,7 @@ index 0000000..1ac06a6
 +		return n;
 +	}
 +	case 0x82:                                              /* 16-bit uniform copy (ASSUMED, replaces the earlier get_sr reading): h[b1] = half b2 of the uniform file (`82 01 15 00` between the 32-bit `c2` copies of the colour block) */
-+		s8f_sh(c, b[1], (uint16_t)(c->uni[b[2] & 127 & ~1] >> ((b[2] & 1) * 16)));
++		s8f_sh(c, b[1], (uint16_t)(c->uni[b[2] & 255 & ~1] >> ((b[2] & 1) * 16)));
 +		s8f_assume(c, op);
 +		return n;
 +	case 0xa2:                                              /* get_sr, 16-bit: h[b1] = sr[b2] */
@@ -3149,7 +3153,7 @@ index 0000000..1ac06a6
 +		s8f_assume(c, op);
 +		return n;
 +	case 0xc2: case 0x42:                                   /* 32-bit uniform copy into the half-register pair at half index b1 */
-+		c->r[(b[1] >> 1) & (S8F_REGS - 1)] = c->uni[b[2] & 127];
++		c->r[(b[1] >> 1) & (S8F_REGS - 1)] = c->uni[b[2] & 255];
 +		return n;
 +	case 0x75: case 0xde: case 0xfe: case 0x1e: case 0x20: case 0x23: case 0x26:
 +		s8f_assume(c, op);                              /* decoded for length only: treated as no-ops */
@@ -3313,7 +3317,7 @@ index 0000000..1ac06a6
 +			pc += 4;
 +		} else if (c->rd != 0 && (op == 0xc2 || op == 0x42) && pc + 4 <= len) {          /* b3 = 0x04 occurs in the compositor strips (`c2 02 00 04`): same copy */
 +			/* c2 dst src 00: copy the 32-bit uniform at half index src into the register at half index dst */
-+			c->r[(b[1] / 2) & (S8F_REGS - 1)] = c->uni[b[2] & 127];
++			c->r[(b[1] / 2) & (S8F_REGS - 1)] = c->uni[b[2] & 255];
 +			pc += 4;
 +		} else if (c->rd != 0 && op == 0x0e && pc + 6 <= len) {
 +			c->stride = (uint32_t)b[5] * 4;                 /* 0e 00 c0 ca 1a 04: the vertex address multiply-add, stride 16 in these programs */

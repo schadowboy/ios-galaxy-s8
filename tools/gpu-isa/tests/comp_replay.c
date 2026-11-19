@@ -79,7 +79,7 @@ static void bind_uniforms(const struct s8s_prog * pg, uint32_t * uni)
 
 		if (pu->type != 0x03 && pu->type != 0x33) continue;
 		halves = pu->halves ? pu->halves : 32;
-		for (j = 0; j < halves / 2 && pu->dest + 2 * j < 128; j++) uni[pu->dest + 2 * j] = agxrd(0, pu->va + 4 * j);
+		for (j = 0; j < halves / 2 && pu->dest + 2 * j < S8F_NUNI; j++) uni[pu->dest + 2 * j] = agxrd(0, pu->va + 4 * j);
 	}
 }
 
@@ -201,7 +201,7 @@ int main(int argc, char ** argv)
 			const uint8_t * vbase, * fbase;
 			uint64_t voff, vlen, foff, flen;
 			unsigned vstart, fstart = 0;
-			uint32_t vp[4], uni[128], tried = 0, ok = 0, fail = 0, k, t;
+			uint32_t vp[4], uni[S8F_NUNI], tried = 0, ok = 0, fail = 0, k, t;
 			uint32_t fu = 0, fpc = 0, fmask = 0, idxv[3];
 			int inside = 0, outside = 0, nvar = 0, simg = 0;
 			float minx = 1e30f, maxx = -1e30f, miny = 1e30f, maxy = -1e30f;

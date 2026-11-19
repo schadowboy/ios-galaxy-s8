@@ -105,7 +105,7 @@ static void bind_uniforms(const struct s8s_prog * pg, uint32_t * uni)
 
 		if (pu->type != 0x03 && pu->type != 0x33) continue;
 		halves = pu->halves ? pu->halves : 32;
-		for (j = 0; j < halves / 2 && pu->dest + 2 * j < 128; j++) uni[pu->dest + 2 * j] = agxrd(0, pu->va + 4 * j);
+		for (j = 0; j < halves / 2 && pu->dest + 2 * j < S8F_NUNI; j++) uni[pu->dest + 2 * j] = agxrd(0, pu->va + 4 * j);
 	}
 }
 
@@ -354,7 +354,7 @@ int main(int argc, char ** argv)
 			const uint8_t * vbase, * fbase;
 			uint64_t voff, vlen, foff, flen;
 			unsigned vstart, fstart = 0;
-			uint32_t vp[4], uni[128], nvar = 0, nvid, vid, t, kk, idxv[3], dTried = 0, dOk = 0, dFail = 0, dUnk = 0;
+			uint32_t vp[4], uni[S8F_NUNI], nvar = 0, nvid, vid, t, kk, idxv[3], dTried = 0, dOk = 0, dFail = 0, dUnk = 0;
 			int32_t bx0 = 0, bx1 = 0, by0 = 0, by1 = 0;
 			int bbox = 0, simg = 0;
 			struct comp_px * dc = &dcs;
@@ -437,7 +437,7 @@ int main(int argc, char ** argv)
 								uint32_t hp = 0, hh = 0, hw = 0;
 
 								rd32(tva - 0x40 + 16, &hp); rd32(tva - 0x40 + 20, &hh); rd32(tva - 0x40 + 24, &hw);
-								if (hw >= 1 && hw < 8192 && hh >= 1 && hh < 8192) { tw = hw; th = hh; pitch = (hw + 63) & ~63u; (void)hp; }      /* row stride = width aligned to 64 bytes: 651 -> 704, 694 -> 704 (the header word [4] says 694 for the date, so it is NOT the pitch) */      /* header {.., pitch, height, width, height}: the real texture size (651x387 for a quad that is 582 wide) */
+								if (hw >= 1 && hw < 8192 && hh >= 1 && hh < 8192) { tw = hp >= hw ? hp : hw; th = hh; pitch = (tw + 63) & ~63u;     /* sampler width = header dword [4] (704 for the clock whose visible width is 651: normalised u spans the padded width), pitch = that aligned to 64 */ }      /* row stride = width aligned to 64 bytes: 651 -> 704, 694 -> 704 (the header word [4] says 694 for the date, so it is NOT the pitch) */      /* header {.., pitch, height, width, height}: the real texture size (651x387 for a quad that is 582 wide) */
 							}
 							s8t_desc_make(&dc->tmpl.texd[ti], tva, tw, th, S8T_FMT_A8, S8T_LAYOUT_LINEAR, pitch);
 						}

@@ -16,6 +16,7 @@
 
 #define S8F_REGS 64
 #define S8F_NTEX 8
+#define S8F_NUNI 256                    /* uniform file size in half-register slots: the compositor fragment programs address up to half 0x116 (c2 b2 up to 0xfa) */
 
 struct s8f_ctx {
 	f32b r[S8F_REGS];               /* 32-bit registers, index = half-register index / 2 */
@@ -34,7 +35,7 @@ struct s8f_ctx {
 	unsigned pc_fail;               /* byte offset of the instruction the interpreter did not know */
 	/* vertex stage with the uniform file: uni[] is indexed by 16-bit half index (even indices hold the 32-bit words), pushed by the uniform-push records;
 	 * rd reads a 32-bit word at a GPU virtual address (vertex attribute fetch); vid and stride address the vertex */
-	uint32_t uni[128];
+	uint32_t uni[S8F_NUNI];
 	uint32_t (*rd)(void * rdctx, uint64_t va);
 	void * rdctx;
 	uint32_t vid;
@@ -660,7 +661,7 @@ s8f_step_frag(struct s8f_ctx * c, const uint8_t * b, unsigned avail)
 		return n;
 	}
 	case 0x82:                                              /* 16-bit uniform copy (ASSUMED, replaces the earlier get_sr reading): h[b1] = half b2 of the uniform file (`82 01 15 00` between the 32-bit `c2` copies of the colour block) */
-		s8f_sh(c, b[1], (uint16_t)(c->uni[b[2] & 127 & ~1] >> ((b[2] & 1) * 16)));
+		s8f_sh(c, b[1], (uint16_t)(c->uni[b[2] & 255 & ~1] >> ((b[2] & 1) * 16)));
 		s8f_assume(c, op);
 		return n;
 	case 0xa2:                                              /* get_sr, 16-bit: h[b1] = sr[b2] */
@@ -717,7 +718,7 @@ s8f_step_frag(struct s8f_ctx * c, const uint8_t * b, unsigned avail)
 		s8f_assume(c, op);
 		return n;
 	case 0xc2: case 0x42:                                   /* 32-bit uniform copy into the half-register pair at half index b1 */
-		c->r[(b[1] >> 1) & (S8F_REGS - 1)] = c->uni[b[2] & 127];
+		c->r[(b[1] >> 1) & (S8F_REGS - 1)] = c->uni[b[2] & 255];
 		return n;
 	case 0x75: case 0xde: case 0xfe: case 0x1e: case 0x20: case 0x23: case 0x26:
 		s8f_assume(c, op);                              /* decoded for length only: treated as no-ops */
@@ -881,7 +882,7 @@ s8f_run(struct s8f_ctx * c, const uint8_t * p, unsigned len)
 			pc += 4;
 		} else if (c->rd != 0 && (op == 0xc2 || op == 0x42) && pc + 4 <= len) {          /* b3 = 0x04 occurs in the compositor strips (`c2 02 00 04`): same copy */
 			/* c2 dst src 00: copy the 32-bit uniform at half index src into the register at half index dst */
-			c->r[(b[1] / 2) & (S8F_REGS - 1)] = c->uni[b[2] & 127];
+			c->r[(b[1] / 2) & (S8F_REGS - 1)] = c->uni[b[2] & 255];
 			pc += 4;
 		} else if (c->rd != 0 && op == 0x0e && pc + 6 <= len) {
 			c->stride = (uint32_t)b[5] * 4;                 /* 0e 00 c0 ca 1a 04: the vertex address multiply-add, stride 16 in these programs */
