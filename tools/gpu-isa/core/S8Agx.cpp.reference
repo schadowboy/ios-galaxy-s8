@@ -47,7 +47,8 @@
 
 static volatile SInt32 gAgxLogged;
 static char gDumpName[32] = "s8mtl_test";      /* boot-arg s8agxdump=<process name prefix> */
-static uint32_t gSkip = 0;                      /* boot-arg s8agxskip=<n>: do not dump the first n submits of that process (later rounds of the test) */
+static uint8_t gNoRes[1024];                    /* boot-arg s8agxnores=<id>,<id>,...: resource ids that are never dumped (keeps the console ring from wrapping) */
+static uint32_t gSkip = 0;                     /* boot-arg s8agxskip=<n>: do not dump the first n submits of that process (later rounds of the test) */
 static uint32_t gSeen = 0;
 
 extern "C" uint64_t mach_absolute_time(void);
@@ -1373,7 +1374,7 @@ AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 				for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
 					uint32_t r = fResShm[n - 1];
 
-					if (r != 0xffffffffu && r < fShmemCount && fShmemBuf[r] != NULL) {
+					if (r != 0xffffffffu && r < fShmemCount && fShmemBuf[r] != NULL && !gNoRes[n]) {
 						dumpSparse("res", r, n, 0, fResVa[n - 1], (const uint8_t *)fShmemBuf[r]->getBytesNoCopy(), fShmemBuf[r]->getLength());
 					}
 				}
@@ -1444,6 +1445,30 @@ S8AgxStart(void)
 	PE_parse_boot_argn("s8agxexec", gExecName, sizeof(gExecName));
 	PE_parse_boot_argn("s8agxprogs", gProgName, sizeof(gProgName));
 	PE_parse_boot_argn("s8agxskip", &gSkip, sizeof(gSkip));
+	{
+		char nores[96] = "";
+
+		if (PE_parse_boot_argn("s8agxnores", nores, sizeof(nores))) {
+			uint32_t v = 0;
+			bool have = false;
+
+			for (const char * p = nores;; p++) {
+				if (*p >= '0' && *p <= '9') {
+					v = v * 10 + (uint32_t)(*p - '0');
+					have = true;
+				} else {
+					if (have && v < sizeof(gNoRes)) {
+						gNoRes[v] = 1;
+					}
+					v = 0;
+					have = false;
+					if (*p == 0) {
+						break;
+					}
+				}
+			}
+		}
+	}
 	for (int i = 0; i < 600 && (provider = IOService::getPlatform()) == NULL; i++) {
 		IOSleep(100);
 	}
