@@ -49,7 +49,8 @@
 
 static volatile SInt32 gAgxLogged;
 static char gDumpName[32] = "s8mtl_test";      /* boot-arg s8agxdump=<process name prefix> */
-static uint32_t gNoTex = 0;                     /* boot-arg s8agxnotex=1: do not dump caller-memory (texture) resources */
+static uint32_t gNoProgDump = 0;                /* boot-arg s8agxnoprog=1: do not dump the programs of executed draws */
+static uint32_t gNoTex = 0;                    /* boot-arg s8agxnotex=1: do not dump caller-memory (texture) resources */
 static uint8_t gNoRes[1024];                   /* boot-arg s8agxnores=<id>,<id>,...: resource ids that are never dumped (keeps the console ring from wrapping) */
 static uint32_t gSkip = 0;                     /* boot-arg s8agxskip=<n>: do not dump the first n submits of that process (later rounds of the test) */
 static uint32_t gSeen = 0;
@@ -749,6 +750,47 @@ AGXDeviceUserClient::streamRd(void * ctx, uint64_t va, uint32_t * out)
 
 static uint32_t gPxBudget = 1500000;            /* boot-arg s8agxpx: fragment invocations per submit (software shading is slow) */
 
+/* Dump a window of a program region around an entry point as an extra capture region (same "D"/"L" line format as dumpSparse; id 9000+): a host renderer
+ * then replays the draws with the very programs this boot compiled. Each entry address is dumped once. */
+static bool
+comp_dump_window(uint32_t session, uint64_t entryVa, const uint8_t * base, uint64_t off, uint64_t len, uint64_t before, uint64_t after)
+{
+	static uint64_t done[256];
+	static int ndone;
+	uint64_t from = off > before ? off - before : 0, to = off + after < len ? off + after : len;
+	uint64_t baseVa = entryVa - off;
+
+	for (int k = 0; k < ndone; k++) {
+		if (done[k] == entryVa) {
+			return false;
+		}
+	}
+	if (ndone >= 256 || to <= from) {
+		return false;
+	}
+	done[ndone] = entryVa;
+	IOLog("S8AGX: D %u res %u type 7 va 0x%llx len 0x%llx\n", (unsigned)session, (unsigned)(9000 + ndone), (unsigned long long)(baseVa + (from & ~63ULL)),
+	    (unsigned long long)(((to + 63) & ~63ULL) - (from & ~63ULL)));
+	ndone++;
+	for (uint64_t k = from & ~63ULL; k + 64 <= len && k < to; k += 64) {
+		bool nz = false;
+		char hex[64 * 2 + 1];
+
+		for (int b = 0; b < 64; b++) {
+			if (base[k + b] != 0) {
+				nz = true;
+			}
+			hex[b * 2] = "0123456789abcdef"[base[k + b] >> 4];
+			hex[b * 2 + 1] = "0123456789abcdef"[base[k + b] & 15];
+		}
+		hex[128] = 0;
+		if (nz) {
+			IOLog("S8AGX: L %llx %s\n", (unsigned long long)(k - (from & ~63ULL)), hex);
+		}
+	}
+	return true;
+}
+
 /* log each distinct draw (programs + extent + texture count) once: the same frame repeats for minutes */
 static bool
 comp_new_draw(uint64_t key)
@@ -1172,6 +1214,20 @@ AGXDeviceUserClient::execComposite(void)
 							dc->smpw[si][1] = w2[1];
 							s8t_sampler_decode(&dc->tmpl.texs[si++], w2);
 						}
+					}
+				}
+				if (!gNoProgDump) {
+					const uint8_t * eb;
+					uint64_t eo, el;
+
+					if (findResRegion(d->vs.entry, &eb, &eo, &el)) {
+						comp_dump_window(fSubmitDumps ? fSubmitDumps : 1, d->vs.entry, eb, eo, el, 0x200, 0x600);
+					}
+					if (findResRegion(d->fs.entry, &eb, &eo, &el)) {
+						comp_dump_window(fSubmitDumps ? fSubmitDumps : 1, d->fs.entry, eb, eo, el, 0x1800, 0x1000);
+					}
+					if (d->fs.block != 0 && findResRegion(d->fs.block, &eb, &eo, &el)) {
+						comp_dump_window(fSubmitDumps ? fSubmitDumps : 1, d->fs.block, eb, eo, el, 0x40, 0x1400);
 					}
 				}
 				dc->frag = fbase + fstart;
@@ -2254,6 +2310,7 @@ S8AgxStart(void)
 	PE_parse_boot_argn("s8agxskip", &gSkip, sizeof(gSkip));
 	PE_parse_boot_argn("s8agxpx", &gPxBudget, sizeof(gPxBudget));
 	PE_parse_boot_argn("s8agxnotex", &gNoTex, sizeof(gNoTex));
+	PE_parse_boot_argn("s8agxnoprog", &gNoProgDump, sizeof(gNoProgDump));
 	{
 		char nores[96] = "";
 

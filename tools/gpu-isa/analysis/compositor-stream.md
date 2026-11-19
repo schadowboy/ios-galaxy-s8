@@ -256,3 +256,18 @@ Results after the fixes: capture17 s8: 18 of 18 vertex programs with bytes run (
 program bytes, 2 stop at unknown forms 0x56, 0xc4). capture18 s11: 13 vertex ok, fragment 7 stored, stops at 0x0a (funop) and 0xc0. Remaining interpreter gaps: (a) the 4-vertex strip `6e44 prim 9` rect draws (vs 0x1006144e0): all 4 vertices
 come out at (-x0, -y0): the vid-dependent corner selection (integer ops) is not executed; (b) stored colours of the textured shaders are tiny (3e-5, 0.0078, 0.03) because f16 ops (`c6 f6 76`) and the 32-bit texture_sample
 results share the register file with different conventions; (c) unknown ops 0x56, 0xc4, 0x0a, 0xc0 (see compositor-frag-forms.md).
+
+## 13. Host frame renderer (tests/comp_render.c, tests/comp_render.sh, tests/ppm2png.py)
+
+Run (WSL): `wsl -u root -d Ubuntu -- bash tests/comp_render.sh` renders capture17 s8, capture18 s11 and s14 (program heaps merged from capture17 s10) to `logs/_frame_<name>.png` (display target), `logs/_frame_<name>_t<VA>.png`
+(every pass target; offscreen layers over a grey checker) and `logs/_render_<name>.txt` (per pass / draw: program entries and start kind, texture bindings, quad bbox, vertices ok, pixels covered / stored, first output pixel, unknown ops).
+One frame: `bash tests/comp_render.sh <name> <capture dir name> <session> [<merge capture>:<session>] -- [flags]`, e.g. `... bash tests/comp_render.sh f19 capture19 14 capture17:10 -- -all -v`.
+Flags: `-all` all targets, `-v` texture records, `-synth` ignore texel memory, `-keepfull` do not skip the full-screen dither pass, `-selfblend` force the hardware blend even for programs that read the destination, `-bg AARRGGBB`.
+Logic = execComposite (pre-pass bbox, R8 0x8002 layer textures sized to the quad, constant / destination-only fast paths, premultiplied source-over for blend=1) with these host differences, which the kernel should adopt:
+* pass targets are separate linear BGRA8 buffers (pitch = pass width * 4) keyed by VA; a texture whose address is a previous pass's target is bound as LINEAR BGRA8 with THAT target's width/height/pitch
+  (the kernel's Morton + pass-size guess is wrong for blur chains);
+* texel memory that is zero / missing gets a synthetic checker (visible), real texels are used when the snapshot has them (capture19 type-9 regions);
+* programs that read the destination (`ld_tile` 0x79 / 0xf9) blend themselves: no second hardware blend; a full-screen blend pass whose program reads the destination (the last draw of every display pass, fs 0x1000e4220: f16 dither / resolve) is skipped
+  by default because the f16 forms are not decoded and it writes opaque black over the whole frame.
+Findings on the capture17 session-8 frame: geometry plausible (a 694x79 header bar over a 582x387 body at (373,303)-(1067,738), both white because the R8 mask texels are synthetic, a 103x63 widget at (1071,55), a 90x90 coloured icon
+at (1158,2666) from IOSurface 5, a 516x15 home-indicator bar at (462,2921), the full-screen backdrop = vertex colour (0,0,0,1) i.e. black). Missing: every draw whose vertex/fragment bytes are zero in the capture (blur chain passes 2-5, 7, 8: 13 of 31 draws).
