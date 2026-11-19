@@ -62,6 +62,7 @@ struct s8f_ctx {
 	unsigned ntex_missing;
 	unsigned last_iter;             /* half index of the destination of the last iter: the coordinates a texture_sample reads (ASSUMED) */
 	uint32_t hit[256];              /* executed instructions by opcode (coverage runner) */
+	unsigned vaddr_reg1;            /* vertex stage: 1 + the register pair written by the last address imadd (the base of the following device_loads); 0 = none yet */
 };
 
 /* 16-bit lane access to the 32-bit register file: half index i = register i / 2, low half first */
@@ -576,11 +577,17 @@ s8f_run(struct s8f_ctx * c, const uint8_t * p, unsigned len)
 	c->stored = 0;
 	c->unknown = 0;
 	c->discard = 0;
+	if (c->rd != 0) {
+		c->r[5] = c->vid;               /* vertex stage: the hardware pre-loads the vertex id in r5 (half index 10, the A operand of the address imadd) */
+	}
 	while (pc + 2 <= len) {
 		const uint8_t * b = p + pc;
 		uint8_t op = b[0];
 
 		c->hit[op]++;
+#ifdef S8F_TRACE
+		S8F_TRACE(c, pc, b);
+#endif
 		if (c->rd == 0 && c->fetch == 0) {
 			uint32_t was = 0, now = 0;
 			unsigned adv, i;
@@ -726,21 +733,63 @@ s8f_run(struct s8f_ctx * c, const uint8_t * p, unsigned len)
 			c->stride = (uint32_t)b[5] * 4;                 /* 0e 00 c0 ca 1a 04: the vertex address multiply-add, stride 16 in these programs */
 			pc += 6;
 		} else if (c->rd != 0 && op == 0x8e && pc + 8 <= len) {
-			c->stride = b[3];                               /* 8e 00 ca <stride> 26 80 c0 00 (stride 32 = 0x20 in the interleaved probe) */
-			pc += 8;
-		} else if (c->rd != 0 && (op == 0x05 || op == 0x85) && pc + 8 <= len) {
-			/* device_load (8 B): 05 <8*dst+1> <byte offset> 05 00 <c4|c8> <NN> 00; components = 2 + bit6 + bit7 of NN; address = pointer in uniform
-			 * halves 0..3 + vid * stride + offset */
-			int n = 2 + ((b[6] >> 6) & 1) + ((b[6] >> 7) & 1);
-			unsigned dst = (b[1] - 1) / 8;
-			uint64_t base = (uint64_t)c->uni[0] | ((uint64_t)c->uni[2] << 32);
-			uint64_t va = base + (uint64_t)c->vid * c->stride + b[2];
+				/* vertex address imadd (8 B, `8e <D> <A> <B> 26 80 <C> 00`): 64-bit D = A * B + C. A = register (the vertex id is pre-loaded in r5 = half index 10 = `ca`),
+				 * B = 8-bit immediate (the vertex STRIDE, 0x30 in the compositor) or a register, C = the register pair r[C/2]:r[C/2+1] (the buffer base copied from the uniforms
+				 * by `c2 00 00 00` / `c2 02 02 00`), D = the register pair at half index b1 >> 2. Replaces the old `stride = b[3]` shortcut (S8F fix, tests/comp_replay.c). */
+				uint64_t a = c->r[((b[2] & 0x3f) >> 1) & (S8F_REGS - 1)];
+				uint64_t m = ((b[3] >> 6) >= 2) ? c->r[((b[3] & 0x3f) >> 1) & (S8F_REGS - 1)] : (uint64_t)b[3];
+				unsigned cr = ((b[6] & 0x3f) >> 1) & (S8F_REGS - 1), dr = (b[1] >> 3) & (S8F_REGS - 1);
+				uint64_t cc = (uint64_t)c->r[cr] | ((uint64_t)c->r[(cr + 1) & (S8F_REGS - 1)] << 32);
+				uint64_t res = a * m + cc;
 
-			for (int k = 0; k < n; k++) {
-				c->r[(dst + k) & (S8F_REGS - 1)] = c->rd(c->rdctx, va + 4 * (uint64_t)k);
-			}
-			pc += 8;
-		} else if (c->rd == 0 && op == 0xc2 && pc + 20 <= len && b[1] == 0x02 && b[4] == 0x0e && b[10] == 0x05 && b[18] == 0x38) {
+				c->r[dr] = (uint32_t)res;
+				c->r[(dr + 1) & (S8F_REGS - 1)] = (uint32_t)(res >> 32);
+				c->stride = (uint32_t)m;
+				c->vaddr_reg1 = dr + 1;
+				pc += 8;
+			} else if (c->rd != 0 && (op == 0x05 || op == 0x85) && pc + 8 <= len) {
+				/* device_load (8 B) with the G13 field layout (same as s8f_devldst): F = b0[7] | b1[1:0] << 1 | b6[0] << 3 (2 = 32-bit, 1 / 3 = 16-bit, f16 in the vertex
+				 * attribute streams), mask = b6 >> 4, destination R = b1 >> 2 (half index; b6 bit 1 = 32-bit registers), offset O = b2 >> 4 | (b4 & 15) << 4 | b7 << 8
+				 * (b3 bit 0: immediate) shifted left by (log2 element size + b5[3:2]) bytes, address = the register pair r[(b5 & 63) / 2] (the imadd result) + offset.
+				 * 16-bit destinations are widened to float in c->h[] (the 32-bit ALU forms read half sources from there). Replaces the old `base = uni[0] + vid * stride + b[2]`. */
+				unsigned F = ((b[0] >> 7) & 1) | ((b[1] & 3) << 1) | ((b[6] & 1) << 3);
+				unsigned mask = b[6] >> 4, R = (b[1] >> 2) | ((b[5] & 3) << 6);
+				int r32 = (b[6] >> 1) & 1;
+				uint32_t O = (b[2] >> 4) | ((b[4] & 15) << 4) | ((uint32_t)b[7] << 8);
+				unsigned sh = (b[5] >> 2) & 3, esh = (F == 2 || F == 0) ? 2 : 1, j = 0, k;
+				unsigned br = c->vaddr_reg1 ? c->vaddr_reg1 - 1 : 0;   /* the imadd result pair (b5 names r4 even when the imadd wrote r0) */
+				uint64_t base = c->vaddr_reg1 ? ((uint64_t)c->r[br] | ((uint64_t)c->r[(br + 1) & (S8F_REGS - 1)] << 32))
+				    : (((uint64_t)c->uni[0] | ((uint64_t)c->uni[2] << 32)) + (uint64_t)c->vid * c->stride);   /* programs with the older `0e ..` address form (no imadd): pointer in uniform halves 0..3 + vid * stride */
+				uint64_t va;
+
+				if (sh == 3) {
+					sh = 2;
+				}
+				va = base + ((uint64_t)O << (esh + sh));
+				for (k = 0; k < 4; k++) {
+					uint32_t v;
+
+					if (!((mask >> k) & 1)) {
+						continue;
+					}
+					if (esh == 2) {
+						v = c->rd(c->rdctx, va + 4 * (uint64_t)j);
+						c->r[((R >> 1) + j) & (S8F_REGS - 1)] = v;
+					} else {
+						uint32_t w = c->rd(c->rdctx, (va + 2 * (uint64_t)j) & ~3ULL);
+
+						v = ((va + 2 * (uint64_t)j) & 2) ? (w >> 16) : (w & 0xffff);
+						if (r32) {
+							c->r[((R >> 1) + j) & (S8F_REGS - 1)] = sf_h2f((uint16_t)v);
+						} else {
+							c->h[(R + j) & (S8F_REGS * 2 - 1)] = sf_h2f((uint16_t)v);
+							s8f_sh(c, R + j, (uint16_t)v);
+						}
+					}
+					j++;
+				}
+				pc += 8;
+			} else if (c->rd == 0 && op == 0xc2 && pc + 20 <= len && b[1] == 0x02 && b[4] == 0x0e && b[10] == 0x05 && b[18] == 0x38) {
 			/* vertex fetch prologue (20 B): c2 02 02 00 | 0e 00 c0 ca 1a 04 | 05 01 00 05 00 cX NN 00 | 38 00; components loaded = 2 + bit6 + bit7 of NN */
 			int n = 2 + ((b[16] >> 6) & 1) + ((b[16] >> 7) & 1);
 
@@ -782,10 +831,12 @@ s8f_run(struct s8f_ctx * c, const uint8_t * p, unsigned len)
  * Returns 1, 2 or 3 accordingly with *start set, 0 when there is no candidate.
  */
 static inline int
-s8f_walk_lands(const uint8_t * m, unsigned len, unsigned start, unsigned entry)
+s8f_walk_lands2(const uint8_t * m, unsigned len, unsigned start, unsigned entry, unsigned * eff)
 {
 	unsigned pc = start;
 	int hit = start == entry || start == entry + 2;
+
+	*eff = start;                           /* start of the shader the entry belongs to: moves past an earlier shader of the same image (its end + 08 00 padding) */
 
 	while (pc + 2 <= len) {
 		unsigned n = s8f_len(m + pc, len - pc);
@@ -818,22 +869,53 @@ s8f_walk_lands(const uint8_t * m, unsigned len, unsigned start, unsigned entry)
 }
 
 static inline int
+s8f_walk_lands(const uint8_t * m, unsigned len, unsigned start, unsigned entry)
+{
+	unsigned eff;
+
+	return s8f_walk_lands2(m, len, start, entry, &eff);
+}
+
+static inline int
 s8f_start_image(const uint8_t * m, unsigned len, unsigned block, unsigned entry, unsigned * start)
 {
-	unsigned q;
+	unsigned q, eff;
 
-	if (block != (unsigned)-1 && block + 0x40 < len && s8f_walk_lands(m, len, block + 0x40, entry)) {
-		*start = block + 0x40;
+	if (block != (unsigned)-1 && block + 0x40 < len && s8f_walk_lands2(m, len, block + 0x40, entry, &eff)) {
+		*start = eff;                   /* block + 0x40, or the later shader of a multi-shader image */
 		return 1;
 	}
 	for (q = entry >= 0x100 ? entry - 0x100 : 0; q <= entry; q++) {
-		if (s8f_walk_lands(m, len, q, entry)) {
-			*start = q;
+		if (s8f_walk_lands2(m, len, q, entry, &eff)) {
+			*start = eff;
 			return 2;
 		}
 	}
 	if (block != (unsigned)-1 && block + 0x40 < len && s8f_len(m + block + 0x40, len - block - 0x40) != 0) {
-		*start = block + 0x40;
+		/* unverified: still skip the complete shaders that end before the entry pointer (multi-shader image: tile preamble shader, `08 01`, `08 00` padding, the real shader) */
+		unsigned pc = block + 0x40, guard;
+
+		eff = pc;
+		for (guard = 0; guard < 64 && pc + 2 <= len; guard++) {
+			unsigned n = s8f_len(m + pc, len - pc);
+
+			if (n == 0) {
+				break;
+			}
+			if (m[pc] == 0x08 && m[pc + 1] == 0x01) {
+				if (pc + 4 > entry) {
+					break;
+				}
+				pc += 4;
+				while (pc + 2 <= len && m[pc] == 0x08 && m[pc + 1] == 0x00) {
+					pc += 2;
+				}
+				eff = pc;
+				continue;
+			}
+			pc += n;
+		}
+		*start = eff;
 		return 3;
 	}
 	return 0;

@@ -233,3 +233,26 @@ heaps res_3 / 10 / 59 / 68..77 from another snapshot). Per-draw lines `DL ... vs
   The "no bytes" ones all lie in 0x1006df000-0x1006dffff, 0x10070e000-0x10070ffff, 0x10073e000-0x10073ffff (res_68..71, skipped) and, for 18 of capture17's, res_10: **so the new dump rule made program coverage worse for
   the compositor draws, not better; programs of res_3 / res_59 / res_72..76 are present now** (res_59 programs 0x1006139b0, 0x100619ff0, 0x10061ee70 walk fine).
 * Fragment program forms, per-program disassembly and the work list: `analysis/compositor-frag-forms.md`. Sampled textures, their resources and IOSurface ids, and the descriptor words: section 4 of that file.
+
+## 12. Host reproduction of execComposite (tests/comp_replay.c, tests/comp_replay.sh)
+
+`wsl -u root -d Ubuntu -- bash tests/comp_replay.sh` runs the kernel's per-draw logic on capture17 session 8 and capture18 sessions 11, 14 (program heaps merged from capture17 s10); `-v` prints vertex exports,
+`-t <pass> <draw>` / `-tf <pass> <draw>` trace the first vertex / the first fragment pixel instruction by instruction (hook `S8F_TRACE` in `s8f_run`, host only). Output: `logs/_comp_*.txt`.
+
+Bugs found and fixed (the kernel glue needs no change for 1 and 2 beyond taking the new headers; 3-5 are glue):
+1. **Uniform push source address** (`s8s_push_decode`): the low byte is `(w0 >> 24) & 0xfc`, NOT `& 0xfe`; bit 1 is a flag (`0x22`, `0xb2`, `0x82` ...). With `0xfe` every transform block was read 2 bytes off, so all matrices
+   came out as f32 garbage (w = 0, positions -inf/nan, 0 pixels). `s8s_push.flags` keeps the bit. Data after the fix: the transform block is f32 `{1/1440, 0, ..., -1/1480, ..., -1.0, 1.0, 0, 1.0}`.
+2. **Vertex stage address/fetch** (`s8f_run`, rd != 0): `8e <D> ca 30 26 80 c0 00` is a 64-bit imadd `D = r5 * 0x30 + r1:r0` (r5 = vertex id, stride = immediate, r0:r1 = base copied by `c2 00 00 00` / `c2 02 02 00`), and
+   `05/85 ..` device_load uses the G13 layout: offset `O = b2>>4 | (b4&15)<<4 | b7<<8` shifted by `log2(element size) + b5[3:2]` (second stream: `85 20 48 05 00 c8 f0 00` = 16-bit elements at +0x20), base = the imadd result pair
+   (not b5, not `uni[0] + vid*stride + b2`). The vertex id is pre-loaded in r5 (new: `s8f_run` sets `r[5] = vid` when `rd != 0`; kernel glue unchanged since it sets `c.vid`). The old `uni[0]`-based path remains for the
+   `0e` programs of the test app (run_all.sh all green).
+3. **Fragment image start** (`s8f_start_image`): a program image can hold several shaders (`08 01`, `08 00` padding, next shader); the returned start is now the start of the shader that contains the entry (was block+0x40, i.e.
+   the tile-preamble shader, which ended without a store). The unverified fallback (return 3) skips complete shaders before the entry too.
+4. Kernel glue: `execComposite` skips `d->count > 4000` etc. fine; do NOT treat `halves` of pushes as bytes; texture descriptors: `s8t_desc_decode` accepts only format low half `0x050a` and `w[2] << 2`: the compositor's records are other
+   formats (0x8002, 0x4642, 0x5982, 0x54c2 ...) and attachment form 1 (`VA >> 4`): use `s8s_texrec_va` for the address and `s8t_desc_make` with the pass / surface size until Agent I decodes w1.
+5. Programs whose bytes are zero in the capture (res_10 / res_68..71 skipped by the dump rule) cannot run; in the live kernel they exist, so the "vertices failed, op 0x00 at +0" lines of the capture replay are a capture artefact.
+
+Results after the fixes: capture17 s8: 18 of 18 vertex programs with bytes run (all vertices on screen: full-screen quads (0,0)-(1440,2960), icons (429,350)-(1011,737), blur taps), fragment: 16 of 31 draws store pixels (13 have no
+program bytes, 2 stop at unknown forms 0x56, 0xc4). capture18 s11: 13 vertex ok, fragment 7 stored, stops at 0x0a (funop) and 0xc0. Remaining interpreter gaps: (a) the 4-vertex strip `6e44 prim 9` rect draws (vs 0x1006144e0): all 4 vertices
+come out at (-x0, -y0): the vid-dependent corner selection (integer ops) is not executed; (b) stored colours of the textured shaders are tiny (3e-5, 0.0078, 0.03) because f16 ops (`c6 f6 76`) and the 32-bit texture_sample
+results share the register file with different conventions; (c) unknown ops 0x56, 0xc4, 0x0a, 0xc0 (see compositor-frag-forms.md).

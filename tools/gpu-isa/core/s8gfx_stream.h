@@ -27,7 +27,7 @@
  *   20000160                                 single-word token between that chunk and the body
  * A slot (vertex or fragment) is a run of 2-dword push records followed by one state record:
  *   push  <w0> <w1>:  type = w0 & 0xff: 0x03 / 0x33 uniform, 0x13 sampler state, 0x17 texture state;
- *                     source VA = (w1 << 8) | (w0 >> 24 & 0xfe), size = (w0 >> 20 & 0x1f) halves (0 = 32), destination = w0 >> 8 & 0xff
+ *                     source VA = (w1 << 8) | (w0 >> 24 & 0xfc), size = (w0 >> 20 & 0x1f) halves (0 = 32), destination = w0 >> 8 & 0xff
  *   state <hdr> <entry|flags> [extra if hdr bit 10] [0x108]  [c0400038 <program block VA>]:
  *                     hdr 0x0001xx1f/2f/3f = vertex program, 0x0011xx1f/2f/3f = fragment program
  */
@@ -56,6 +56,7 @@ struct s8s_push {
 	uint64_t va;                    /* source address */
 	uint32_t halves;                /* size in 16-bit units (uniform pushes; 32 when the field is 0) */
 	uint32_t dest;                  /* destination register / state index (w0 >> 8 & 0xff) */
+	uint32_t flags;                 /* (w0 >> 24) & 3: bit 1 seen set on uniform pushes whose data is f32, meaning [?] */
 };
 
 struct s8s_prog {
@@ -135,7 +136,8 @@ s8s_push_decode(struct s8s_push * p, uint32_t w0, uint32_t w1)
 	p->w0 = w0;
 	p->w1 = w1;
 	p->type = w0 & 0xff;
-	p->va = ((uint64_t)w1 << 8) | ((w0 >> 24) & 0xfe);
+	p->va = ((uint64_t)w1 << 8) | ((w0 >> 24) & 0xfc);   /* bit 1 of the low byte (0x22, 0xb2, 0x82 ...) is a flag, NOT an address bit: the data is 4-aligned (tests/comp_replay.c) */
+	p->flags = (w0 >> 24) & 3;
 	p->halves = (w0 >> 20) & 0x1f;
 	if (p->halves == 0) {
 		p->halves = 32;

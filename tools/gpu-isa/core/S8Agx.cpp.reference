@@ -941,7 +941,34 @@ AGXDeviceUserClient::execComposite(void)
 							w6[j] = agxRd(this, d->fs.push[k].va + 4 * j);
 						}
 						ok = s8t_desc_decode(&dc->tmpl.texd[dc->tmpl.ntex], w6);
-						(void)ok;
+						{
+							uint64_t tva = 0;
+
+							if (s8s_texrec_va(w6, &tva) || !ok) {
+								/* compositor records: address from the attachment form; size/format words are not decoded yet, so take them from the
+								 * backing IOSurface (linear BGRA8 with its pitch) or, for other memory, from the pass size (ASSUMED) */
+								uint32_t tw = p->width, th = p->height, tp = p->width * 4;
+								uint32_t lay = S8T_LAYOUT_MORTON;
+
+								if (tva == 0) {
+									tva = dc->tmpl.texd[dc->tmpl.ntex].va;
+								}
+								for (uint32_t m = 0; m < fVmN && m < kVmMax; m++) {
+									if (fVm[m].surf != 0 && tva >= fVm[m].va && tva < fVm[m].va + fVm[m].len) {
+										SweetSurface * ss = sweet_surface_copy(fVm[m].surf);
+
+										if (ss != NULL) {
+											tw = ss->width;
+											th = ss->height;
+											tp = ss->bytesPerRow;
+											lay = S8T_LAYOUT_LINEAR;
+											ss->release();
+										}
+									}
+								}
+								s8t_desc_make(&dc->tmpl.texd[dc->tmpl.ntex], tva, tw, th, S8T_FMT_BGRA8, lay, tp);
+							}
+						}
 						dc->tmpl.ntex++;
 					}
 				}
