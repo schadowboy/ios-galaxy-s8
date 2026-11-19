@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..d12ea18
+index 0000000..33c239b
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,1637 @@
+@@ -0,0 +1,1954 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -209,6 +209,9 @@ index 0000000..d12ea18
 +	bool resolveVa(uint64_t va, uint8_t ** mem, uint64_t * avail);
 +	static int streamRd(void * ctx, uint64_t va, uint32_t * out);
 +	void logCompositor(void);
++	void execComposite(void);
++	void bindUniforms(const struct s8s_prog * pg, uint32_t * uni);
++	bool fSurfDone[kSurfMax];       /* the first-use background fill of this surface was done */
 +
 +	IOReturn createShmem(IOExternalMethodArguments * args);
 +	void executePasses(void);
@@ -746,6 +749,318 @@ index 0000000..d12ea18
 +	return 0;
 +}
 +
++static uint32_t gPxBudget = 1500000;            /* boot-arg s8agxpx: fragment invocations per submit (software shading is slow) */
++
++/* uniform-push records of a pipeline slot fill the uniform file: address, size in halves (0 = 32), destination half index */
++void
++AGXDeviceUserClient::bindUniforms(const struct s8s_prog * pg, uint32_t * uni)
++{
++	for (uint32_t k = 0; k < pg->npush; k++) {
++		const struct s8s_push * pu = &pg->push[k];
++
++		if (pu->type != 0x03 && pu->type != 0x33) {
++			continue;
++		}
++		uint32_t halves = pu->halves ? pu->halves : 32;
++
++		for (uint32_t j = 0; j < halves / 2 && pu->dest + 2 * j < 128; j++) {
++			uni[pu->dest + 2 * j] = agxRd(this, pu->va + 4 * j);
++		}
++	}
++}
++
++/* one draw's per-pixel state: the fragment program, its uniforms/textures (template context) and the target */
++struct comp_px {
++	struct s8f_ctx tmpl;
++	const uint8_t * frag;
++	uint32_t fraglen;
++	uint8_t * target;
++	uint32_t pitch;                 /* bytes per row */
++	int w, h;
++	int blend;
++	uint32_t pixels, unknown, stored;
++};
++
++static void
++comp_emit(void * vctx, int px, int py, const f32b * v)
++{
++	struct comp_px * dc = (struct comp_px *)vctx;
++	struct s8f_ctx fc;
++	uint32_t * dst;
++
++	if (px < 0 || py < 0 || px >= dc->w || py >= dc->h) {
++		return;
++	}
++	dst = (uint32_t *)(dc->target + (uint64_t)py * dc->pitch + (uint64_t)px * 4);
++	memcpy(&fc, &dc->tmpl, sizeof(fc));
++	fc.varying = v;
++	fc.tile = *dst;
++	fc.has_tile = 1;
++	fc.sr[48] = (uint32_t)px & 31;
++	fc.sr[49] = (uint32_t)py & 31;
++	dc->pixels++;
++	if (s8f_run(&fc, dc->frag, dc->fraglen) && fc.stored) {
++		uint32_t sb = sf_to_unorm8(fc.out[2]), sg = sf_to_unorm8(fc.out[1]), sr = sf_to_unorm8(fc.out[0]), sa = sf_to_unorm8(fc.out[3]);
++
++		if (dc->blend) {                /* premultiplied source-over (HYPOTHESIS for the pipeline blend bit) */
++			uint32_t d = *dst, ia = 255 - sa;
++
++			sb = sb + (((d & 0xff) * ia + 127) / 255);
++			sg = sg + ((((d >> 8) & 0xff) * ia + 127) / 255);
++			sr = sr + ((((d >> 16) & 0xff) * ia + 127) / 255);
++			sa = sa + ((((d >> 24) & 0xff) * ia + 127) / 255);
++			sb = sb > 255 ? 255 : sb;
++			sg = sg > 255 ? 255 : sg;
++			sr = sr > 255 ? 255 : sr;
++			sa = sa > 255 ? 255 : sa;
++		}
++		*dst = sb | (sg << 8) | (sr << 16) | (sa << 24);
++		dc->stored++;
++	} else if (fc.unknown != 0) {
++		dc->unknown = fc.unknown;
++	}
++}
++
++/*
++ * Execute the compositor's draws: for each live pass of the kernel command list, each draw runs the vertex program per vertex, the viewport transform,
++ * the rasteriser and the fragment program per pixel into the pass target (IOSurface = linear BGRA8 with the surface's pitch; other targets: linear, width * 4).
++ */
++void
++AGXDeviceUserClient::execComposite(void)
++{
++	static volatile SInt32 xlogged;
++	static const int kMaxPass = 24, kMaxDraw = 48, kMaxVtx = 1024;
++	struct s8s_pass * passes = (struct s8s_pass *)IOMallocZero(sizeof(*passes) * kMaxPass);
++	struct s8s_draw * draws = (struct s8s_draw *)IOMallocZero(sizeof(*draws) * kMaxDraw);
++	struct s8r_vtx * vt = (struct s8r_vtx *)IOMallocZero(sizeof(*vt) * kMaxVtx);
++	uint8_t * vok = (uint8_t *)IOMallocZero(kMaxVtx);
++	struct comp_px * dc = (struct comp_px *)IOMallocZero(sizeof(*dc));
++	uint32_t budget = gPxBudget;
++
++	if (passes == NULL || draws == NULL || vt == NULL || vok == NULL || dc == NULL) {
++		goto out;
++	}
++	for (uint32_t r = 0; r < fShmemCount && r < kShmemMax; r++) {
++		if (fShmemBuf[r] == NULL || fShmemType == NULL || fShmemType[r] != 1) {
++			continue;
++		}
++		const uint32_t * cl = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
++		int np = s8s_find_passes(cl, (uint32_t)(fShmemBuf[r]->getLength() / 4), passes, kMaxPass);
++
++		for (int pi = 0; pi < np; pi++) {
++			struct s8s_pass * p = &passes[pi];
++			uint32_t first = 0;
++			uint8_t * tp;
++			uint64_t ta = 0;
++
++			if (!streamRd(this, p->stream, &first) || first != 0x80000001u || p->width == 0 || p->height == 0 || p->width > 4096 || p->height > 4096) {
++				continue;                       /* stale block */
++			}
++			s8s_pass_target(streamRd, this, p);
++			if (!p->has_target || !resolveVa(p->target_va, &tp, &ta)) {
++				continue;
++			}
++			uint32_t pitch = p->width * 4;
++
++			for (uint32_t k = 0; k < fVmN && k < kVmMax; k++) {
++				if (fVm[k].surf != 0 && p->target_va >= fVm[k].va && p->target_va < fVm[k].va + fVm[k].len) {
++					SweetSurface * ss = sweet_surface_copy(fVm[k].surf);
++
++					if (ss != NULL) {
++						pitch = ss->bytesPerRow;
++						ss->release();
++					}
++				}
++			}
++			if ((uint64_t)pitch * p->height > ta) {
++				continue;
++			}
++			struct s8s_stats st;
++			int nd = s8s_scan(streamRd, this, p->stream, (uint32_t)pi, draws, kMaxDraw, &st);
++
++			for (int di = 0; di < nd; di++) {
++				struct s8s_draw * d = &draws[di];
++				const uint8_t * vbase;
++				const uint8_t * fbase;
++				uint64_t voff, vlen, foff, flen;
++				unsigned vstart, fstart = 0;
++				uint32_t vp[4];
++				uint32_t nvar = 0, idxmax = 0;
++				uint32_t ntri;
++				uint32_t uni[128];
++				uint32_t idxv[3];
++
++				if (d->kind == S8S_DRAW_OTHER || d->count < 3 || d->count > 4000 || (d->prim != 6 && d->prim != 9)) {
++					continue;
++				}
++				if (!findResRegion(d->vs.entry, &vbase, &voff, &vlen) || !findResRegion(d->fs.entry, &fbase, &foff, &flen)) {
++					continue;
++				}
++				vstart = s8v_find_start(vbase, (unsigned)(vlen > 0xffffffffULL ? 0xffffffffU : vlen), (unsigned)voff);
++				if (d->fs.block != 0 && findResRegion(d->fs.block, &fbase, &foff, &flen)) {
++					/* block image: code at block + 0x40, the entry pointer lies after the preamble */
++					unsigned blk = (unsigned)foff, ent = 0, fs0 = 0;
++					uint64_t eoff;
++					const uint8_t * eb;
++					uint64_t el;
++					if (findResRegion(d->fs.entry, &eb, &eoff, &el) && eb == fbase) {
++						ent = (unsigned)eoff;
++					}
++					if (s8f_start_image(fbase, (unsigned)(flen > 0xffffffffULL ? 0xffffffffU : flen), blk, ent, &fs0)) {
++						fstart = fs0;
++					} else {
++						fstart = blk + 0x40;
++					}
++				} else if (findResRegion(d->fs.entry, &fbase, &foff, &flen)) {
++					unsigned fs0 = 0;
++
++					if (s8f_start_image(fbase, (unsigned)(flen > 0xffffffffULL ? 0xffffffffU : flen), (unsigned)-1, (unsigned)foff, &fs0)) {
++						fstart = fs0;
++					} else {
++						fstart = (unsigned)foff;
++					}
++				}
++				if (d->vp_valid) {
++					memcpy(vp, d->vp, sizeof(vp));
++				} else {
++					vp[0] = sf_from_i64((int64_t)p->width / 2);
++					vp[1] = vp[0];
++					vp[2] = sf_from_i64((int64_t)p->height / 2);
++					vp[3] = sf_from_i64(-(int64_t)p->height / 2);
++				}
++				bzero(dc, sizeof(*dc));
++				bzero(uni, sizeof(uni));
++				bindUniforms(&d->vs, uni);
++				bindUniforms(&d->fs, dc->tmpl.uni);          /* the fragment stage has its own uniform file */
++				dc->tmpl.rd = NULL;
++				dc->tmpl.fetch = NULL;
++				dc->tmpl.trd = agxRd;
++				dc->tmpl.trdctx = this;
++				for (uint32_t k = 0; k < d->fs.npush && dc->tmpl.ntex < S8F_NTEX; k++) {
++					if (d->fs.push[k].type == S8S_PUSH_TEXTURE) {
++						uint32_t w6[6];
++						int ok;
++
++						for (int j = 0; j < 6; j++) {
++							w6[j] = agxRd(this, d->fs.push[k].va + 4 * j);
++						}
++						ok = s8t_desc_decode(&dc->tmpl.texd[dc->tmpl.ntex], w6);
++						(void)ok;
++						dc->tmpl.ntex++;
++					}
++				}
++				{
++					uint32_t si = 0;
++
++					for (uint32_t k = 0; k < d->fs.npush && si < S8F_NTEX; k++) {
++						if (d->fs.push[k].type == S8S_PUSH_SAMPLER) {
++							uint32_t w2[2] = { agxRd(this, d->fs.push[k].va), agxRd(this, d->fs.push[k].va + 4) };
++
++							s8t_sampler_decode(&dc->tmpl.texs[si++], w2);
++						}
++					}
++				}
++				dc->frag = fbase + fstart;
++				dc->fraglen = (uint32_t)(flen - fstart > 0x1000 ? 0x1000 : flen - fstart);
++				dc->target = tp;
++				dc->pitch = pitch;
++				dc->w = (int)p->width;
++				dc->h = (int)p->height;
++				dc->blend = (int)d->blend;
++				bzero(vok, kMaxVtx);
++
++				/* vertex ids of the triangles */
++				ntri = d->kind == S8S_DRAW_INDEXED ? d->count : d->count;
++				for (uint32_t t = 0; t + 3 <= ntri && budget > 0; t += (d->prim == 6 ? 3 : 1)) {
++					for (int q = 0; q < 3; q++) {
++						uint32_t pos = t + (uint32_t)q;
++						uint32_t vid = pos;
++
++						if (d->kind == S8S_DRAW_INDEXED) {
++							uint8_t * ip;
++							uint64_t ia;
++
++							vid = 0;
++							if (resolveVa(d->index_va + 2ULL * pos, &ip, &ia) && ia >= 2) {
++								vid = *(const uint16_t *)ip;
++							}
++						}
++						idxv[q] = vid;
++						if (vid > idxmax) {
++							idxmax = vid;
++						}
++					}
++					if (d->prim == 9 && (t & 1)) {
++						uint32_t tmp = idxv[1];
++
++						idxv[1] = idxv[2];
++						idxv[2] = tmp;
++					}
++					for (int q = 0; q < 3; q++) {
++						uint32_t vid = idxv[q];
++						struct s8f_ctx c;
++
++						if (vid >= (uint32_t)kMaxVtx || vok[vid]) {
++							continue;
++						}
++						bzero(&c, sizeof(c));
++						memcpy(c.uni, uni, sizeof(c.uni));
++						c.rd = agxRd;
++						c.rdctx = this;
++						c.vid = vid;
++						vok[vid] = 2;                   /* tried */
++						if (!s8f_run(&c, vbase + vstart, (unsigned)(vlen - vstart > 0x400 ? 0x400 : vlen - vstart)) || (c.expmask & 0xf) != 0xf) {
++							continue;
++						}
++						f32b iw = sf_div(SF_ONE, c.exp[3]);
++
++						vt[vid].x = sf_fma(vp[1], sf_mul(c.exp[0], iw), vp[0]);
++						vt[vid].y = sf_fma(vp[3], sf_mul(c.exp[1], iw), vp[2]);
++						vt[vid].iw = iw;
++						nvar = 0;
++						while (nvar < S8R_MAXV && (c.expmask & (1u << (4 + nvar)))) {
++							vt[vid].v[nvar] = c.exp[4 + nvar];
++							nvar++;
++						}
++						for (uint32_t k = nvar; k < S8R_MAXV; k++) {
++							vt[vid].v[k] = 0;
++						}
++						vok[vid] = 1;
++					}
++					if (idxv[0] < (uint32_t)kMaxVtx && idxv[1] < (uint32_t)kMaxVtx && idxv[2] < (uint32_t)kMaxVtx && vok[idxv[0]] == 1 && vok[idxv[1]] == 1 &&
++					    vok[idxv[2]] == 1) {
++						uint32_t before = dc->pixels;
++
++						s8r_tri(&vt[idxv[0]], &vt[idxv[1]], &vt[idxv[2]], (int)(nvar ? nvar : 1), 0, 0, dc->w, dc->h, comp_emit, dc);
++						budget = (dc->pixels - before) >= budget ? 0 : budget - (dc->pixels - before);
++					}
++				}
++				if (OSIncrementAtomic((SInt32 *)&xlogged) < 300) {
++					IOLog("S8AGX: comp: pass %d draw %d prim %u n %u kind %u vs 0x%llx fs 0x%llx(+%u) tex %d: %u shaded, %u stored, unknown 0x%02x, budget left %u\n", pi, di,
++					    (unsigned)d->prim, (unsigned)d->count, (unsigned)d->kind, (unsigned long long)d->vs.entry, (unsigned long long)d->fs.entry, fstart,
++					    dc->tmpl.ntex, (unsigned)dc->pixels, (unsigned)dc->stored, (unsigned)dc->unknown, (unsigned)budget);
++				}
++			}
++		}
++	}
++out:
++	if (passes != NULL) {
++		IOFree(passes, sizeof(*passes) * kMaxPass);
++	}
++	if (draws != NULL) {
++		IOFree(draws, sizeof(*draws) * kMaxDraw);
++	}
++	if (vt != NULL) {
++		IOFree(vt, sizeof(*vt) * kMaxVtx);
++	}
++	if (vok != NULL) {
++		IOFree(vok, kMaxVtx);
++	}
++	if (dc != NULL) {
++		IOFree(dc, sizeof(*dc));
++	}
++}
++
 +/* Walk the compositor passes of the kernel command list (shmem type 1) and log what resolves: a dry run of the draw executor. */
 +void
 +AGXDeviceUserClient::logCompositor(void)
@@ -1003,9 +1318,10 @@ index 0000000..d12ea18
 +			uint64_t tva = (uint64_t)d[i + 2] << 4;
 +
 +			for (uint32_t s = 0; s < fSurfN; s++) {
-+				if (fSurfVa[s] != tva) {
++				if (fSurfVa[s] != tva || fSurfDone[s]) {
 +					continue;
 +				}
++				fSurfDone[s] = true;            /* background fill only the first time: later frames load what was drawn */
 +				SweetSurface * ss = sweet_surface_copy(fSurfId[s]);
 +
 +				if (ss != NULL) {
@@ -1034,9 +1350,9 @@ index 0000000..d12ea18
 +void
 +AGXDeviceUserClient::executePasses(void)
 +{
-+	logCompositor();
 +	if (fSurfN != 0) {
-+		fillSurfaceTargets(0xffe09030u);        /* memory bytes 30 90 e0 ff: if the panel shows orange the format is BGRA, if blue it is RGBA */
++		fillSurfaceTargets(0xffe09030u);        /* first-use background (memory bytes 30 90 e0 ff = orange: whatever stays orange was never drawn) */
++		execComposite();
 +		/* compositor draw packets {0x00220000|0x00260000|0x001b0000, 0x6e44pp00, count, instances - 1}: log where they are (first few per call) */
 +		static volatile SInt32 dlogged;
 +		for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
@@ -1598,6 +1914,7 @@ index 0000000..d12ea18
 +	PE_parse_boot_argn("s8agxexec", gExecName, sizeof(gExecName));
 +	PE_parse_boot_argn("s8agxprogs", gProgName, sizeof(gProgName));
 +	PE_parse_boot_argn("s8agxskip", &gSkip, sizeof(gSkip));
++	PE_parse_boot_argn("s8agxpx", &gPxBudget, sizeof(gPxBudget));
 +	{
 +		char nores[96] = "";
 +
@@ -1643,10 +1960,10 @@ index 0000000..d12ea18
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
 diff --git a/iokit/Kernel/arm/s8gfx_frag.h b/iokit/Kernel/arm/s8gfx_frag.h
 new file mode 100755
-index 0000000..26309f7
+index 0000000..6133840
 --- /dev/null
 +++ b/iokit/Kernel/arm/s8gfx_frag.h
-@@ -0,0 +1,733 @@
+@@ -0,0 +1,894 @@
 +/*
 + * Fragment program interpreter for the A11 (G10) shader subset decoded so far (tools/agx-emu.py is its Python twin, validated on the render scenes).
 + * Integer-only (s8gfx_sf.h), no libc, so it builds into the kernel and into the host test (scratch/agx/frag_test.c).
@@ -1661,8 +1978,10 @@ index 0000000..26309f7
 +#define S8GFX_FRAG_H
 +
 +#include "s8gfx_sf.h"
++#include "s8gfx_tex.h"
 +
 +#define S8F_REGS 64
++#define S8F_NTEX 8
 +
 +struct s8f_ctx {
 +	f32b r[S8F_REGS];               /* 32-bit registers, index = half-register index / 2 */
@@ -1698,6 +2017,17 @@ index 0000000..26309f7
 +	uint32_t sr[256];
 +	uint32_t assumed[8];
 +	int strict;
++	/* texture sampling (opcode 0x21, ASSUMED field mapping, see analysis/a11-isa-forms.md): the caller binds up to S8F_NTEX units (descriptor decoded with
++	 * s8t_desc_decode / s8t_desc_make, sampler with s8t_sampler_decode) and a texel reader; ntex = 0 -> samples return transparent black (stored in out regs) and
++	 * ntex_missing counts the samples. The unit index is (b5 & 63) % ntex until the push-record -> slot mapping is proven. */
++	struct s8t_desc texd[S8F_NTEX];
++	struct s8t_sampler texs[S8F_NTEX];
++	int ntex;
++	uint32_t (*trd)(void * ctx, uint64_t va);
++	void * trdctx;
++	unsigned ntex_missing;
++	unsigned last_iter;             /* half index of the destination of the last iter: the coordinates a texture_sample reads (ASSUMED) */
++	uint32_t hit[256];              /* executed instructions by opcode (coverage runner) */
 +};
 +
 +/* 16-bit lane access to the 32-bit register file: half index i = register i / 2, low half first */
@@ -1784,6 +2114,9 @@ index 0000000..26309f7
 +	if (op == 0x79 || op == 0x09 || op == 0x89 || op == 0xc6 || op == 0xca || op == 0x31) {
 +		return 8;
 +	}
++	if (op == 0xf9 || op == 0xf6 || op == 0x76 || op == 0xfa || op == 0x7a) {
++		return 8;                       /* f9 = ld_tile (second family), f6/76 = f16 three-source ALU, fa/7a = f16 ALU: 8 bytes (every program walk that contains them lands on the entry/end) */
++	}
 +	if (op == 0x75) {
 +		return 2;                       /* `75 2a 75 29` before the end of the compositor's fragment programs (two 2-byte units; ASSUMED boundary) */
 +	}
@@ -1820,6 +2153,13 @@ index 0000000..26309f7
 +		return 6;
 +	}
 +	return 0;
++}
++
++/* 16-bit float source byte: hint bits 0b10/0b11 -> half register (6-bit index), else the 8-bit minifloat immediate */
++static inline f32b
++s8f_h16src(const struct s8f_ctx * c, uint8_t v)
++{
++	return (v >> 6) >= 2 ? sf_h2f(s8f_gh(c, v & 0x3f)) : sf_minifloat(v);
 +}
 +
 +/* float -> uint32 / int32, toward zero, saturating (NaN -> 0) */
@@ -1966,8 +2306,8 @@ index 0000000..26309f7
 +	switch (op) {
 +	case 0x05: case 0x85: case 0x45: case 0xc5:
 +		return s8f_devldst(c, b, avail);
-+	case 0x79:
-+		if (b[6] == 0xfa && b[7] == 0xff) {
++	case 0x79: case 0xf9:
++		if (op == 0x79 && b[6] == 0xfa && b[7] == 0xff) {
 +			return 0;                       /* the float form of scene 9 */
 +		}
 +		{
@@ -1991,8 +2331,19 @@ index 0000000..26309f7
 +		uint32_t a, bb, res = 0;
 +		unsigned tt = b[4] >> 4;
 +
-+		if (!w32) {
-+			return 0;
++		if (!w32) {                                     /* 16-bit lanes (b4 & 15 == 0): h[b1 >> 2] = tt(A, B) (compositor `7e 02 c0 81 80 00`; ASSUMED, same table) */
++			a = s8f_s16(c, b[2]);
++			bb = s8f_s16(c, b[3]);
++			if ((b[3] >> 6) < 2) {
++				bb |= (uint32_t)((b[5] >> 4) & 3) << 6;
++			}
++			if (tt & 1) res |= ~a & ~bb;
++			if (tt & 2) res |= a & ~bb;
++			if (tt & 4) res |= ~a & bb;
++			if (tt & 8) res |= a & bb;
++			s8f_sh(c, b[1] >> 2, (uint16_t)res);
++			s8f_assume(c, op);
++			return n;
 +		}
 +		a = s8f_s32(c, b[2]);
 +		bb = s8f_s32(c, b[3]);
@@ -2055,20 +2406,66 @@ index 0000000..26309f7
 +		s8f_sh(c, b[1] >> 2, (uint16_t)(s8f_s16(c, b[2]) * s8f_s16(c, b[3]) + s8f_s16(c, b[6])));
 +		s8f_assume(c, op);
 +		return n;
-+	case 0xc6: {                                            /* f16 ffma (8 B): D = a * imm(b3, minifloat) + c (b5: register when bits 7:6 = 11, else minifloat) */
++	case 0xc6: {                                            /* f16 ffma (8 B): D = a * b + c; b: register (b3 bits 7:6 >= 2) else minifloat(b3); c: register when b5 bits 7:6 >= 2 else minifloat(b5) */
 +		f32b a = sf_h2f(s8f_gh(c, b[2] & 0x3f));
-+		f32b m = sf_minifloat(b[3]);
-+		f32b cc = ((b[5] & 0xc0) == 0xc0) ? sf_h2f(s8f_gh(c, b[5] & 0x3f)) : sf_minifloat(b[5]);
++		f32b m = s8f_h16src(c, b[3]);
++		f32b cc = s8f_h16src(c, b[5]);
 +
++		if (b[4] & 0x02) {
++			a = sf_neg(a);                          /* ASSUMED: negate-A flag in b4 bit 1, as in the 32-bit forms */
++		}
 +		s8f_sh(c, b[1] >> 2, sf_f2h(sf_fma(a, m, cc)));
 +		s8f_assume(c, op);
 +		return n;
 +	}
-+	case 0x86: {                                            /* f16 fadd (6 B): D = a + b (b3: register when bits 7:6 = 11, else minifloat) */
++	case 0x46: case 0x86: {                                 /* f16 fmul (46) / fadd (86), 6 B: D = a op b; b3: register or minifloat; b4 bit 1 = negate a (`86 1a c6 30 02 00` = 1.0 - h6) */
 +		f32b a = sf_h2f(s8f_gh(c, b[2] & 0x3f));
-+		f32b bb = ((b[3] & 0xc0) == 0xc0) ? sf_h2f(s8f_gh(c, b[3] & 0x3f)) : sf_minifloat(b[3]);
++		f32b bb = s8f_h16src(c, b[3]);
 +
-+		s8f_sh(c, b[1] >> 2, sf_f2h(sf_add(a, bb)));
++		if (b[4] & 0x02) {
++			a = sf_neg(a);
++		}
++		s8f_sh(c, b[1] >> 2, sf_f2h(op == 0x46 ? sf_mul(a, bb) : sf_add(a, bb)));
++		s8f_assume(c, op);                              /* family guess: 0x06 + bits 7:6 = fmul/fadd/ffma at 16 bit, like 0x0a for 32 bit (46 = fmul is only inferred) */
++		return n;
++	}
++	case 0xf6: case 0x76: {                                 /* 8 B with the operand pair repeated in b5/b6: ASSUMED f16 multiply D = a * b (b2, b3), second pair ignored */
++		f32b a = sf_h2f(s8f_gh(c, b[2] & 0x3f));
++		f32b bb = sf_h2f(s8f_gh(c, b[3] & 0x3f));
++
++		s8f_sh(c, b[1] >> 2, sf_f2h(sf_mul(a, bb)));
++		s8f_assume(c, op);
++		return n;
++	}
++	case 0xfa: case 0x7a: case 0x1a: case 0x5a: {           /* 32-bit float multiply with the operand pair repeated (fa/7a 8 B, 1a/5a 6 B): ASSUMED D = a * b; dst register (b1 - 1) / 8 (bit 0 = 1) or b1 >> 3 */
++		f32b a = c->r[((b[2] & 0x3f) >> 1) & (S8F_REGS - 1)];
++		f32b bb = c->r[((b[3] & 0x3f) >> 1) & (S8F_REGS - 1)];
++
++		c->r[(b[1] >> 3) & (S8F_REGS - 1)] = sf_mul(a, bb);
++		s8f_assume(c, op);
++		return n;
++	}
++	case 0x21: {                                            /* texture_sample (10 B), ASSUMED mapping (G13 numbering does not apply): dst register b1 >> 2 (32-bit), channel mask b4 & 15 (contiguous destination),
++								 * texture unit (b5 & 63) % ntex, sampler = same unit, coordinates = the registers the last iter wrote (u, v as floats) */
++		f32b out4[4];
++		unsigned mask = b[4] & 15, d = b[1] >> 2, k, j = 0;
++		unsigned u = c->ntex ? (unsigned)(b[5] & 63) % (unsigned)c->ntex : 0;
++		f32b uu = c->r[(c->last_iter / 2) & (S8F_REGS - 1)], vv = c->r[(c->last_iter / 2 + 1) & (S8F_REGS - 1)];
++
++		if (c->ntex > 0 && c->trd != 0) {
++			s8t_sample(&c->texd[u], &c->texs[u], uu, vv, c->trd, c->trdctx, out4);
++		} else {
++			c->ntex_missing++;
++			for (k = 0; k < 4; k++) {
++				out4[k] = SF_ZERO;
++			}
++		}
++		for (k = 0; k < 4; k++) {
++			if ((mask >> k) & 1) {
++				c->r[(d + j) & (S8F_REGS - 1)] = out4[k];
++				j++;
++			}
++		}
 +		s8f_assume(c, op);
 +		return n;
 +	}
@@ -2079,6 +2476,12 @@ index 0000000..26309f7
 +			return n;
 +		}
 +		return 0;
++	case 0x58:                                              /* signal_pix (4 B), the pixel-ordering partner of wait_pix: no effect on a single pixel */
++		return n;
++	case 0xe2: case 0x22:                                   /* get_sr, 32-bit form (`e2 06 10 04`): r[b1 >> 1] = sr[b2] (ASSUMED; 0x22 only length-known) */
++		c->r[(b[1] >> 1) & (S8F_REGS - 1)] = c->sr[b[2]];
++		s8f_assume(c, op);
++		return n;
 +	case 0x02:                                              /* 02 04 04 00: 16-bit register copy (a self copy in the corpus) */
 +		s8f_sh(c, b[1], s8f_gh(c, b[2]));
 +		s8f_assume(c, op);
@@ -2111,9 +2514,9 @@ index 0000000..26309f7
 +		c->r[(b[1] >> 3) & (S8F_REGS - 1)] = res;
 +		return n;
 +	}
-+	case 0x92:                                              /* 4 B: r[b1 >> 1] = float(f16 immediate b2 | b3 << 8) (scene 31/35: 255.0 = 0x5bf8, ASSUMED field split) */
-+		c->r[(b[1] >> 1) & (S8F_REGS - 1)] = sf_h2f((uint16_t)(b[2] | (b[3] << 8)));
-+		s8f_assume(c, op);
++	case 0x92:                                              /* 4 B: h[b1] = 16-bit immediate b2 | b3 << 8 (scene 31/35: 255.0 = 0x5bf8 in h2, read by `4a 03 c0 c2 04 00` as a 16-bit source;
++								 * compositor: `92 01 00 7c` h1 = +inf, `92 03 00 3c` h3 = 1.0) */
++		s8f_sh(c, b[1], (uint16_t)(b[2] | (b[3] << 8)));
 +		return n;
 +	case 0x12:                                              /* 4 B: h[b1] = 16-bit integer immediate (ASSUMED) */
 +		s8f_sh(c, b[1], (uint16_t)(b[2] | (b[3] << 8)));
@@ -2143,6 +2546,7 @@ index 0000000..26309f7
 +		const uint8_t * b = p + pc;
 +		uint8_t op = b[0];
 +
++		c->hit[op]++;
 +		if (c->rd == 0 && c->fetch == 0) {
 +			uint32_t was = 0, now = 0;
 +			unsigned adv, i;
@@ -2165,12 +2569,17 @@ index 0000000..26309f7
 +			}
 +		}
 +		if (op == 0x51) {
-+			if (b[1] & 1) {                                 /* short iter (the texture path): the caller supplies the sample */
++			int nch = (b[2] >> 6) ? (b[2] >> 6) : 4;
++			int dreg = b[1] >> 2;
++
++			c->last_iter = (unsigned)dreg;
++			if (b[1] & 1) {                                 /* short iter (4 B, the texture coordinates): same fields as the long form, values from the caller's varyings (ASSUMED equal semantics) */
++				for (int k = 0; k < nch; k++) {
++					c->r[(dreg / 2 + k) & (S8F_REGS - 1)] = c->varying ? c->varying[k] : 0;
++				}
 +				pc += 4;
 +				continue;
 +			}
-+			int nch = (b[2] >> 6) ? (b[2] >> 6) : 4;
-+			int dreg = b[1] >> 2;
 +
 +			for (int k = 0; k < nch; k++) {
 +				if (b[1] & 2) {
@@ -2186,8 +2595,10 @@ index 0000000..26309f7
 +			f32b a = s8f_src(c, b, 2, half_a);
 +			f32b s1;
 +
-+			if ((b[4] & 0x20) || (b[3] >> 6) >= 2) {        /* register: flag bit in b4, or the 0b10/0b11 hint bits in b3 (scene 35: `4a 03 c0 c2 04 00` = r0 * r1) */
++			if (b[4] & 0x20) {                              /* b4 bit 5: B is a 32-bit register */
 +				s1 = s8f_src(c, b, 3, 0);
++			} else if ((b[3] >> 6) >= 2) {                  /* hint bits 0b10/0b11 in b3 without bit 5: a 16-bit register, converted (scene 35: `4a 03 c0 c2 04 00` = r0 * f32(h2 = 255.0)) */
++				s1 = sf_h2f(s8f_gh(c, b[3] & 0x3f));
 +			} else {
 +				/* 8-bit minifloat: bits 0-5 in byte 3, bits 6-7 in bits 4-5 of byte 5 (seen with 2.0 = 0x40 in the vertex col*2 shader) */
 +				s1 = sf_minifloat((uint8_t)(b[3] | (((b[5] >> 4) & 3) << 6)));
@@ -2325,6 +2736,73 @@ index 0000000..26309f7
 +		}
 +	}
 +	return c->stored;
++}
++
++/*
++ * Fragment program image start (tests/frag_forms.c: analysis/compositor-frag-forms.md section 0.3, compositor-stream.md).
++ * m/len = memory window of the image, block = offset of the program block the draw's `c0400038 <block VA>` record names ((unsigned)-1 if the draw has none),
++ * entry = offset of the entry pointer (flag bits cleared; the pointer's `& 3 == 2` flag shifts the instruction boundary to entry + 2 for some programs).
++ * Order: (1) block + 0x40 when the instruction-length walk from there lands on the entry (or entry + 2) and reaches `08 01` after it;
++ *        (2) the earliest offset in [entry - 0x100, entry] whose walk does the same (no block, or an image with another header);
++ *        (3) block + 0x40 unverified when the block exists and its first byte decodes (the walk stops on a form not known yet).
++ * Returns 1, 2 or 3 accordingly with *start set, 0 when there is no candidate.
++ */
++static inline int
++s8f_walk_lands(const uint8_t * m, unsigned len, unsigned start, unsigned entry)
++{
++	unsigned pc = start;
++	int hit = start == entry || start == entry + 2;
++
++	while (pc + 2 <= len) {
++		unsigned n = s8f_len(m + pc, len - pc);
++
++		if (n == 0 || pc + n > len) {
++			return 0;
++		}
++		if (m[pc] == 0x08 && m[pc + 1] == 0x01) {
++			if (hit) {
++				return 1;
++			}
++			if (pc + 4 > entry) {
++				return 0;
++			}
++			pc += 4;                        /* an earlier program of the same image: skip its end and the 08 00 padding */
++			while (pc + 2 <= len && m[pc] == 0x08 && m[pc + 1] == 0x00) {
++				pc += 2;
++			}
++			if (pc == entry || pc == entry + 2) {
++				hit = 1;
++			}
++			continue;
++		}
++		pc += n;
++		if (pc == entry || pc == entry + 2) {
++			hit = 1;
++		}
++	}
++	return 0;
++}
++
++static inline int
++s8f_start_image(const uint8_t * m, unsigned len, unsigned block, unsigned entry, unsigned * start)
++{
++	unsigned q;
++
++	if (block != (unsigned)-1 && block + 0x40 < len && s8f_walk_lands(m, len, block + 0x40, entry)) {
++		*start = block + 0x40;
++		return 1;
++	}
++	for (q = entry >= 0x100 ? entry - 0x100 : 0; q <= entry; q++) {
++		if (s8f_walk_lands(m, len, q, entry)) {
++			*start = q;
++			return 2;
++		}
++	}
++	if (block != (unsigned)-1 && block + 0x40 < len && s8f_len(m + block + 0x40, len - block - 0x40) != 0) {
++		*start = block + 0x40;
++		return 3;
++	}
++	return 0;
 +}
 +
 +/*
@@ -3423,6 +3901,283 @@ index 0000000..eafe7ba
 +}
 +
 +#endif /* S8GFX_STREAM_H */
+diff --git a/iokit/Kernel/arm/s8gfx_tex.h b/iokit/Kernel/arm/s8gfx_tex.h
+new file mode 100755
+index 0000000..35aded3
+--- /dev/null
++++ b/iokit/Kernel/arm/s8gfx_tex.h
+@@ -0,0 +1,271 @@
++/*
++ * Texture sampler for the A11 (G10) AGX stand-in: integer-only (soft float of s8gfx_sf.h), no libc, builds into the kernel and the host test
++ * (tools/gpu-isa/tests/tex_test.c). Analysis and evidence levels: tools/gpu-isa/analysis/texture-state.md.
++ *
++ *   s8t_desc_decode()    6-word texture state record (as pushed by the 0x17 push record) -> struct s8t_desc
++ *   s8t_sampler_decode() 2-word sampler state (as pushed by the 0x13 push record)        -> struct s8t_sampler
++ *   s8t_sample()         u, v (normalised, float bits) -> RGBA float bits, nearest or bilinear, level 0 only
++ *
++ * What is verified on captured data (capture9, 4x4 RGBA8): the texel address (word2 << 2), Morton addressing with y in the LOW bit, RGBA8 byte order,
++ * and the nearest / linear bit of the sampler word. Everything else (size field, format field, wrap modes, min/mag split, tiling of large textures)
++ * is a HYPOTHESIS; the struct fields can be filled in by hand (s8t_desc_make) when the caller knows better (e.g. from the IOGPU resource size).
++ * Filtering model (assumption, no hardware oracle exists yet): coordinates and texel positions in 16.16 fixed point, bilinear weights truncated to
++ * 8 bits, the result sum(w * texel8) / (65536 * 255) rounded to nearest by the soft float divide.
++ */
++#ifndef S8GFX_TEX_H
++#define S8GFX_TEX_H
++
++#include "s8gfx_sf.h"
++
++enum { S8T_FMT_RGBA8 = 0, S8T_FMT_BGRA8 = 1, S8T_FMT_R8 = 2 };
++enum { S8T_LAYOUT_MORTON = 0, S8T_LAYOUT_LINEAR = 1 };
++enum { S8T_WRAP_CLAMP_EDGE = 0, S8T_WRAP_REPEAT = 1, S8T_WRAP_MIRROR = 2, S8T_WRAP_ZERO = 3 };
++
++struct s8t_desc {
++	uint64_t va;            /* address of level 0 */
++	uint32_t width, height; /* texels */
++	uint32_t levels;        /* mip levels (only level 0 is sampled) */
++	uint32_t fmt;           /* S8T_FMT_* */
++	uint32_t layout;        /* S8T_LAYOUT_* */
++	uint32_t pitch;         /* bytes per row, linear layout only */
++	int known;              /* 1 when the size/format came from a record the decoder recognises */
++};
++
++struct s8t_sampler {
++	int mag_linear;
++	int min_linear;
++	uint32_t wrap_s, wrap_t;        /* S8T_WRAP_* */
++};
++
++static inline uint32_t
++s8t_bpp(uint32_t fmt)
++{
++	return fmt == S8T_FMT_R8 ? 1 : 4;
++}
++
++static inline void
++s8t_desc_make(struct s8t_desc * d, uint64_t va, uint32_t w, uint32_t h, uint32_t fmt, uint32_t layout, uint32_t pitch)
++{
++	d->va = va;
++	d->width = w;
++	d->height = h;
++	d->levels = 1;
++	d->fmt = fmt;
++	d->layout = layout;
++	d->pitch = pitch ? pitch : w * s8t_bpp(fmt);
++	d->known = 0;
++}
++
++/*
++ * Decode a texture state record. Recognised: low 16 bits of word 0 = 0x050a (both the texture record 1b44050a and the render target record 1fe3050a carry it).
++ *   word2          = VA >> 2                                         [verified: 0x40001440 -> 0x100005100]
++ *   word1 bits 0-10 = 0x800 - (0x800 >> k) for a (square) size of 2^k  [hypothesis from two points: 4x4 -> 0x600, 64x64 -> 0x7e0]
++ *   word0 >> 16    = 0x1b44 -> RGBA8 2D (only value seen); anything else is taken as RGBA8 too, known = 0
++ * Returns 0 when the record is recognised, -1 otherwise (d is still filled with defaults).
++ */
++static inline int
++s8t_desc_decode(struct s8t_desc * d, const uint32_t w[6])
++{
++	uint32_t m = w[1] & 0x7ff;
++	uint32_t k = 0;
++	uint32_t size = 0;
++
++	d->va = (uint64_t)w[2] << 2;
++	d->fmt = S8T_FMT_RGBA8;
++	d->layout = S8T_LAYOUT_MORTON;
++	d->levels = 1;
++	d->known = 0;
++	if ((w[0] & 0xffff) != 0x050a || m == 0) {
++		d->width = d->height = 0;
++		d->pitch = 0;
++		return -1;
++	}
++	/* m = 0x800 - 0x800 / size: the lowest set bit is at 11 - k */
++	while (!((m >> k) & 1)) {
++		k++;
++	}
++	size = 1u << (11 - k);
++	d->width = d->height = size;
++	d->pitch = size * 4;
++	d->known = ((w[0] >> 16) == 0x1b44);
++	return 0;
++}
++
++/* sampler state, two words. word0 bit 23 = linear (magnify), bit 25 = linear (minify): both set by filter::linear, both clear for nearest [verified as a pair]. Wrap modes: not decoded (clamp_to_edge). */
++static inline void
++s8t_sampler_decode(struct s8t_sampler * s, const uint32_t w[2])
++{
++	s->mag_linear = (w[0] >> 23) & 1;
++	s->min_linear = (w[0] >> 25) & 1;
++	s->wrap_s = s->wrap_t = S8T_WRAP_CLAMP_EDGE;
++}
++
++static inline uint32_t
++s8t_log2(uint32_t v)
++{
++	uint32_t k = 0;
++
++	while ((1u << k) < v && k < 31) {
++		k++;
++	}
++	return k;
++}
++
++/* byte offset of texel (x, y) from the level base */
++static inline uint64_t
++s8t_texel_offset(const struct s8t_desc * d, uint32_t x, uint32_t y)
++{
++	uint64_t idx;
++
++	if (d->layout == S8T_LAYOUT_LINEAR) {
++		return (uint64_t)y * d->pitch + (uint64_t)x * s8t_bpp(d->fmt);
++	}
++	/* Morton / twiddle, y in the LOW bit: interleave the low min(lw, lh) bits of y and x, the remaining bits of the longer side follow linearly */
++	{
++		uint32_t lw = s8t_log2(d->width), lh = s8t_log2(d->height);
++		uint32_t n = lw < lh ? lw : lh;
++		uint32_t b;
++
++		idx = 0;
++		for (b = 0; b < n; b++) {
++			idx |= (uint64_t)((y >> b) & 1) << (2 * b);
++			idx |= (uint64_t)((x >> b) & 1) << (2 * b + 1);
++		}
++		if (lw > lh) {
++			idx |= (uint64_t)(x >> n) << (2 * n);
++		} else if (lh > lw) {
++			idx |= (uint64_t)(y >> n) << (2 * n);
++		}
++	}
++	return idx * s8t_bpp(d->fmt);
++}
++
++/* apply a wrap mode to texel coordinate c in a dimension of n texels; returns -1 for "outside, transparent black" */
++static inline int32_t
++s8t_wrap(int32_t c, int32_t n, uint32_t mode)
++{
++	switch (mode) {
++	case S8T_WRAP_REPEAT:
++		c %= n;
++		return c < 0 ? c + n : c;
++	case S8T_WRAP_MIRROR: {
++		int32_t p = 2 * n;
++
++		c %= p;
++		if (c < 0) {
++			c += p;
++		}
++		return c < n ? c : p - 1 - c;
++	}
++	case S8T_WRAP_ZERO:
++		return (c < 0 || c >= n) ? -1 : c;
++	default:
++		return c < 0 ? 0 : (c >= n ? n - 1 : c);
++	}
++}
++
++/* the four channels of texel (x, y) as 8-bit values in RGBA order; outside (x or y < 0) = 0 */
++static inline void
++s8t_fetch(const struct s8t_desc * d, uint32_t (*rd)(void *, uint64_t va), void * ctx, int32_t x, int32_t y, uint32_t c[4])
++{
++	uint64_t a;
++	uint32_t v;
++
++	if (x < 0 || y < 0) {
++		c[0] = c[1] = c[2] = c[3] = 0;
++		return;
++	}
++	a = d->va + s8t_texel_offset(d, (uint32_t)x, (uint32_t)y);
++	v = rd(ctx, a & ~3ull);
++	if (d->fmt == S8T_FMT_R8) {
++		c[0] = (v >> (8 * (a & 3))) & 0xff;
++		c[1] = c[2] = 0;
++		c[3] = 255;
++	} else if (d->fmt == S8T_FMT_BGRA8) {
++		c[0] = (v >> 16) & 0xff;
++		c[1] = (v >> 8) & 0xff;
++		c[2] = v & 0xff;
++		c[3] = v >> 24;
++	} else {
++		c[0] = v & 0xff;
++		c[1] = (v >> 8) & 0xff;
++		c[2] = (v >> 16) & 0xff;
++		c[3] = v >> 24;
++	}
++}
++
++/* a * 2^16 as int32 (rounded to nearest at 2^-16, saturating); >> 16 of the result is the floor */
++static inline int32_t
++s8t_fix16_floor(f32b a)
++{
++	uint32_t e = (a >> 23) & 0xff;
++
++	if (e > 127 + 14) {                     /* |a| >= 2^15: far outside the texture, saturate */
++		return (a >> 31) ? INT32_MIN : INT32_MAX;
++	}
++	return sf_to_fixed(a, 16);
++}
++
++/*
++ * Sample level 0. u, v are normalised coordinates (float bits). out = R, G, B, A as float bits in [0, 1].
++ * Nearest: texel floor(u * w). Bilinear: position u * w - 0.5, 2x2 taps with 8-bit weights.
++ */
++static inline void
++s8t_sample(const struct s8t_desc * d, const struct s8t_sampler * s, f32b u, f32b v, uint32_t (*rd)(void *, uint64_t va), void * ctx, f32b out[4])
++{
++	int32_t W = (int32_t)d->width, H = (int32_t)d->height;
++	f32b fw = sf_from_i64(W), fh = sf_from_i64(H);
++	f32b half = 0x3f000000u;
++	f32b su = sf_mul(u, fw), sv = sf_mul(v, fh);        /* texel space */
++	int linear = s->mag_linear || s->min_linear;        /* level 0 only: magnification and minification are told apart by the LOD, which this stand-in does not compute */
++	uint32_t c[4];
++	int k;
++
++	if (W <= 0 || H <= 0) {
++		for (k = 0; k < 4; k++) {
++			out[k] = SF_ZERO;
++		}
++		return;
++	}
++	if (!linear) {
++		int32_t fx = s8t_fix16_floor(su), fy = s8t_fix16_floor(sv);
++		int32_t x = fx >> 16, y = fy >> 16;     /* arithmetic shift = floor */
++
++		s8t_fetch(d, rd, ctx, s8t_wrap(x, W, s->wrap_s), s8t_wrap(y, H, s->wrap_t), c);
++		for (k = 0; k < 4; k++) {
++			out[k] = sf_div(sf_from_i64(c[k]), 0x437f0000u);
++		}
++		return;
++	}
++	{
++		int32_t fx = s8t_fix16_floor(sf_sub(su, half)), fy = s8t_fix16_floor(sf_sub(sv, half));
++		int32_t x0 = fx >> 16, y0 = fy >> 16;
++		uint32_t wx = ((uint32_t)fx >> 8) & 0xff, wy = ((uint32_t)fy >> 8) & 0xff;   /* 8-bit weights, truncated */
++		uint32_t w00 = (256 - wx) * (256 - wy), w10 = wx * (256 - wy), w01 = (256 - wx) * wy, w11 = wx * wy;
++		uint32_t acc[4] = { 0, 0, 0, 0 };
++		uint32_t t[4];
++		int32_t xs[2], ys[2];
++		uint32_t wt[4];
++		int i;
++
++		xs[0] = s8t_wrap(x0, W, s->wrap_s);
++		xs[1] = s8t_wrap(x0 + 1, W, s->wrap_s);
++		ys[0] = s8t_wrap(y0, H, s->wrap_t);
++		ys[1] = s8t_wrap(y0 + 1, H, s->wrap_t);
++		wt[0] = w00; wt[1] = w10; wt[2] = w01; wt[3] = w11;
++		for (i = 0; i < 4; i++) {
++			if (wt[i] == 0) {
++				continue;
++			}
++			s8t_fetch(d, rd, ctx, xs[i & 1], ys[i >> 1], t);
++			for (k = 0; k < 4; k++) {
++				acc[k] += t[k] * wt[i];
++			}
++		}
++		for (k = 0; k < 4; k++) {
++			out[k] = sf_div(sf_from_i64(acc[k]), sf_from_i64(65536 * 255ll));
++		}
++	}
++}
++
++#endif /* S8GFX_TEX_H */
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
 index 1563949..98a92d5 100644
 --- a/iokit/conf/files.arm64

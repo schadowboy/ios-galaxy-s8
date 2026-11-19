@@ -76,3 +76,36 @@ All shaders are fragment functions on a 4x MSAA BGRA8 target or a normal target 
 4. **bfeil 16-bit form, imad 16-bit, iadd 16-bit, icmpsel `16 ..`, `1e`/`23` 4-byte pair (64-bit multiply?).** `kernel void k(device ushort *a, uint i [[thread_position_in_grid]]) { a[i] = (ushort)((i >> 2) * 3 + 5); }`
    and `uint64_t`/`mulhi` variants: `a[i] = (uint)mulhi(i, 0x9e3779b9u)`; plus `int i = ...; return i > 3 ? ... : ...` (scene 32) for icmpsel.
 5. **The vertex imad literal as stride, `fe`, `26`, `12`, `16`, `de`, `75`.** A vertex shader with two interleaved streams of strides 28 and 44 bytes (buffer(0) with `stride 44`), positions fetched with `vid * stride`; compare the literal in the `20 c0` word with the stride.
+
+## 6. Second pass: the compositor corpus (2026-11-19, tests/comp_run.c over data/corpus_comp.bin = tests/frag_forms.c -o)
+Corpus: 46 distinct compositor fragment programs with a determined start (11 block images, the rest by walk), exported by `bash tests/r9.sh`. Runner: `tests/comp_run.c` (`bash tests/r12.sh [-v]`, built with
+-fsanitize=address,undefined) executes each program with synthetic inputs (varyings, tile word, uniforms 0.5f, 16x16 texture, sr[48..49]) and counts executed opcodes. **Result: 38/46 reach the end
+instruction, 35 execute a pixel store, 17 sample the texture unit; 5 run with proven forms only; 8 stop** (3 records that start in data (`80 00 ..`), 4 programs at the unary function op `0a`, 1 at `c4`).
+Walk lengths: `s8f_len` now knows `f9 f6 76 fa 7a` (8 B, lands on every block entry) and `1a/5a` (6 B).
+
+New proven fact (P, scene 35 / 31 still bit-exact): float ALU sources have a size bit. For `4a/8a`: **b4 bit 5 = B is a 32-bit register; b3 >= 0x80 without it = a 16-bit register (half index b3 & 63) converted to f32**; `92 b1 lo hi` therefore
+writes the raw half h[b1] (not a converted f32 as in section 2): `92 02 f8 5b` = h2 = 255.0 read as a 16-bit source by `4a 03 c0 c2 04 00`. The earlier "r1 = float" reading passed the same tests by accident.
+
+| form | status | semantics implemented | evidence / why ASSUMED |
+|---|---|---|---|
+| `c6` (212x) | A | f16 ffma D = a*b + c, a = h[b2], b = h[b3] if b3 >= 0x80 else minifloat(b3), c likewise from b5, negate-a = b4 bit 1 | MSAA-resolve tree consistency (section 3); `c6 .. 93 00 c1` (b3 a register) in the blend programs; the 0x04/0x01 weights and b4/b6 bits (`20`, `04`) unexplained |
+| `46`/`86` | A | f16 fmul / fadd, b4 bit 1 negates a: `86 1a c6 30 02 00` = 1.0 - h6 (minifloat 0x30 = 1.0) | the 1 - alpha idiom of the blend programs; 46 = fmul only by the 0x06 + bits 7:6 pattern of 4a/8a/ca |
+| `f6`/`76` (56x each) | A | f16 multiply D = h[b2] * h[b3]; b5/b6 repeat b2/b3 in every one of the 120 instances (ignored) | used with the f16 pair constant loaded by `d2 .. 06 ba 01 3d` (h0 = 0xba06 = -0.753, h1 = 0x3d01 = 1.251) as f6 = low half, 76 = high half; true operation (fma(a,b,a)?) not settled |
+| `fa`/`7a`/`1a`/`5a` | A | f32 multiply of r[b2/2] * r[b3/2] (duplicated operands) | texture-coordinate transform ops before texture_sample |
+| `f9` (38x) | A | four f16 unorm channels of the pixel word (same as the four-way `79`); `f8 ff`/`78 ff` = one sample, `fc 01`/`7c 01` = samples via b3/b5 | length proven by the walk, semantics as for 79 |
+| `75` (18x) | A | no-op (`75 2a`, `75 29` pairs before the end) | nothing observable |
+| `31` | A | pixel write of h0..h3 (f16) -> out[] | unchanged; coordinates `d0` operand and `0a`/`0e` byte (format?) ignored |
+| `21` texture_sample | A | dst r[b1 >> 2] (32-bit), channel mask b4 & 15 into contiguous registers, unit (b5 & 63) % ntex, coordinates = registers of the last iter, via `s8t_sample`; short iter `51 b1 b2 00` writes the varyings like the long form | scenes 26/28/29 (tex nearest/tint/premult) reproduce the host reference bit-exact on a 4x4 Morton texture (P for that mapping on those scenes; the compositor's unit/coordinate fields b5/b6 are not mapped: in them b6 = iter destination half index + 4) |
+| `58` signal_pix, `e2`/`22`, 16-bit bitop `7e` | A | no-op, get_sr -> r[b1 >> 1], 16-bit truth table | length/structure |
+| `71`, `2a`, `56`, `80`, `c4`, `0a` unary | open | `71` appears only in data-like records (`71 01 00 11 00 74` tables) at unknown starts: probably not an instruction; `0a` unary is 4 B in scene 19 (`0a 01 c0 44` = rcp?) but 6 B elsewhere in the compositor; `80`/`2a`/`56`/`c4` are mid-instruction stops of mis-started records | |
+
+API additions (all optional; old callers unaffected): `ctx->texd[8]/texs[8]/ntex/trd/trdctx` (texture units, descriptors from `s8t_desc_decode`/`s8t_desc_make`, texel reader), `ctx->hit[256]` (executed instruction counts), `ctx->last_iter`,
+`s8f_walk_lands()` and **`s8f_start_image(m, len, block, entry, &start)`** (1 = block + 0x40 verified by the length walk reaching the entry or entry + 2 and the end, 2 = earliest start in [entry - 0x100, entry], 3 = block + 0x40 unverified);
+tested on the corpus (11/11 block images, 21/21 headerless). `s8gfx_frag.h` now includes `s8gfx_tex.h`; all three kernel headers compile as C++ (`g++ -fsyntax-only -x c++`).
+
+Experiments that would settle the ASSUMED compositor forms (fragment shaders captured with s8agxprogs, outputs read back; tex = 2x2 RGBA8 texture, constants chosen so every candidate formula gives a different pixel):
+1. f6/76/46/86/c6: `half4 d = half4(dst [[color(0)]]); half a = half(in.col.a); return float4(d * (half(1) - a) + half4(in.col) * a);` and `return float4(d * half4(0.75h) * half4(1.25h))`: dump the program, vary one constant at a time; expected for d = 0.5, col = (0.25, 0.5, 0.75, 0.5): (0.375, 0.5, 0.625, 0.5) / 0.46875.
+2. 0x21 unit/coordinate fields: two textures bound at slots 0 and 3 with different colours, `t3.sample(s3, uv)`, `t0.sample(s0, uv * 0.5)`; the b5/b6 bytes of the two sample instructions identify slot and coordinate register.
+3. unary `0a`: `float4(sqrt(x), 1.0/x, exp2(x), log2(x))` with x = 0.25 on separate shaders (one function each), read the function-code byte of each.
+4. `31` write: a fragment shader on a non-MSAA target outputting a constant, plus a variant with `[[color(1)]]` second attachment: the extra bytes in `31 01 .. 0a 10 d0 00 04` vs `31 01 0e 0a 00 ..` select the target/format.
+5. f9/79 sample/format split: MSAA 4x resolve of a target with distinct per-sample values (`[[sample_id]]`), expected resolved mean.

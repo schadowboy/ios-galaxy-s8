@@ -257,8 +257,100 @@ static void t_resolve(const char * path)
 	fclose(f);
 }
 
+/* ---- texture_sample (0x21) through the ctx texture units: scenes 26 (nearest), 28 (tint), 29 (premultiply) of capture9 on a 4x4 Morton texture ----
+ * expected values: independent Morton addressing (y in the low bit) and float math in the test; sampling is the hook of s8gfx_tex.h (nearest only here) */
+static uint32_t tex_words[16];
+static uint32_t texrd(void * ctx, uint64_t va) { (void)ctx; return tex_words[((va - 0x2000) >> 2) & 15]; }
+
+static unsigned morton4(unsigned x, unsigned y) { return (y & 1) | ((x & 1) << 1) | ((y & 2) << 1) | ((x & 2) << 2); }
+
+static int load_scene(const char * path, uint32_t want, uint8_t * out, uint32_t * n)
+{
+	FILE * f = fopen(path, "rb");
+	uint32_t id, l;
+
+	if (!f) return 0;
+	while (fread(&id, 4, 1, f) == 1 && fread(&l, 4, 1, f) == 1) {
+		uint8_t tmp[512];
+
+		if (l > sizeof(tmp) || fread(tmp, 1, l, f) != l) break;
+		if (id == want) { memcpy(out, tmp, l); *n = l; fclose(f); return 1; }
+	}
+	fclose(f);
+	return 0;
+}
+
+static void t_tex(const char * scenes)
+{
+	int bad[3] = { 0, 0, 0 };
+	static const uint32_t sc[3] = { 26, 28, 29 };
+
+	for (int i = 0; i < 16; i++) tex_words[i] = rnd() * 2654435761u;
+	for (int s = 0; s < 3; s++) {
+		uint8_t prog[512];
+		uint32_t n = 0;
+
+		if (!load_scene(scenes, sc[s], prog, &n)) { printf("scene %u not found in %s\n", sc[s], scenes); fails++; continue; }
+		for (int i = 0; i < 400; i++) {
+			struct s8f_ctx c;
+			f32b vv[4];
+			float u = (rnd() % 4000) / 4000.0f, v = (rnd() % 4000) / 4000.0f;
+			unsigned x = (unsigned)(u * 4.0f), y = (unsigned)(v * 4.0f);
+			uint32_t w = tex_words[morton4(x, y)];       /* RGBA8: R in the low byte */
+			float t[4] = { (w & 255) / 255.0f, ((w >> 8) & 255) / 255.0f, ((w >> 16) & 255) / 255.0f, (w >> 24) / 255.0f };
+			float want[4];
+
+			vv[0] = tob(u); vv[1] = tob(v); vv[2] = tob(0.0f); vv[3] = tob(1.0f);
+			memset(&c, 0, sizeof(c));
+			c.varying = vv;
+			c.ntex = 1;
+			s8t_desc_make(&c.texd[0], 0x2000, 4, 4, S8T_FMT_RGBA8, S8T_LAYOUT_MORTON, 0);
+			c.trd = texrd;
+			s8f_run(&c, prog, n);
+			if (s == 0) { for (int k = 0; k < 4; k++) want[k] = t[k]; }
+			else if (s == 1) { want[0] = t[0]; want[1] = t[1] * 0.5f; want[2] = t[2] * 0.25f; want[3] = t[3]; }
+			else { for (int k = 0; k < 3; k++) want[k] = t[k] * t[3]; want[3] = t[3]; }
+			for (int k = 0; k < 4; k++) if (!c.stored || tof(c.out[k]) != want[k]) { if (bad[s] < 3) printf("  scene %u uv %.4f %.4f ch %d got %.6f want %.6f stored %d unk %02x\n", sc[s], u, v, k, tof(c.out[k]), want[k], c.stored, c.unknown); bad[s]++; }
+		}
+		CHECK(bad[s] == 0, "scene %u texture", sc[s]);
+		printf("scene %u (%s, 0x21 + short iter, nearest, 4x4 Morton): %s\n", sc[s], s == 0 ? "tex nearest" : s == 1 ? "tex tint" : "tex premult", bad[s] ? "FAIL" : "400 random uv bit-exact against the host reference (unit mapping ASSUMED)");
+	}
+}
+
+/* program image start finder on the compositor corpus: block-based records re-embedded behind a 0x40-byte header must come back as block + 0x40 */
+static void t_start(const char * path)
+{
+	FILE * f = fopen(path, "rb");
+	char kind;
+	uint32_t entry, len;
+	int n = 0, ok1 = 0, ok2 = 0, nb = 0, nw = 0;
+
+	if (!f) { printf("corpus_comp.bin not given, start finder test skipped\n"); return; }
+	while (fread(&kind, 1, 1, f) == 1) {
+		uint8_t pad[3];
+		static uint8_t buf[8192], img[8192 + 0x100];
+		unsigned st = 0;
+		int how;
+
+		if (fread(pad, 1, 3, f) != 3 || fread(&entry, 4, 1, f) != 1 || fread(&len, 4, 1, f) != 1 || len > sizeof(buf) || fread(buf, 1, len, f) != len) break;
+		memset(img, 0xee, sizeof(img));
+		memcpy(img + 0x80, buf, len);                      /* image: 0x80 junk bytes, 0x40 more would be the header: block = 0x40, code at 0x80 */
+		n++;
+		/* skip records that do not walk to an end inside the window (cut programs, data records) */
+		if (!s8f_walk_lands(buf, len, 0, entry)) continue;
+		how = s8f_start_image(img, len + 0x80, 0x40, 0x80 + entry, &st);
+		if (pad[0] == 1) { nb++; if (how == 1 && st == 0x80) ok1++; else if (nb < 4) printf("  block record: how %d start %u (want 1 / 128)\n", how, st); }
+		else { nw++; how = s8f_start_image(img, len + 0x80, (unsigned)-1, 0x80 + entry, &st); if (how >= 1 && st <= 0x80 + entry && s8f_walk_lands(img, len + 0x80, st, 0x80 + entry)) ok2++; }
+	}
+	fclose(f);
+	CHECK(ok1 == nb && ok2 == nw, "start finder: %d/%d block, %d/%d walk", ok1, nb, ok2, nw);
+	printf("s8f_start_image on %d corpus records: %d/%d block images -> block + 0x40, %d/%d headerless images -> a start whose walk lands on the entry: %s\n", n, ok1, nb, ok2, nw, (ok1 == nb && ok2 == nw) ? "ok" : "FAIL");
+}
+
 int main(int argc, char ** argv)
 {
+	t_tex(argc > 2 ? argv[2] : "../data/scenes.bin");
+	t_start(argc > 3 ? argv[3] : "../data/corpus_comp.bin");
 	t_f16();
 	t_pack("g3 (pack, bfeil shift, and-mask, unpack via device_store/load)", g3, sizeof(g3), ref_g3, 0, 0);
 	t_pack("g5 (pack ^ 0xff00ff00)", g5, sizeof(g5), ref_g5, 0, 0);

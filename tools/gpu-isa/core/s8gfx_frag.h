@@ -12,8 +12,10 @@
 #define S8GFX_FRAG_H
 
 #include "s8gfx_sf.h"
+#include "s8gfx_tex.h"
 
 #define S8F_REGS 64
+#define S8F_NTEX 8
 
 struct s8f_ctx {
 	f32b r[S8F_REGS];               /* 32-bit registers, index = half-register index / 2 */
@@ -49,6 +51,17 @@ struct s8f_ctx {
 	uint32_t sr[256];
 	uint32_t assumed[8];
 	int strict;
+	/* texture sampling (opcode 0x21, ASSUMED field mapping, see analysis/a11-isa-forms.md): the caller binds up to S8F_NTEX units (descriptor decoded with
+	 * s8t_desc_decode / s8t_desc_make, sampler with s8t_sampler_decode) and a texel reader; ntex = 0 -> samples return transparent black (stored in out regs) and
+	 * ntex_missing counts the samples. The unit index is (b5 & 63) % ntex until the push-record -> slot mapping is proven. */
+	struct s8t_desc texd[S8F_NTEX];
+	struct s8t_sampler texs[S8F_NTEX];
+	int ntex;
+	uint32_t (*trd)(void * ctx, uint64_t va);
+	void * trdctx;
+	unsigned ntex_missing;
+	unsigned last_iter;             /* half index of the destination of the last iter: the coordinates a texture_sample reads (ASSUMED) */
+	uint32_t hit[256];              /* executed instructions by opcode (coverage runner) */
 };
 
 /* 16-bit lane access to the 32-bit register file: half index i = register i / 2, low half first */
@@ -135,6 +148,9 @@ s8f_len(const uint8_t * b, unsigned avail)
 	if (op == 0x79 || op == 0x09 || op == 0x89 || op == 0xc6 || op == 0xca || op == 0x31) {
 		return 8;
 	}
+	if (op == 0xf9 || op == 0xf6 || op == 0x76 || op == 0xfa || op == 0x7a) {
+		return 8;                       /* f9 = ld_tile (second family), f6/76 = f16 three-source ALU, fa/7a = f16 ALU: 8 bytes (every program walk that contains them lands on the entry/end) */
+	}
 	if (op == 0x75) {
 		return 2;                       /* `75 2a 75 29` before the end of the compositor's fragment programs (two 2-byte units; ASSUMED boundary) */
 	}
@@ -171,6 +187,13 @@ s8f_len(const uint8_t * b, unsigned avail)
 		return 6;
 	}
 	return 0;
+}
+
+/* 16-bit float source byte: hint bits 0b10/0b11 -> half register (6-bit index), else the 8-bit minifloat immediate */
+static inline f32b
+s8f_h16src(const struct s8f_ctx * c, uint8_t v)
+{
+	return (v >> 6) >= 2 ? sf_h2f(s8f_gh(c, v & 0x3f)) : sf_minifloat(v);
 }
 
 /* float -> uint32 / int32, toward zero, saturating (NaN -> 0) */
@@ -317,8 +340,8 @@ s8f_step_frag(struct s8f_ctx * c, const uint8_t * b, unsigned avail)
 	switch (op) {
 	case 0x05: case 0x85: case 0x45: case 0xc5:
 		return s8f_devldst(c, b, avail);
-	case 0x79:
-		if (b[6] == 0xfa && b[7] == 0xff) {
+	case 0x79: case 0xf9:
+		if (op == 0x79 && b[6] == 0xfa && b[7] == 0xff) {
 			return 0;                       /* the float form of scene 9 */
 		}
 		{
@@ -342,8 +365,19 @@ s8f_step_frag(struct s8f_ctx * c, const uint8_t * b, unsigned avail)
 		uint32_t a, bb, res = 0;
 		unsigned tt = b[4] >> 4;
 
-		if (!w32) {
-			return 0;
+		if (!w32) {                                     /* 16-bit lanes (b4 & 15 == 0): h[b1 >> 2] = tt(A, B) (compositor `7e 02 c0 81 80 00`; ASSUMED, same table) */
+			a = s8f_s16(c, b[2]);
+			bb = s8f_s16(c, b[3]);
+			if ((b[3] >> 6) < 2) {
+				bb |= (uint32_t)((b[5] >> 4) & 3) << 6;
+			}
+			if (tt & 1) res |= ~a & ~bb;
+			if (tt & 2) res |= a & ~bb;
+			if (tt & 4) res |= ~a & bb;
+			if (tt & 8) res |= a & bb;
+			s8f_sh(c, b[1] >> 2, (uint16_t)res);
+			s8f_assume(c, op);
+			return n;
 		}
 		a = s8f_s32(c, b[2]);
 		bb = s8f_s32(c, b[3]);
@@ -406,20 +440,66 @@ s8f_step_frag(struct s8f_ctx * c, const uint8_t * b, unsigned avail)
 		s8f_sh(c, b[1] >> 2, (uint16_t)(s8f_s16(c, b[2]) * s8f_s16(c, b[3]) + s8f_s16(c, b[6])));
 		s8f_assume(c, op);
 		return n;
-	case 0xc6: {                                            /* f16 ffma (8 B): D = a * imm(b3, minifloat) + c (b5: register when bits 7:6 = 11, else minifloat) */
+	case 0xc6: {                                            /* f16 ffma (8 B): D = a * b + c; b: register (b3 bits 7:6 >= 2) else minifloat(b3); c: register when b5 bits 7:6 >= 2 else minifloat(b5) */
 		f32b a = sf_h2f(s8f_gh(c, b[2] & 0x3f));
-		f32b m = sf_minifloat(b[3]);
-		f32b cc = ((b[5] & 0xc0) == 0xc0) ? sf_h2f(s8f_gh(c, b[5] & 0x3f)) : sf_minifloat(b[5]);
+		f32b m = s8f_h16src(c, b[3]);
+		f32b cc = s8f_h16src(c, b[5]);
 
+		if (b[4] & 0x02) {
+			a = sf_neg(a);                          /* ASSUMED: negate-A flag in b4 bit 1, as in the 32-bit forms */
+		}
 		s8f_sh(c, b[1] >> 2, sf_f2h(sf_fma(a, m, cc)));
 		s8f_assume(c, op);
 		return n;
 	}
-	case 0x86: {                                            /* f16 fadd (6 B): D = a + b (b3: register when bits 7:6 = 11, else minifloat) */
+	case 0x46: case 0x86: {                                 /* f16 fmul (46) / fadd (86), 6 B: D = a op b; b3: register or minifloat; b4 bit 1 = negate a (`86 1a c6 30 02 00` = 1.0 - h6) */
 		f32b a = sf_h2f(s8f_gh(c, b[2] & 0x3f));
-		f32b bb = ((b[3] & 0xc0) == 0xc0) ? sf_h2f(s8f_gh(c, b[3] & 0x3f)) : sf_minifloat(b[3]);
+		f32b bb = s8f_h16src(c, b[3]);
 
-		s8f_sh(c, b[1] >> 2, sf_f2h(sf_add(a, bb)));
+		if (b[4] & 0x02) {
+			a = sf_neg(a);
+		}
+		s8f_sh(c, b[1] >> 2, sf_f2h(op == 0x46 ? sf_mul(a, bb) : sf_add(a, bb)));
+		s8f_assume(c, op);                              /* family guess: 0x06 + bits 7:6 = fmul/fadd/ffma at 16 bit, like 0x0a for 32 bit (46 = fmul is only inferred) */
+		return n;
+	}
+	case 0xf6: case 0x76: {                                 /* 8 B with the operand pair repeated in b5/b6: ASSUMED f16 multiply D = a * b (b2, b3), second pair ignored */
+		f32b a = sf_h2f(s8f_gh(c, b[2] & 0x3f));
+		f32b bb = sf_h2f(s8f_gh(c, b[3] & 0x3f));
+
+		s8f_sh(c, b[1] >> 2, sf_f2h(sf_mul(a, bb)));
+		s8f_assume(c, op);
+		return n;
+	}
+	case 0xfa: case 0x7a: case 0x1a: case 0x5a: {           /* 32-bit float multiply with the operand pair repeated (fa/7a 8 B, 1a/5a 6 B): ASSUMED D = a * b; dst register (b1 - 1) / 8 (bit 0 = 1) or b1 >> 3 */
+		f32b a = c->r[((b[2] & 0x3f) >> 1) & (S8F_REGS - 1)];
+		f32b bb = c->r[((b[3] & 0x3f) >> 1) & (S8F_REGS - 1)];
+
+		c->r[(b[1] >> 3) & (S8F_REGS - 1)] = sf_mul(a, bb);
+		s8f_assume(c, op);
+		return n;
+	}
+	case 0x21: {                                            /* texture_sample (10 B), ASSUMED mapping (G13 numbering does not apply): dst register b1 >> 2 (32-bit), channel mask b4 & 15 (contiguous destination),
+								 * texture unit (b5 & 63) % ntex, sampler = same unit, coordinates = the registers the last iter wrote (u, v as floats) */
+		f32b out4[4];
+		unsigned mask = b[4] & 15, d = b[1] >> 2, k, j = 0;
+		unsigned u = c->ntex ? (unsigned)(b[5] & 63) % (unsigned)c->ntex : 0;
+		f32b uu = c->r[(c->last_iter / 2) & (S8F_REGS - 1)], vv = c->r[(c->last_iter / 2 + 1) & (S8F_REGS - 1)];
+
+		if (c->ntex > 0 && c->trd != 0) {
+			s8t_sample(&c->texd[u], &c->texs[u], uu, vv, c->trd, c->trdctx, out4);
+		} else {
+			c->ntex_missing++;
+			for (k = 0; k < 4; k++) {
+				out4[k] = SF_ZERO;
+			}
+		}
+		for (k = 0; k < 4; k++) {
+			if ((mask >> k) & 1) {
+				c->r[(d + j) & (S8F_REGS - 1)] = out4[k];
+				j++;
+			}
+		}
 		s8f_assume(c, op);
 		return n;
 	}
@@ -430,6 +510,12 @@ s8f_step_frag(struct s8f_ctx * c, const uint8_t * b, unsigned avail)
 			return n;
 		}
 		return 0;
+	case 0x58:                                              /* signal_pix (4 B), the pixel-ordering partner of wait_pix: no effect on a single pixel */
+		return n;
+	case 0xe2: case 0x22:                                   /* get_sr, 32-bit form (`e2 06 10 04`): r[b1 >> 1] = sr[b2] (ASSUMED; 0x22 only length-known) */
+		c->r[(b[1] >> 1) & (S8F_REGS - 1)] = c->sr[b[2]];
+		s8f_assume(c, op);
+		return n;
 	case 0x02:                                              /* 02 04 04 00: 16-bit register copy (a self copy in the corpus) */
 		s8f_sh(c, b[1], s8f_gh(c, b[2]));
 		s8f_assume(c, op);
@@ -462,9 +548,9 @@ s8f_step_frag(struct s8f_ctx * c, const uint8_t * b, unsigned avail)
 		c->r[(b[1] >> 3) & (S8F_REGS - 1)] = res;
 		return n;
 	}
-	case 0x92:                                              /* 4 B: r[b1 >> 1] = float(f16 immediate b2 | b3 << 8) (scene 31/35: 255.0 = 0x5bf8, ASSUMED field split) */
-		c->r[(b[1] >> 1) & (S8F_REGS - 1)] = sf_h2f((uint16_t)(b[2] | (b[3] << 8)));
-		s8f_assume(c, op);
+	case 0x92:                                              /* 4 B: h[b1] = 16-bit immediate b2 | b3 << 8 (scene 31/35: 255.0 = 0x5bf8 in h2, read by `4a 03 c0 c2 04 00` as a 16-bit source;
+								 * compositor: `92 01 00 7c` h1 = +inf, `92 03 00 3c` h3 = 1.0) */
+		s8f_sh(c, b[1], (uint16_t)(b[2] | (b[3] << 8)));
 		return n;
 	case 0x12:                                              /* 4 B: h[b1] = 16-bit integer immediate (ASSUMED) */
 		s8f_sh(c, b[1], (uint16_t)(b[2] | (b[3] << 8)));
@@ -494,6 +580,7 @@ s8f_run(struct s8f_ctx * c, const uint8_t * p, unsigned len)
 		const uint8_t * b = p + pc;
 		uint8_t op = b[0];
 
+		c->hit[op]++;
 		if (c->rd == 0 && c->fetch == 0) {
 			uint32_t was = 0, now = 0;
 			unsigned adv, i;
@@ -516,12 +603,17 @@ s8f_run(struct s8f_ctx * c, const uint8_t * p, unsigned len)
 			}
 		}
 		if (op == 0x51) {
-			if (b[1] & 1) {                                 /* short iter (the texture path): the caller supplies the sample */
+			int nch = (b[2] >> 6) ? (b[2] >> 6) : 4;
+			int dreg = b[1] >> 2;
+
+			c->last_iter = (unsigned)dreg;
+			if (b[1] & 1) {                                 /* short iter (4 B, the texture coordinates): same fields as the long form, values from the caller's varyings (ASSUMED equal semantics) */
+				for (int k = 0; k < nch; k++) {
+					c->r[(dreg / 2 + k) & (S8F_REGS - 1)] = c->varying ? c->varying[k] : 0;
+				}
 				pc += 4;
 				continue;
 			}
-			int nch = (b[2] >> 6) ? (b[2] >> 6) : 4;
-			int dreg = b[1] >> 2;
 
 			for (int k = 0; k < nch; k++) {
 				if (b[1] & 2) {
@@ -537,8 +629,10 @@ s8f_run(struct s8f_ctx * c, const uint8_t * p, unsigned len)
 			f32b a = s8f_src(c, b, 2, half_a);
 			f32b s1;
 
-			if ((b[4] & 0x20) || (b[3] >> 6) >= 2) {        /* register: flag bit in b4, or the 0b10/0b11 hint bits in b3 (scene 35: `4a 03 c0 c2 04 00` = r0 * r1) */
+			if (b[4] & 0x20) {                              /* b4 bit 5: B is a 32-bit register */
 				s1 = s8f_src(c, b, 3, 0);
+			} else if ((b[3] >> 6) >= 2) {                  /* hint bits 0b10/0b11 in b3 without bit 5: a 16-bit register, converted (scene 35: `4a 03 c0 c2 04 00` = r0 * f32(h2 = 255.0)) */
+				s1 = sf_h2f(s8f_gh(c, b[3] & 0x3f));
 			} else {
 				/* 8-bit minifloat: bits 0-5 in byte 3, bits 6-7 in bits 4-5 of byte 5 (seen with 2.0 = 0x40 in the vertex col*2 shader) */
 				s1 = sf_minifloat((uint8_t)(b[3] | (((b[5] >> 4) & 3) << 6)));
@@ -676,6 +770,73 @@ s8f_run(struct s8f_ctx * c, const uint8_t * p, unsigned len)
 		}
 	}
 	return c->stored;
+}
+
+/*
+ * Fragment program image start (tests/frag_forms.c: analysis/compositor-frag-forms.md section 0.3, compositor-stream.md).
+ * m/len = memory window of the image, block = offset of the program block the draw's `c0400038 <block VA>` record names ((unsigned)-1 if the draw has none),
+ * entry = offset of the entry pointer (flag bits cleared; the pointer's `& 3 == 2` flag shifts the instruction boundary to entry + 2 for some programs).
+ * Order: (1) block + 0x40 when the instruction-length walk from there lands on the entry (or entry + 2) and reaches `08 01` after it;
+ *        (2) the earliest offset in [entry - 0x100, entry] whose walk does the same (no block, or an image with another header);
+ *        (3) block + 0x40 unverified when the block exists and its first byte decodes (the walk stops on a form not known yet).
+ * Returns 1, 2 or 3 accordingly with *start set, 0 when there is no candidate.
+ */
+static inline int
+s8f_walk_lands(const uint8_t * m, unsigned len, unsigned start, unsigned entry)
+{
+	unsigned pc = start;
+	int hit = start == entry || start == entry + 2;
+
+	while (pc + 2 <= len) {
+		unsigned n = s8f_len(m + pc, len - pc);
+
+		if (n == 0 || pc + n > len) {
+			return 0;
+		}
+		if (m[pc] == 0x08 && m[pc + 1] == 0x01) {
+			if (hit) {
+				return 1;
+			}
+			if (pc + 4 > entry) {
+				return 0;
+			}
+			pc += 4;                        /* an earlier program of the same image: skip its end and the 08 00 padding */
+			while (pc + 2 <= len && m[pc] == 0x08 && m[pc + 1] == 0x00) {
+				pc += 2;
+			}
+			if (pc == entry || pc == entry + 2) {
+				hit = 1;
+			}
+			continue;
+		}
+		pc += n;
+		if (pc == entry || pc == entry + 2) {
+			hit = 1;
+		}
+	}
+	return 0;
+}
+
+static inline int
+s8f_start_image(const uint8_t * m, unsigned len, unsigned block, unsigned entry, unsigned * start)
+{
+	unsigned q;
+
+	if (block != (unsigned)-1 && block + 0x40 < len && s8f_walk_lands(m, len, block + 0x40, entry)) {
+		*start = block + 0x40;
+		return 1;
+	}
+	for (q = entry >= 0x100 ? entry - 0x100 : 0; q <= entry; q++) {
+		if (s8f_walk_lands(m, len, q, entry)) {
+			*start = q;
+			return 2;
+		}
+	}
+	if (block != (unsigned)-1 && block + 0x40 < len && s8f_len(m + block + 0x40, len - block - 0x40) != 0) {
+		*start = block + 0x40;
+		return 3;
+	}
+	return 0;
 }
 
 /*
