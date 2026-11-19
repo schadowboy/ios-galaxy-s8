@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..6a46bda
+index 0000000..b287cac
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,2001 @@
+@@ -0,0 +1,2017 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -781,6 +781,7 @@ index 0000000..6a46bda
 +	int w, h;
 +	int blend;
 +	uint32_t pixels, unknown, stored;
++	uint32_t firstOut, lastOut;     /* the first and the last stored pixel (diagnostics) */
 +};
 +
 +static void
@@ -817,6 +818,10 @@ index 0000000..6a46bda
 +			sa = sa > 255 ? 255 : sa;
 +		}
 +		*dst = sb | (sg << 8) | (sr << 16) | (sa << 24);
++		if (dc->stored == 0) {
++			dc->firstOut = *dst;
++		}
++		dc->lastOut = *dst;
 +		dc->stored++;
 +	} else if (fc.unknown != 0) {
 +		dc->unknown = fc.unknown;
@@ -1083,6 +1088,17 @@ index 0000000..6a46bda
 +					IOLog("S8AGX: comp: pass %d draw %d prim %u n %u kind %u vs 0x%llx fs 0x%llx(+%u) tex %d: %u shaded, %u stored, unknown 0x%02x, budget left %u\n", pi, di,
 +					    (unsigned)d->prim, (unsigned)d->count, (unsigned)d->kind, (unsigned long long)d->vs.entry, (unsigned long long)d->fs.entry, fstart,
 +					    dc->tmpl.ntex, (unsigned)dc->pixels, (unsigned)dc->stored, (unsigned)dc->unknown, (unsigned)budget);
++					if (dc->stored != 0) {
++						IOLog("S8AGX: comp:   out first %08x last %08x; fs uniforms %08x %08x %08x %08x; blend %d\n", (unsigned)dc->firstOut, (unsigned)dc->lastOut,
++						    (unsigned)dc->tmpl.uni[0], (unsigned)dc->tmpl.uni[2], (unsigned)dc->tmpl.uni[4], (unsigned)dc->tmpl.uni[6], (int)dc->blend);
++					}
++					for (int ti = 0; ti < dc->tmpl.ntex && ti < 2; ti++) {
++						const struct s8t_desc * td = &dc->tmpl.texd[ti];
++
++						IOLog("S8AGX: comp:   tex %d va 0x%llx %ux%u fmt %u layout %u pitch %u texels %08x %08x %08x %08x\n", ti, (unsigned long long)td->va, (unsigned)td->width,
++						    (unsigned)td->height, (unsigned)td->fmt, (unsigned)td->layout, (unsigned)td->pitch, (unsigned)agxRd(this, td->va), (unsigned)agxRd(this, td->va + 4),
++						    (unsigned)agxRd(this, td->va + 0x1000), (unsigned)agxRd(this, td->va + 0x20000));
++					}
 +					IOLog("S8AGX: comp:   vertices tried %u ok %u; first failure op 0x%02x at +%u exports 0x%x; first ok vertex at (%d/16, %d/16) w %08x; vp %08x %08x %08x %08x uni0 %08x %08x; vbytes %02x %02x %02x %02x\n",
 +					    (unsigned)dTried, (unsigned)dOk, (unsigned)dUnk, (unsigned)dPc, (unsigned)dMask, (int)dX, (int)dY, (unsigned)dW, (unsigned)vp[0], (unsigned)vp[1],
 +					    (unsigned)vp[2], (unsigned)vp[3], (unsigned)uni[0], (unsigned)uni[2], vbase[vstart], vbase[vstart + 1], vbase[vstart + 2], vbase[vstart + 3]);
