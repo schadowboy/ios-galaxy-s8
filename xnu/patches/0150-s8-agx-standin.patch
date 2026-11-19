@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..d8fed49
+index 0000000..22172fe
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,2039 @@
+@@ -0,0 +1,2117 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -44,7 +44,8 @@ index 0000000..d8fed49
 +#include <IOKit/IOBufferMemoryDescriptor.h>
 +#include <IOKit/IOSharedDataQueue.h>
 +#include <pexpert/pexpert.h>
-+#include "SweetSurface.h"       /* IOSurface-backed render targets (display path) */
++#include <kern/clock.h>
++#include "SweetSurface.h"      /* IOSurface-backed render targets (display path) */
 +#include "s8gfx_sf.h"          /* integer-only float, rasteriser and shader interpreter of the software executor (host-tested in scratch/agx) */
 +#include "s8gfx_rast.h"
 +#include "s8gfx_frag.h"
@@ -783,6 +784,8 @@ index 0000000..d8fed49
 +	int blend;
 +	uint32_t pixels, unknown, stored;
 +	uint32_t firstOut, lastOut;     /* the first and the last stored pixel (diagnostics) */
++	int constant;                   /* the program's output does not depend on varyings, tile, pixel position or textures: shaded once */
++	uint32_t cb, cg, cr, ca;        /* its output as unorm8 */
 +};
 +
 +static void
@@ -796,17 +799,34 @@ index 0000000..d8fed49
 +		return;
 +	}
 +	dst = (uint32_t *)(dc->target + (uint64_t)py * dc->pitch + (uint64_t)px * 4);
-+	memcpy(&fc, &dc->tmpl, sizeof(fc));
-+	fc.varying = v;
-+	fc.tile = *dst;
-+	fc.has_tile = 1;
-+	fc.sr[48] = (uint32_t)px & 31;
-+	fc.sr[49] = (uint32_t)py & 31;
-+	fc.sr[16] = (uint32_t)px;               /* pixel coordinates (dither texture lookups: e2 .. sr 0x10/0x11) */
-+	fc.sr[17] = (uint32_t)py;
 +	dc->pixels++;
-+	if (s8f_run(&fc, dc->frag, dc->fraglen) && fc.stored) {
-+		uint32_t sb = sf_to_unorm8(fc.out[2]), sg = sf_to_unorm8(fc.out[1]), sr = sf_to_unorm8(fc.out[0]), sa = sf_to_unorm8(fc.out[3]);
++	if (dc->constant) {
++		fc.stored = 1;
++		fc.unknown = 0;
++	} else {
++		memcpy(&fc, &dc->tmpl, sizeof(fc));
++		fc.varying = v;
++		fc.tile = *dst;
++		fc.has_tile = 1;
++		fc.sr[48] = (uint32_t)px & 31;
++		fc.sr[49] = (uint32_t)py & 31;
++		fc.sr[16] = (uint32_t)px;               /* pixel coordinates (dither texture lookups: e2 .. sr 0x10/0x11) */
++		fc.sr[17] = (uint32_t)py;
++	}
++	if (dc->constant || (s8f_run(&fc, dc->frag, dc->fraglen) && fc.stored)) {
++		uint32_t sb, sg, sr, sa;
++
++		if (dc->constant) {
++			sb = dc->cb;
++			sg = dc->cg;
++			sr = dc->cr;
++			sa = dc->ca;
++		} else {
++			sb = sf_to_unorm8(fc.out[2]);
++			sg = sf_to_unorm8(fc.out[1]);
++			sr = sf_to_unorm8(fc.out[0]);
++			sa = sf_to_unorm8(fc.out[3]);
++		}
 +
 +		if (dc->blend) {                /* premultiplied source-over (HYPOTHESIS for the pipeline blend bit) */
 +			uint32_t d = *dst, ia = 255 - sa;
@@ -846,6 +866,7 @@ index 0000000..d8fed49
 +	uint8_t * vok = (uint8_t *)IOMallocZero(kMaxVtx);
 +	struct comp_px * dc = (struct comp_px *)IOMallocZero(sizeof(*dc));
 +	uint32_t budget = gPxBudget;
++	uint64_t t0 = mach_absolute_time();
 +
 +	if (passes == NULL || draws == NULL || vt == NULL || vok == NULL || dc == NULL) {
 +		goto out;
@@ -1026,6 +1047,51 @@ index 0000000..d8fed49
 +				dc->blend = (int)d->blend;
 +				bzero(vok, kMaxVtx);
 +
++				/* constant-output probe: three runs with different varyings / destination pixel / position; identical outputs and no texture = a solid colour */
++				if (dc->tmpl.ntex == 0) {
++					f32b pv[3][S8R_MAXV];
++					static const uint32_t ptile[3] = { 0u, 0xffffffffu, 0x80402010u };
++					uint32_t po[3][4];
++					bool pok = true;
++
++					for (int a = 0; a < 3; a++) {
++						for (int k = 0; k < S8R_MAXV; k++) {
++							pv[a][k] = sf_from_i64((int64_t)(a * 3 + k));
++						}
++					}
++					for (int a = 0; a < 3 && pok; a++) {
++						memcpy(&dc->work, &dc->tmpl, sizeof(dc->work));
++						dc->work.varying = pv[a];
++						dc->work.tile = ptile[a];
++						dc->work.has_tile = 1;
++						dc->work.sr[48] = (uint32_t)a * 7;
++						dc->work.sr[49] = (uint32_t)a * 13;
++						dc->work.sr[16] = (uint32_t)a * 101;
++						dc->work.sr[17] = (uint32_t)a * 77;
++						if (!s8f_run(&dc->work, dc->frag, dc->fraglen) || !dc->work.stored) {
++							pok = false;
++							break;
++						}
++						for (int k = 0; k < 4; k++) {
++							po[a][k] = dc->work.out[k];
++						}
++					}
++					if (pok) {
++						for (int k = 0; k < 4; k++) {
++							if (po[0][k] != po[1][k] || po[1][k] != po[2][k]) {
++								pok = false;
++							}
++						}
++					}
++					if (pok) {
++						dc->constant = 1;
++						dc->cb = sf_to_unorm8(po[0][2]);
++						dc->cg = sf_to_unorm8(po[0][1]);
++						dc->cr = sf_to_unorm8(po[0][0]);
++						dc->ca = sf_to_unorm8(po[0][3]);
++					}
++				}
++
 +				/* vertex ids of the triangles */
 +				ntri = d->kind == S8S_DRAW_INDEXED ? d->count : d->count;
 +				for (uint32_t t = 0; t + 3 <= ntri && budget > 0; t += (d->prim == 6 ? 3 : 1)) {
@@ -1102,11 +1168,14 @@ index 0000000..d8fed49
 +						uint32_t before = dc->pixels;
 +
 +						s8r_tri(&vt[idxv[0]], &vt[idxv[1]], &vt[idxv[2]], (int)(nvar ? nvar : 1), 0, 0, dc->w, dc->h, comp_emit, dc);
-+						budget = (dc->pixels - before) >= budget ? 0 : budget - (dc->pixels - before);
++						if (!dc->constant) {         /* solid draws cost almost nothing: only real shading counts against the budget */
++							budget = (dc->pixels - before) >= budget ? 0 : budget - (dc->pixels - before);
++						}
 +					}
 +				}
 +				if (OSIncrementAtomic((SInt32 *)&xlogged) < 300) {
-+					IOLog("S8AGX: comp: pass %d draw %d prim %u n %u kind %u vs 0x%llx fs 0x%llx(+%u) tex %d: %u shaded, %u stored, unknown 0x%02x, budget left %u\n", pi, di,
++					IOLog("S8AGX: comp: pass %d draw %d%s prim %u n %u kind %u vs 0x%llx fs 0x%llx(+%u) tex %d: %u shaded, %u stored, unknown 0x%02x, budget left %u\n", pi, di,
++					    dc->constant ? " CONST" : "",
 +					    (unsigned)d->prim, (unsigned)d->count, (unsigned)d->kind, (unsigned long long)d->vs.entry, (unsigned long long)d->fs.entry, fstart,
 +					    dc->tmpl.ntex, (unsigned)dc->pixels, (unsigned)dc->stored, (unsigned)dc->unknown, (unsigned)budget);
 +					if (dc->stored != 0) {
@@ -1128,6 +1197,15 @@ index 0000000..d8fed49
 +		}
 +	}
 +out:
++	{
++		uint64_t ns = 0;
++		static volatile SInt32 tlogged;
++
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		if (ns > 50000000ULL && OSIncrementAtomic((SInt32 *)&tlogged) < 100) {
++			IOLog("S8AGX: comp: submit executed in %llu ms (budget left %u)\n", (unsigned long long)(ns / 1000000ULL), (unsigned)budget);
++		}
++	}
 +	if (passes != NULL) {
 +		IOFree(passes, sizeof(*passes) * kMaxPass);
 +	}
