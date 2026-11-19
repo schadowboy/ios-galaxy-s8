@@ -778,6 +778,8 @@ struct comp_px {
 	int blend;
 	uint32_t pixels, unknown, stored;
 	uint32_t firstOut, lastOut;     /* the first and the last stored pixel (diagnostics) */
+	uint32_t texw[S8F_NTEX][6];     /* raw texture-state words of each bound texture (diagnostics: descriptor decoding) */
+	uint32_t smpw[S8F_NTEX][2];     /* raw sampler words */
 	int constant;                   /* the program's output does not depend on varyings, tile, pixel position or textures: shaded once */
 	int tileOnly;                   /* the output depends on the destination pixel only (no texture): cached per destination value */
 	int cacheValid;
@@ -946,6 +948,8 @@ AGXDeviceUserClient::execComposite(void)
 				uint32_t idxv[3];
 				uint32_t dTried = 0, dOk = 0, dFail = 0, dUnk = 0, dPc = 0, dMask = 0, dW = 0;
 				int32_t dX = 0, dY = 0;
+				int32_t bx0 = 0, bx1 = 0, by0 = 0, by1 = 0;
+				int bbox = 0;
 
 				if (d->kind == S8S_DRAW_OTHER || d->count < 3 || d->count > 4000 || (d->prim != 6 && d->prim != 9)) {
 					if (OSIncrementAtomic((SInt32 *)&xlogged) < 300) {
@@ -1008,6 +1012,7 @@ AGXDeviceUserClient::execComposite(void)
 						for (int j = 0; j < 6; j++) {
 							w6[j] = agxRd(this, d->fs.push[k].va + 4 * j);
 						}
+						memcpy(dc->texw[dc->tmpl.ntex], w6, sizeof(w6));
 						ok = s8t_desc_decode(&dc->tmpl.texd[dc->tmpl.ntex], w6);
 						{
 							uint64_t tva = 0;
@@ -1047,6 +1052,8 @@ AGXDeviceUserClient::execComposite(void)
 						if (d->fs.push[k].type == S8S_PUSH_SAMPLER) {
 							uint32_t w2[2] = { agxRd(this, d->fs.push[k].va), agxRd(this, d->fs.push[k].va + 4) };
 
+							dc->smpw[si][0] = w2[0];
+							dc->smpw[si][1] = w2[1];
 							s8t_sampler_decode(&dc->tmpl.texs[si++], w2);
 						}
 					}
@@ -1172,6 +1179,23 @@ AGXDeviceUserClient::execComposite(void)
 						vt[vid].x = sf_fma(vp[1], sf_mul(c.exp[0], iw), vp[0]);
 						vt[vid].y = sf_fma(vp[3], sf_mul(c.exp[1], iw), vp[2]);
 						vt[vid].iw = iw;
+						{
+							int32_t fx = sf_to_fixed(vt[vid].x, 0), fy = sf_to_fixed(vt[vid].y, 0);
+
+							if (!bbox || fx < bx0) {
+								bx0 = fx;
+							}
+							if (!bbox || fx > bx1) {
+								bx1 = fx;
+							}
+							if (!bbox || fy < by0) {
+								by0 = fy;
+							}
+							if (!bbox || fy > by1) {
+								by1 = fy;
+							}
+							bbox = 1;
+						}
 						nvar = 0;
 						while (nvar < S8R_MAXV && (c.expmask & (1u << (4 + nvar)))) {
 							vt[vid].v[nvar] = c.exp[4 + nvar];
@@ -1201,8 +1225,14 @@ AGXDeviceUserClient::execComposite(void)
 						IOLog("S8AGX: comp:   out first %08x last %08x; fs uniforms %08x %08x %08x %08x; blend %d\n", (unsigned)dc->firstOut, (unsigned)dc->lastOut,
 						    (unsigned)dc->tmpl.uni[0], (unsigned)dc->tmpl.uni[2], (unsigned)dc->tmpl.uni[4], (unsigned)dc->tmpl.uni[6], (int)dc->blend);
 					}
-					for (int ti = 0; ti < dc->tmpl.ntex && ti < 2; ti++) {
+					IOLog("S8AGX: comp:   quad bbox (%d,%d)-(%d,%d) in a %ux%u pass at 0x%llx\n", (int)bx0, (int)by0, (int)bx1, (int)by1, (unsigned)p->width, (unsigned)p->height,
+					    (unsigned long long)p->target_va);
+					for (int ti = 0; ti < dc->tmpl.ntex && ti < 4; ti++) {
 						const struct s8t_desc * td = &dc->tmpl.texd[ti];
+
+						IOLog("S8AGX: comp:   texw %d: %08x %08x %08x %08x %08x %08x smp %08x %08x\n", ti, (unsigned)dc->texw[ti][0], (unsigned)dc->texw[ti][1],
+						    (unsigned)dc->texw[ti][2], (unsigned)dc->texw[ti][3], (unsigned)dc->texw[ti][4], (unsigned)dc->texw[ti][5], (unsigned)dc->smpw[ti][0],
+						    (unsigned)dc->smpw[ti][1]);
 
 						IOLog("S8AGX: comp:   tex %d va 0x%llx %ux%u fmt %u layout %u pitch %u texels %08x %08x %08x %08x\n", ti, (unsigned long long)td->va, (unsigned)td->width,
 						    (unsigned)td->height, (unsigned)td->fmt, (unsigned)td->layout, (unsigned)td->pitch, (unsigned)agxRd(this, td->va), (unsigned)agxRd(this, td->va + 4),
