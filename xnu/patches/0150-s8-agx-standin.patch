@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..058de07
+index 0000000..4928bf7
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,1447 @@
+@@ -0,0 +1,1465 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -896,7 +896,25 @@ index 0000000..058de07
 +AGXDeviceUserClient::executePasses(void)
 +{
 +	if (fSurfN != 0) {
-+		fillSurfaceTargets(0xffff00ffu);        /* magenta (B,G,R,A = ff,00,ff,ff), only until the shaders run */
++		fillSurfaceTargets(0xffe09030u);        /* memory bytes 30 90 e0 ff: if the panel shows orange the format is BGRA, if blue it is RGBA */
++		/* compositor draw packets {0x00220000|0x00260000|0x001b0000, 0x6e44pp00, count, instances - 1}: log where they are (first few per call) */
++		static volatile SInt32 dlogged;
++		for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
++			uint32_t r = fResShm[n - 1];
++
++			if (r == 0xffffffffu || r >= fShmemCount || fShmemBuf[r] == NULL) {
++				continue;
++			}
++			const uint32_t * d = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
++			uint64_t nd = fShmemBuf[r]->getLength() / 4;
++
++			for (uint64_t i = 0; i + 4 < nd; i++) {
++				if ((d[i] & 0xffffu) == 0 && (d[i + 1] >> 16) == 0x6e44u && d[i + 2] != 0 && d[i + 2] < 100000u && OSIncrementAtomic((SInt32 *)&dlogged) < 120) {
++					IOLog("S8AGX: draw packet res %u +0x%llx: %08x %08x count %u inst %u\n", (unsigned)n, (unsigned long long)(i * 4), (unsigned)d[i],
++					    (unsigned)d[i + 1], (unsigned)d[i + 2], (unsigned)d[i + 3] + 1);
++				}
++			}
++		}
 +	}
 +
 +	static volatile SInt32 logged;
@@ -1453,10 +1471,10 @@ index 0000000..058de07
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
 diff --git a/iokit/Kernel/arm/s8gfx_frag.h b/iokit/Kernel/arm/s8gfx_frag.h
 new file mode 100755
-index 0000000..a8200ee
+index 0000000..26309f7
 --- /dev/null
 +++ b/iokit/Kernel/arm/s8gfx_frag.h
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,733 @@
 +/*
 + * Fragment program interpreter for the A11 (G10) shader subset decoded so far (tools/agx-emu.py is its Python twin, validated on the render scenes).
 + * Integer-only (s8gfx_sf.h), no libc, so it builds into the kernel and into the host test (scratch/agx/frag_test.c).
@@ -1499,7 +1517,50 @@ index 0000000..a8200ee
 +	/* fragment blending: the destination pixel as stored (BGRA8, little endian word) for ld_tile; has_tile = 0 leaves registers alone */
 +	uint32_t tile;
 +	int has_tile;
++	/* integer / f16 fragment forms (see s8f_step_frag): scratch memory behind the device_load/device_store round trips (8-bit pack/unpack), the per-sample
++	 * tile words for the raw four-way ld_tile (ntile_s = 0: every sample reads `tile`), the special registers read by get_sr (sr[48], sr[49] = pixel x, y in
++	 * the tile), and the bookkeeping of forms whose semantics are only ASSUMED (assumed[op >> 5] bit op & 31; strict = stop instead of continuing) */
++	uint8_t scratch[256];
++	uint32_t tile_s[16];
++	int ntile_s;
++	uint32_t sr[256];
++	uint32_t assumed[8];
++	int strict;
 +};
++
++/* 16-bit lane access to the 32-bit register file: half index i = register i / 2, low half first */
++static inline uint16_t
++s8f_gh(const struct s8f_ctx * c, unsigned i)
++{
++	uint32_t w = c->r[(i >> 1) & (S8F_REGS - 1)];
++
++	return (i & 1) ? (uint16_t)(w >> 16) : (uint16_t)(w & 0xffff);
++}
++
++static inline void
++s8f_sh(struct s8f_ctx * c, unsigned i, uint16_t v)
++{
++	uint32_t * w = &c->r[(i >> 1) & (S8F_REGS - 1)];
++
++	if (i & 1) {
++		*w = (*w & 0xffffu) | ((uint32_t)v << 16);
++	} else {
++		*w = (*w & 0xffff0000u) | v;
++	}
++}
++
++/* ALU source byte (A11 compact forms): bits 6-7 = 0b10 / 0b11 -> register (6-bit half index; 32-bit operations use index / 2), else an immediate */
++static inline uint32_t
++s8f_s16(const struct s8f_ctx * c, uint8_t v)
++{
++	return (v >> 6) >= 2 ? s8f_gh(c, v & 0x3f) : v;
++}
++
++static inline uint32_t
++s8f_s32(const struct s8f_ctx * c, uint8_t v)
++{
++	return (v >> 6) >= 2 ? c->r[((v & 0x3f) >> 1) & (S8F_REGS - 1)] : v;
++}
 +
 +static inline f32b
 +s8f_src(struct s8f_ctx * c, const uint8_t * b, int i, int src_is_half)
@@ -1511,6 +1572,390 @@ index 0000000..a8200ee
 +		return c->h[idx];
 +	}
 +	return c->r[idx / 2];
++}
++
++/*
++ * Instruction length of the A11 forms seen in the corpus (0 = form not known). Lengths are PROVEN structurally: every captured vertex/fragment program
++ * walks with these rules from its first instruction to its `08 01` end (tests/isa_walk.c). See analysis/a11-isa-forms.md.
++ * Rules: 4 B = 4-byte mov family (low 6 bits 0x02/0x22: 02 42 82 a2 c2 e2), export 01/81, wait_pix 48/58, end 08, `23`, short iter 51 with bit 0;
++ * 6/8 B = the 6-byte base form, 8 bytes when bit 47 (b5 bit 7) is set (iadd/device_load families); fixed: c6/ca/ld_tile/st_tile 8, mov_imm 6.
++ * 0x1e (imadd) is 4 B (`1e 13 cc 00`, with a following 0x23), 8 B, or 6 B when b4 & 0x60 == 0x60, in which case a `20 c0 <imm32>` literal (6 B) follows.
++ */
++static inline unsigned
++s8f_len(const uint8_t * b, unsigned avail)
++{
++	uint8_t op = b[0];
++	unsigned lo = op & 0x3f;
++	unsigned n = 0;
++
++	if (avail < 2) {
++		return 0;
++	}
++	if (op == 0x38) {
++		return 2;
++	}
++	if (op == 0x08 || op == 0x48 || op == 0x58 || op == 0x01 || op == 0x81 || op == 0x23) {
++		return 4;
++	}
++	if (lo == 0x02 || lo == 0x22) {
++		return 4;
++	}
++	if (op == 0x51) {
++		return (b[1] & 1) ? 4 : 8;
++	}
++	if (op == 0x52 || op == 0xd2) {
++		return 6;
++	}
++	if (op == 0x21) {
++		return 10;
++	}
++	if (op == 0x79 || op == 0x09 || op == 0x89 || op == 0xc6 || op == 0xca || op == 0x31) {
++		return 8;
++	}
++	if (op == 0x75) {
++		return 2;                       /* `75 2a 75 29` before the end of the compositor's fragment programs (two 2-byte units; ASSUMED boundary) */
++	}
++	if (avail < 6) {
++		return 0;
++	}
++	if (op == 0x1e && b[3] == 0x00 && (b[1] & 1) == 1 && b[2] >= 0xc0) {
++		return 4;                       /* 1e 13 cc 00 / 1e 03 c8 00 */
++	}
++	if (op == 0x26) {
++		return 6;                       /* 26 00 00 00 00 80: 6-byte form of the long compositor vertex programs (semantics unknown) */
++	}
++	if (op == 0x12 || op == 0x92) {
++		return 4;                       /* 12 25 00 00 = 16-bit integer immediate move, 92 02 f8 5b = f16 immediate move (255.0) */
++	}
++	if (op == 0x16) {
++		return 8;                       /* 16 90 e7 e7 00 e7 e7 00 (semantics unknown) */
++	}
++	if (op == 0x20) {
++		return 6;                       /* `20 c0 <imm32>`: literal word that the preceding imadd (b4 & 0x60 == 0x60) takes as its operand */
++	}
++	if (op == 0x1e || op == 0x5e || op == 0x9e) {
++		n = ((b[4] & 0x60) == 0x60) ? 6 : 8;
++		return n;
++	}
++	if (op == 0x05 || op == 0x45 || op == 0x85 || op == 0xc5) {
++		return (b[5] & 0x80) ? 8 : 6;
++	}
++	if (op == 0x0e || op == 0x4e || op == 0x8e || op == 0xce || op == 0x6e || op == 0x2e || op == 0xae || op == 0xee) {
++		return (b[5] & 0x80) ? 8 : 6;
++	}
++	if (op == 0x4a || op == 0x8a || op == 0x0a || op == 0x86 || op == 0x46 || op == 0x7e || op == 0xfe || op == 0x3e || op == 0xbe || op == 0xde ||
++	    op == 0x1a || op == 0x5a) {
++		return 6;
++	}
++	return 0;
++}
++
++/* float -> uint32 / int32, toward zero, saturating (NaN -> 0) */
++static inline uint32_t
++s8f_f2u(f32b a)
++{
++	uint32_t e = (a >> 23) & 0xff;
++	uint64_t m;
++	int x;
++
++	if ((a >> 31) || e < 127) {
++		return 0;
++	}
++	if (e == 0xff) {
++		return (a & 0x7fffff) ? 0 : 0xffffffffu;
++	}
++	x = (int)e - 127;
++	if (x >= 32) {
++		return 0xffffffffu;
++	}
++	m = (a & 0x7fffff) | 0x800000;
++	return (uint32_t)(x >= 23 ? (m << (x - 23)) : (m >> (23 - x)));
++}
++
++static inline int32_t
++s8f_f2s(f32b a)
++{
++	uint32_t mag = s8f_f2u(a & 0x7fffffffu);
++
++	if (sf_isnan(a)) {
++		return 0;
++	}
++	if (a >> 31) {
++		return mag >= 0x80000000u ? (int32_t)0x80000000u : -(int32_t)mag;
++	}
++	return mag > 0x7fffffffu ? 0x7fffffff : (int32_t)mag;
++}
++
++static inline void
++s8f_assume(struct s8f_ctx * c, uint8_t op)
++{
++	c->assumed[op >> 5] |= 1u << (op & 31);
++}
++
++/* device_load / device_store with the G13 field layout (confirmed on the A11 by the g2/g3/g5/g7 round trips, analysis/a11-isa-forms.md):
++ * F = bit7 | b1[1:0] << 1 | b6[0] << 3 (0 i8, 1 i16, 2 i32, 3 f16, 4 u8norm), mask = b6 >> 4, R = b1 >> 2 (+ b5[1:0] << 6) with b6 bit 1 = 32-bit registers,
++ * offset O = b2 >> 4 | (b4 & 15) << 4 | b7 << 8 (immediate when b3 bit 0), shift = b5[3:2]; the byte address = O << (log2 element size + shift) in the scratch memory.
++ * The base register pair is ignored (the compiler's own scratch slot). */
++static inline unsigned
++s8f_devldst(struct s8f_ctx * c, const uint8_t * b, unsigned avail)
++{
++	unsigned n = (b[5] & 0x80) ? 8 : 6;
++	int store = (b[0] & 0x40) != 0;
++	unsigned F = ((b[0] >> 7) & 1) | ((b[1] & 3) << 1) | ((b[6] & 1) << 3);
++	unsigned mask = b[6] >> 4;
++	unsigned R = (b[1] >> 2) | ((b[5] & 3) << 6);
++	int r32 = (b[6] >> 1) & 1;
++	uint32_t O = (b[2] >> 4) | ((b[4] & 15) << 4);
++	unsigned sh = (b[5] >> 2) & 3;
++	static const uint8_t esz[8] = { 0, 1, 2, 1, 0, 0, 1, 1 };
++	unsigned esh = F < 8 ? esz[F] : 2;
++	unsigned bytes = 1u << esh;
++	unsigned addr, j = 0, k;
++
++	if (avail < n) {
++		return 0;
++	}
++	if (n == 8) {
++		O |= (uint32_t)b[7] << 8;
++	}
++	if (b[3] & 1) {
++		O = (uint32_t)(int32_t)(int16_t)O;
++	} else {
++		O = c->r[(O >> 1) & (S8F_REGS - 1)];
++	}
++	if (sh == 3) {
++		sh = 2;
++	}
++	addr = (O << (esh + sh)) & 0xff;
++	for (k = 0; k < 4; k++) {
++		unsigned a = (addr + k * bytes) & 0xff;
++		uint32_t v;
++
++		if (!((mask >> k) & 1)) {
++			continue;
++		}
++		if (store) {
++			v = r32 ? c->r[((R >> 1) + j) & (S8F_REGS - 1)] : s8f_gh(c, R + j);
++			if (F == 4) {
++				c->scratch[a] = r32 ? sf_to_unorm8(v) : sf_to_unorm8(sf_h2f((uint16_t)v));
++			} else if (F == 3) {
++				v = r32 ? sf_f2h(v) : v;
++				c->scratch[a] = (uint8_t)v;
++				c->scratch[(a + 1) & 0xff] = (uint8_t)(v >> 8);
++			} else {
++				unsigned i;
++
++				for (i = 0; i < bytes; i++) {
++					c->scratch[(a + i) & 0xff] = (uint8_t)(v >> (8 * i));
++				}
++			}
++		} else {
++			if (F == 4) {
++				f32b f = sf_div(sf_from_i64(c->scratch[a]), 0x437f0000u);
++
++				v = r32 ? f : sf_f2h(f);
++			} else {
++				unsigned i;
++
++				v = 0;
++				for (i = 0; i < bytes; i++) {
++					v |= (uint32_t)c->scratch[(a + i) & 0xff] << (8 * i);
++				}
++				if (F == 3 && r32) {
++					v = sf_h2f((uint16_t)v);
++				}
++			}
++			if (r32) {
++				c->r[((R >> 1) + j) & (S8F_REGS - 1)] = v;
++			} else {
++				s8f_sh(c, R + j, (uint16_t)v);
++			}
++		}
++		j++;
++	}
++	return n;
++}
++
++/*
++ * Fragment-mode forms beyond the first decode (analysis/a11-isa-forms.md has the evidence and confidence of each). Returns the instruction length, or 0 when the
++ * form is not handled here (the caller's older chain then decides). Operand size rule: b4 & 15 == 0 -> 16-bit lane op (dst half index = b1 >> 2),
++ * otherwise 32-bit op (dst register = b1 >> 3).
++ */
++static inline unsigned
++s8f_step_frag(struct s8f_ctx * c, const uint8_t * b, unsigned avail)
++{
++	uint8_t op = b[0];
++	unsigned n = s8f_len(b, avail);
++	int w32 = (b[4] & 15) != 0;
++
++	if (n == 0 || n > avail) {
++		return 0;
++	}
++	switch (op) {
++	case 0x05: case 0x85: case 0x45: case 0xc5:
++		return s8f_devldst(c, b, avail);
++	case 0x79:
++		if (b[6] == 0xfa && b[7] == 0xff) {
++			return 0;                       /* the float form of scene 9 */
++		}
++		{
++			/* raw four-way ld_tile (compositor): dst half index b1 >> 2, four f16 unorm channels R G B A of the pixel word; sample index = b3[3:2] | b5[3:2] << 2
++			 * ASSUMED: sample/format field split and channel order (see a11-isa-forms.md) */
++			unsigned d = b[1] >> 2;
++			unsigned smp = ((b[3] >> 2) & 3) | (((b[5] >> 2) & 3) << 2);
++			uint32_t word = c->ntile_s ? c->tile_s[smp % (unsigned)c->ntile_s] : c->tile;
++			unsigned k;
++
++			for (k = 0; k < 4; k++) {
++				static const uint8_t sh[4] = { 16, 8, 0, 24 };
++				f32b f = sf_div(sf_from_i64((word >> sh[k]) & 0xff), 0x437f0000u);
++
++				s8f_sh(c, d + k, sf_f2h(f));
++			}
++			s8f_assume(c, op);
++			return n;
++		}
++	case 0x7e: {                                            /* bitop: r[b1>>3] = tt(A = b2, B = b3), tt = b4 >> 4 in G13 order (and 8, xor 6, or e) */
++		uint32_t a, bb, res = 0;
++		unsigned tt = b[4] >> 4;
++
++		if (!w32) {
++			return 0;
++		}
++		a = s8f_s32(c, b[2]);
++		bb = s8f_s32(c, b[3]);
++		if ((b[3] >> 6) < 2) {
++			bb |= (uint32_t)((b[5] >> 4) & 3) << 6;         /* 8-bit immediate: bits 7:6 live in b5 bits 5:4 (scene 31: and 0xf0 = b3 0x30 | 3 << 6) */
++		}
++		if (tt & 1) res |= ~a & ~bb;
++		if (tt & 2) res |= a & ~bb;
++		if (tt & 4) res |= ~a & bb;
++		if (tt & 8) res |= a & bb;
++		c->r[(b[1] >> 3) & (S8F_REGS - 1)] = res;
++		return n;
++	}
++	case 0x0e: case 0x4e:                                   /* iadd (6 B) */
++		if (n != 6) {
++			return 0;
++		}
++		if (w32) {
++			c->r[(b[1] >> 3) & (S8F_REGS - 1)] = s8f_s32(c, b[2]) + s8f_s32(c, b[3]);
++		} else {
++			s8f_sh(c, b[1] >> 2, (uint16_t)(s8f_s16(c, b[2]) + s8f_s16(c, b[3])));
++		}
++		return n;
++	case 0x2e: case 0x6e: {                                 /* 0x6e bfeil: D = (a & ~mask) | ((b >> c) & mask); 0x2e bfi: D = (a & ~(mask << c)) | ((b & mask) << c);
++								 * 8 B, A = b2, B = b3, C = b6, mask = (1 << m) - 1 with m = b5 & 0x3f (0 = all ones) */
++		if (n != 8) {
++			return 0;
++		}
++		if (w32) {
++			uint32_t a = s8f_s32(c, b[2]), v = s8f_s32(c, b[3]), s = s8f_s32(c, b[6]) & 0x7f;
++			unsigned m = b[5] & 0x3f;
++			uint32_t mask = (m == 0 || m >= 32) ? 0xffffffffu : ((1u << m) - 1);
++			uint32_t res;
++
++			if (op == 0x6e) {
++				res = (a & ~mask) | ((s >= 32 ? 0 : v >> s) & mask);
++			} else {
++				uint32_t sm = s >= 32 ? 0 : mask << s;
++
++				res = (a & ~sm) | ((s >= 32 ? 0 : (v & mask) << s));
++			}
++			c->r[(b[1] >> 3) & (S8F_REGS - 1)] = res;
++			return n;
++		}
++		if (op == 0x2e) {
++			return 0;
++		}
++		{
++			uint32_t v = s8f_s16(c, b[3]), s = s8f_s16(c, b[6]) & 0x7f;
++
++			s8f_sh(c, b[1] >> 2, (uint16_t)(s >= 16 ? 0 : (v & 0xffff) >> s));
++		}
++		s8f_assume(c, op);                              /* the 16-bit form and the mask field m are not proven (the 32-bit shift with a = 0 is, by g3) */
++		return n;
++	}
++	case 0x8e:                                              /* imadd 16-bit (8 B): D = A * B + C (C = b6) */
++		if (n != 8 || w32) {
++			return 0;
++		}
++		s8f_sh(c, b[1] >> 2, (uint16_t)(s8f_s16(c, b[2]) * s8f_s16(c, b[3]) + s8f_s16(c, b[6])));
++		s8f_assume(c, op);
++		return n;
++	case 0xc6: {                                            /* f16 ffma (8 B): D = a * imm(b3, minifloat) + c (b5: register when bits 7:6 = 11, else minifloat) */
++		f32b a = sf_h2f(s8f_gh(c, b[2] & 0x3f));
++		f32b m = sf_minifloat(b[3]);
++		f32b cc = ((b[5] & 0xc0) == 0xc0) ? sf_h2f(s8f_gh(c, b[5] & 0x3f)) : sf_minifloat(b[5]);
++
++		s8f_sh(c, b[1] >> 2, sf_f2h(sf_fma(a, m, cc)));
++		s8f_assume(c, op);
++		return n;
++	}
++	case 0x86: {                                            /* f16 fadd (6 B): D = a + b (b3: register when bits 7:6 = 11, else minifloat) */
++		f32b a = sf_h2f(s8f_gh(c, b[2] & 0x3f));
++		f32b bb = ((b[3] & 0xc0) == 0xc0) ? sf_h2f(s8f_gh(c, b[3] & 0x3f)) : sf_minifloat(b[3]);
++
++		s8f_sh(c, b[1] >> 2, sf_f2h(sf_add(a, bb)));
++		s8f_assume(c, op);
++		return n;
++	}
++	case 0x82: case 0xa2:                                   /* get_sr, 16-bit: h[b1] = sr[b2] */
++		if (op == 0xa2 || op == 0x82) {
++			s8f_sh(c, b[1], (uint16_t)c->sr[b[2]]);
++			s8f_assume(c, op);
++			return n;
++		}
++		return 0;
++	case 0x02:                                              /* 02 04 04 00: 16-bit register copy (a self copy in the corpus) */
++		s8f_sh(c, b[1], s8f_gh(c, b[2]));
++		s8f_assume(c, op);
++		return n;
++	case 0x31:                                              /* end-of-shader pixel write: the compositor programs have no st_tile; r(h0..h3) = f16 RGBA is the colour */
++		c->out[0] = sf_h2f(s8f_gh(c, 0));
++		c->out[1] = sf_h2f(s8f_gh(c, 1));
++		c->out[2] = sf_h2f(s8f_gh(c, 2));
++		c->out[3] = sf_h2f(s8f_gh(c, 3));
++		c->stored = 1;
++		s8f_assume(c, op);
++		return n;
++	case 0xbe: {                                            /* convert (6 B): r[b1>>3] = conv(src b3), mode = b2 (G13 numbering: 8 f_to_u32, 9 f_to_s32, 10 u32_to_f, 11 s32_to_f,
++								 * 0 u8_to_f, 6 u16_to_f), b4 bit 6 = round to nearest (else toward zero for float -> int) */
++		uint32_t v = s8f_s32(c, b[3]);
++		uint32_t res;
++
++		switch (b[2] & 0x3f) {
++		case 8: res = s8f_f2u(v); break;
++		case 9: res = (uint32_t)s8f_f2s(v); break;
++		case 10: res = sf_from_i64((int64_t)v); break;
++		case 11: res = sf_from_i64((int64_t)(int32_t)v); break;
++		case 0: res = sf_from_i64(v & 0xff); break;
++		case 6: res = sf_from_i64(v & 0xffff); break;
++		default: return 0;
++		}
++		if ((b[2] & 0x3f) != 8 && (b[2] & 0x3f) != 9 && (b[2] & 0x3f) != 10 && (b[2] & 0x3f) != 11) {
++			s8f_assume(c, op);                      /* u8/u16 sources: mode numbers from G13, not seen on the A11 */
++		}
++		c->r[(b[1] >> 3) & (S8F_REGS - 1)] = res;
++		return n;
++	}
++	case 0x92:                                              /* 4 B: r[b1 >> 1] = float(f16 immediate b2 | b3 << 8) (scene 31/35: 255.0 = 0x5bf8, ASSUMED field split) */
++		c->r[(b[1] >> 1) & (S8F_REGS - 1)] = sf_h2f((uint16_t)(b[2] | (b[3] << 8)));
++		s8f_assume(c, op);
++		return n;
++	case 0x12:                                              /* 4 B: h[b1] = 16-bit integer immediate (ASSUMED) */
++		s8f_sh(c, b[1], (uint16_t)(b[2] | (b[3] << 8)));
++		s8f_assume(c, op);
++		return n;
++	case 0xc2: case 0x42:                                   /* 32-bit uniform copy into the half-register pair at half index b1 */
++		c->r[(b[1] >> 1) & (S8F_REGS - 1)] = c->uni[b[2] & 127];
++		return n;
++	case 0x75: case 0xde: case 0xfe: case 0x1e: case 0x20: case 0x23: case 0x26:
++		s8f_assume(c, op);                              /* decoded for length only: treated as no-ops */
++		return n;
++	default:
++		return 0;
++	}
 +}
 +
 +/* run a fragment program of at most len bytes; returns 1 when a st_tile ran (out[] valid) */
@@ -1526,6 +1971,27 @@ index 0000000..a8200ee
 +		const uint8_t * b = p + pc;
 +		uint8_t op = b[0];
 +
++		if (c->rd == 0 && c->fetch == 0) {
++			uint32_t was = 0, now = 0;
++			unsigned adv, i;
++
++			for (i = 0; i < 8; i++) {
++				was ^= c->assumed[i] * (2 * i + 1);
++			}
++			adv = s8f_step_frag(c, b, len - pc);
++			if (adv) {
++				for (i = 0; i < 8; i++) {
++					now ^= c->assumed[i] * (2 * i + 1);
++				}
++				if (c->strict && now != was) {
++					c->unknown = op;
++					c->pc_fail = pc;
++					return 0;
++				}
++				pc += adv;
++				continue;
++			}
++		}
 +		if (op == 0x51) {
 +			if (b[1] & 1) {                                 /* short iter (the texture path): the caller supplies the sample */
 +				pc += 4;
@@ -1548,7 +2014,7 @@ index 0000000..a8200ee
 +			f32b a = s8f_src(c, b, 2, half_a);
 +			f32b s1;
 +
-+			if (b[4] & 0x20) {
++			if ((b[4] & 0x20) || (b[3] >> 6) >= 2) {        /* register: flag bit in b4, or the 0b10/0b11 hint bits in b3 (scene 35: `4a 03 c0 c2 04 00` = r0 * r1) */
 +				s1 = s8f_src(c, b, 3, 0);
 +			} else {
 +				/* 8-bit minifloat: bits 0-5 in byte 3, bits 6-7 in bits 4-5 of byte 5 (seen with 2.0 = 0x40 in the vertex col*2 shader) */
@@ -1667,6 +2133,16 @@ index 0000000..a8200ee
 +			pc += 20;
 +		} else if (op == 0xc2 && pc + 4 <= len && b[3] == 0x00) {
 +			pc += 4;                                        /* c2 xx yy 00: filler / register-copy form seen around the prologue; treated as a no-op for now */
++		} else if ((op == 0x1e || op == 0x20 || op == 0x23 || op == 0x26 || op == 0x12 || op == 0x16) && s8f_len(b, len - pc) != 0 && s8f_len(b, len - pc) <= len - pc) {
++			/* imadd with a literal (`1e .. 60 00` + `20 c0 <imm32>`): the vertex address multiply, stride = the literal (ASSUMED: the literal is the byte stride of
++			 * the attribute stream); the 4-byte 1e/23 pair and the 6-byte `20` literal word are skipped (ASSUMED no-ops for the position math) */
++			unsigned n = s8f_len(b, len - pc);
++
++			if (op == 0x1e && n == 6 && pc + 12 <= len && b[6] == 0x20 && b[7] == 0xc0 && c->rd != 0) {
++				c->stride = (uint32_t)b[8] | ((uint32_t)b[9] << 8) | ((uint32_t)b[10] << 16) | ((uint32_t)b[11] << 24);
++			}
++			s8f_assume(c, op);
++			pc += n;
 +		} else if (op == 0x08 && pc + 4 <= len && b[1] == 0x01) {
 +			c->pc_end = pc + 4;
 +			return c->stored || c->expmask != 0;
@@ -1840,10 +2316,10 @@ index 0000000..36012e9
 +#endif /* S8GFX_RAST_H */
 diff --git a/iokit/Kernel/arm/s8gfx_sf.h b/iokit/Kernel/arm/s8gfx_sf.h
 new file mode 100755
-index 0000000..33319b4
+index 0000000..ed63fcd
 --- /dev/null
 +++ b/iokit/Kernel/arm/s8gfx_sf.h
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,453 @@
 +/*
 + * Integer-only IEEE-754 single precision (round to nearest even) for the kernel-side AGX executor: the XNU kernel is built without floating point.
 + * Floats are bit patterns (uint32_t). Denormal inputs are treated as zero and denormal results flush to zero (what the GPU does, too).
@@ -2226,6 +2702,74 @@ index 0000000..33319b4
 +	}
 +	/* m = 1.xxx * 2^msb  =>  value = (m << (23 - msb)) * 2^(e + msb - 23) */
 +	return sign | ((uint32_t)(e + msb + 127) << 23) | (((m << (23 - msb)) & 0x7fffff));
++}
++
++/* IEEE half -> float bits (exact) */
++static inline f32b
++sf_h2f(uint16_t h)
++{
++	uint32_t s = ((uint32_t)h & 0x8000) << 16;
++	uint32_t e = (h >> 10) & 0x1f;
++	uint32_t m = h & 0x3ff;
++
++	if (e == 0x1f) {
++		return s | 0x7f800000u | (m << 13);
++	}
++	if (e == 0) {
++		int sh = 0;
++
++		if (m == 0) {
++			return s;
++		}
++		while (!(m & 0x400)) {                  /* normalise the subnormal */
++			m <<= 1;
++			sh++;
++		}
++		return s | ((uint32_t)(113 - sh) << 23) | ((m & 0x3ff) << 13);
++	}
++	return s | ((e + 112) << 23) | (m << 13);
++}
++
++/* float bits -> IEEE half, round to nearest even */
++static inline uint16_t
++sf_f2h(f32b f)
++{
++	uint32_t s = (f >> 16) & 0x8000;
++	int e = (f >> 23) & 0xff;
++	uint32_t m = f & 0x7fffff;
++	int ne;
++	uint32_t r, rem;
++
++	if (e == 0xff) {
++		return (uint16_t)(s | 0x7c00 | (m ? 0x200 : 0));
++	}
++	ne = e - 127 + 15;
++	if (ne >= 31) {
++		return (uint16_t)(s | 0x7c00);
++	}
++	if (ne <= 0) {
++		int sh;
++		uint32_t half;
++
++		if (ne < -10) {
++			return (uint16_t)s;
++		}
++		m |= 0x800000;
++		sh = 14 - ne;
++		r = m >> sh;
++		rem = m & ((1u << sh) - 1);
++		half = 1u << (sh - 1);
++		if (rem > half || (rem == half && (r & 1))) {
++			r++;
++		}
++		return (uint16_t)(s | r);
++	}
++	r = ((uint32_t)ne << 10) | (m >> 13);
++	rem = m & 0x1fff;
++	if (rem > 0x1000 || (rem == 0x1000 && (r & 1))) {
++		r++;                                    /* a carry into the exponent is the correct rounding */
++	}
++	return (uint16_t)(s | r);
 +}
 +
 +#endif /* S8GFX_SF_H */

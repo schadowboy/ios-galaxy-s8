@@ -890,7 +890,25 @@ void
 AGXDeviceUserClient::executePasses(void)
 {
 	if (fSurfN != 0) {
-		fillSurfaceTargets(0xffff00ffu);        /* magenta (B,G,R,A = ff,00,ff,ff), only until the shaders run */
+		fillSurfaceTargets(0xffe09030u);        /* memory bytes 30 90 e0 ff: if the panel shows orange the format is BGRA, if blue it is RGBA */
+		/* compositor draw packets {0x00220000|0x00260000|0x001b0000, 0x6e44pp00, count, instances - 1}: log where they are (first few per call) */
+		static volatile SInt32 dlogged;
+		for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
+			uint32_t r = fResShm[n - 1];
+
+			if (r == 0xffffffffu || r >= fShmemCount || fShmemBuf[r] == NULL) {
+				continue;
+			}
+			const uint32_t * d = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
+			uint64_t nd = fShmemBuf[r]->getLength() / 4;
+
+			for (uint64_t i = 0; i + 4 < nd; i++) {
+				if ((d[i] & 0xffffu) == 0 && (d[i + 1] >> 16) == 0x6e44u && d[i + 2] != 0 && d[i + 2] < 100000u && OSIncrementAtomic((SInt32 *)&dlogged) < 120) {
+					IOLog("S8AGX: draw packet res %u +0x%llx: %08x %08x count %u inst %u\n", (unsigned)n, (unsigned long long)(i * 4), (unsigned)d[i],
+					    (unsigned)d[i + 1], (unsigned)d[i + 2], (unsigned)d[i + 3] + 1);
+				}
+			}
+		}
 	}
 
 	static volatile SInt32 logged;
