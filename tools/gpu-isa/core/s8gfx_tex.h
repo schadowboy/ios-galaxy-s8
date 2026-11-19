@@ -17,7 +17,7 @@
 
 #include "s8gfx_sf.h"
 
-enum { S8T_FMT_RGBA8 = 0, S8T_FMT_BGRA8 = 1, S8T_FMT_R8 = 2 };
+enum { S8T_FMT_RGBA8 = 0, S8T_FMT_BGRA8 = 1, S8T_FMT_R8 = 2, S8T_FMT_A8 = 3 };      /* A8: one byte per texel returned in the ALPHA channel (0,0,0,v): the compositor's 0x8002 glyph / mask textures */
 enum { S8T_LAYOUT_MORTON = 0, S8T_LAYOUT_LINEAR = 1 };
 enum { S8T_WRAP_CLAMP_EDGE = 0, S8T_WRAP_REPEAT = 1, S8T_WRAP_MIRROR = 2, S8T_WRAP_ZERO = 3 };
 
@@ -40,7 +40,7 @@ struct s8t_sampler {
 static inline uint32_t
 s8t_bpp(uint32_t fmt)
 {
-	return fmt == S8T_FMT_R8 ? 1 : 4;
+	return (fmt == S8T_FMT_R8 || fmt == S8T_FMT_A8) ? 1 : 4;
 }
 
 static inline void
@@ -177,7 +177,10 @@ s8t_fetch(const struct s8t_desc * d, uint32_t (*rd)(void *, uint64_t va), void *
 	}
 	a = d->va + s8t_texel_offset(d, (uint32_t)x, (uint32_t)y);
 	v = rd(ctx, a & ~3ull);
-	if (d->fmt == S8T_FMT_R8) {
+	if (d->fmt == S8T_FMT_A8) {
+		c[0] = c[1] = c[2] = 0;
+		c[3] = (v >> (8 * (a & 3))) & 0xff;
+	} else if (d->fmt == S8T_FMT_R8) {
 		c[0] = (v >> (8 * (a & 3))) & 0xff;
 		c[1] = c[2] = 0;
 		c[3] = 255;

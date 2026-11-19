@@ -271,3 +271,23 @@ Logic = execComposite (pre-pass bbox, R8 0x8002 layer textures sized to the quad
   by default because the f16 forms are not decoded and it writes opaque black over the whole frame.
 Findings on the capture17 session-8 frame: geometry plausible (a 694x79 header bar over a 582x387 body at (373,303)-(1067,738), both white because the R8 mask texels are synthetic, a 103x63 widget at (1071,55), a 90x90 coloured icon
 at (1158,2666) from IOSurface 5, a 516x15 home-indicator bar at (462,2921), the full-screen backdrop = vertex colour (0,0,0,1) i.e. black). Missing: every draw whose vertex/fragment bytes are zero in the capture (blur chain passes 2-5, 7, 8: 13 of 31 draws).
+
+## 14. capture20 (one boot; texel regions + program windows) - loader and what is still missing
+
+`tests/replay_dump.py` now merges every type-7 window (`res_9000+n`, VA = window start) into ONE region `progwin` (VA = lowest window start, zero-filled gaps) so an entry and its `c0400038` block that live in different windows resolve in the same memory;
+the type-9 texel regions (res_105/106/107/109/120/122/123/125/128) load as ordinary regions by VA. Check: `bash tests/stream_test.sh` with `CAP=data/capture20 SESS="7 9 10 11 12 13 14 15 20"`: draws resolve their program regions, 14-32 of 56 vertex programs walk, 10-18 fragment programs walk.
+`comp_render` prints `INDEX DATA NOT IN THE CAPTURE` for a draw whose index buffer is unmapped.
+Why nothing renders from capture20: the **vertex / index / uniform ring is not in the dump**. Every draw of the frame has `vb` in 0x1009d0000.. (res_98) and `ib` in 0x100a70000.. (res_103); `s8agxnores=...103,98...` excludes exactly these (in this boot's layout they are the
+data rings, not program heaps; res_102 at 0x100a60000 is something else). Without index data `nvid` = 1 and the vertex stage has no vertices. 50 of 56 draws lose their index buffer; the rest have no program window (windows exist only for draws executed in
+dump sessions 6..12, ~27 windows: 21 of 56 vertex and 14 of 56 fragment entries are in none of them in the session-15/20 frame).
+Needed for the next capture: dump res at 0x100a70000 (0x40000, vertex+index data) and 0x1009d0000 (0x40000, uniforms/vertex data): remove 98 and 103 from `s8agxnores`; windows for EVERY executed draw of the last frame (not only the first 27).
+
+## 15. capture21: first real frame (lock screen "Thursday, November 19" / "9:33")
+
+* `replay_dump.py`: the merged program-window region is now named `zz_progwin` (it spans 0x10012ef00..+7 MB and, sorted first, shadowed res_11 and every ring, which made the stream decode 0 draws). Rule: a catch-all region must sort LAST in `regions.txt`.
+* Complete frames: sessions 8 and 9 of capture21 (kernel command list with live pass blocks, rings res_98 + res_103 present from sessions 6-8, 46-48 of 59-67 vertex programs walk, 25-28 fragment programs walk, 50-54 vertex buffers plausible). Sessions 6, 7 are partial.
+* Render: `bash tests/comp_render.sh f21s9 capture21 9 -- -all` and `... f21s8 capture21 8 ...` -> `logs/_frame_f21s9.png`, `_frame_f21s8.png`.
+* Texture facts (real texels): the 0x8002 caller-memory textures are **A8** (one byte per texel, returned in the ALPHA channel; the shader samples with channel mask 08), linear, and start with a 0x40-byte header
+  `{2, 2, 0x40, 9, w_aligned, h, w, h, 1, ...}` at texel - 0x40; real size = header dwords [6] x [5] (651x387 clock, 694x79 date), **row stride = width aligned to 64 (704 for both)**; header dword [4] is NOT the pitch.
+  Rendering them as R8 (alpha = 255) gave solid white boxes; as A8 with the right size / pitch they show the glyphs (`logs/_tex_res105.png` = "9:33", `_tex_res106_p704.png` = "Thursday, November 19").
+* Changed in core: `s8gfx_tex.h`: enum `S8T_FMT_A8 = 3`, `s8t_bpp` (A8 = 1 byte), `s8t_fetch` (A8 returns (0,0,0,v)). Kernel glue: bind 0x8002 textures with `S8T_FMT_A8`, size from the header, pitch = (w + 63) & ~63.

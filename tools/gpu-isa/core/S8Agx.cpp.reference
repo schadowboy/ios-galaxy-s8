@@ -1169,8 +1169,15 @@ AGXDeviceUserClient::execComposite(void)
 							/* single-channel layer texture (masks / glyphs): format code 0x8002; 1 byte per texel, linear, exactly as large as the quad that samples it 1:1
 							 * (evidence: 640x387 and 694x79 quads = the shaded pixel counts, and the backing buffers are too small for 4 bytes per texel) */
 							uint32_t tw = bbox ? (uint32_t)(bx1 - bx0) : p->width, th = bbox ? (uint32_t)(by1 - by0) : p->height;
+							/* the 0x40-byte header in front of the texels: {2, 2, 0x40, 9, w_aligned, h, w, h, 1, ..}: real size w x h, row stride = width rounded up to 64;
+							 * the texels are alpha (A8: the sample returns (0,0,0,v)) */
+							uint32_t hw = agxRd(this, r8tva - 0x40 + 4 * 6), hh = agxRd(this, r8tva - 0x40 + 4 * 5);
 
-							s8t_desc_make(&dc->tmpl.texd[dc->tmpl.ntex], r8tva, tw, th, S8T_FMT_R8, S8T_LAYOUT_LINEAR, tw);
+							if (hw != 0 && hw <= 4096 && hh != 0 && hh <= 4096) {
+								tw = hw;
+								th = hh;
+							}
+							s8t_desc_make(&dc->tmpl.texd[dc->tmpl.ntex], r8tva, tw, th, S8T_FMT_A8, S8T_LAYOUT_LINEAR, (tw + 63) & ~63u);
 						}
 						{
 							uint64_t tva = 0;

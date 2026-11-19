@@ -115,7 +115,7 @@ static int texels_present(uint64_t va)
 	uint32_t k, v;
 
 	if (synth_all) return 0;
-	for (k = 0; k < 1024; k++) if (rd32(va + 4 * k, &v) && v) return 1;
+	for (k = 0; k < 0x11000; k++) { if (!rd32(va + 4 * k, &v)) break; if (v) return 1; }      /* the first rows of a layer texture are often transparent: scan up to 272 KB */
 	return 0;
 }
 
@@ -387,6 +387,7 @@ int main(int argc, char ** argv)
 			dc->tmpl.rd = 0; dc->tmpl.fetch = 0;
 			dc->tmpl.trd = agxrd;
 			memset(vok, 0, sizeof(vok));
+			{   uint32_t tmp; if (d->kind == S8S_DRAW_INDEXED && !rd32(d->index_va, &tmp)) { printf("  draw %d: INDEX DATA NOT IN THE CAPTURE (index buffer %llx; the vertex/index/uniform ring is not dumped: dump res at 0x100a70000 and 0x1009d0000)\n", di, (unsigned long long)d->index_va); nofrag++; continue; } }
 			/* vertex pre-pass */
 			nvid = d->count;
 			if (d->kind == S8S_DRAW_INDEXED) {
@@ -426,8 +427,19 @@ int main(int argc, char ** argv)
 					if ((w6[0] & 0xffff) == 0x8002 && form) {
 						uint32_t tw = bbox ? (uint32_t)(bx1 - bx0) : ps->width, th = bbox ? (uint32_t)(by1 - by0) : ps->height;
 
-						if (synth_all || !texels_present(tva)) { s8t_desc_make(&dc->tmpl.texd[ti], SYN_BASE + 0x1000000ULL * ti, tw, th, S8T_FMT_R8, S8T_LAYOUT_LINEAR, 4096); dc->synth[ti] = 1; }
-						else s8t_desc_make(&dc->tmpl.texd[ti], tva, tw, th, S8T_FMT_R8, S8T_LAYOUT_LINEAR, tw);
+						if (synth_all || !texels_present(tva)) { s8t_desc_make(&dc->tmpl.texd[ti], SYN_BASE + 0x1000000ULL * ti, tw, th, S8T_FMT_A8, S8T_LAYOUT_LINEAR, 4096); dc->synth[ti] = 1; }
+						else {
+							/* capture21: the texel buffer starts with a 0x40-byte header {2, 2, 0x40, 9, pitch, height, width, height, 1,...}; texels at +0x40, rows are `pitch` bytes (704 for a 651-wide mask) */
+							uint32_t h2 = 0, pitch = tw;
+
+							if (rd32(tva - 0x40 + 8, &h2) && h2 == 0x40) {
+								uint32_t hp = 0, hh = 0, hw = 0;
+
+								rd32(tva - 0x40 + 16, &hp); rd32(tva - 0x40 + 20, &hh); rd32(tva - 0x40 + 24, &hw);
+								if (hw >= 1 && hw < 8192 && hh >= 1 && hh < 8192) { tw = hw; th = hh; pitch = (hw + 63) & ~63u; (void)hp; }      /* row stride = width aligned to 64 bytes: 651 -> 704, 694 -> 704 (the header word [4] says 694 for the date, so it is NOT the pitch) */      /* header {.., pitch, height, width, height}: the real texture size (651x387 for a quad that is 582 wide) */
+							}
+							s8t_desc_make(&dc->tmpl.texd[ti], tva, tw, th, S8T_FMT_A8, S8T_LAYOUT_LINEAR, pitch);
+						}
 					} else if (tgt_index(tva) >= 0 && !synth_all) {
 						int ti2 = tgt_index(tva);
 

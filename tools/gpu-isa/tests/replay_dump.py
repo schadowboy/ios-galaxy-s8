@@ -16,6 +16,19 @@ for s in range(1, sess + 1):
     for n, lines in json.load(open(p)).items():
         for o, h in lines.items():
             bufs[n][int(o, 16):int(o, 16) + 64] = bytes.fromhex(h)
+# program windows (type 7, ids 9000+: the kernel dumps a window around every executed draw's entries; their VA is the window start): merge them all into ONE region
+# 'zz_progwin' so that an entry and its c0400038 block (different windows) resolve in the same memory.
+wins = [n for n in regs if n.startswith('res_9') and len(n) == 8 and int(n[4:]) >= 9000]
+if wins:
+    lo = min(regs[n][0] for n in wins); hi = max(regs[n][0] + regs[n][1] for n in wins)
+    pw = bytearray(hi - lo)
+    for n in wins:
+        va, ln = regs[n]
+        b = bufs[n]
+        for i in range(ln):
+            if b[i] and not pw[va - lo + i]: pw[va - lo + i] = b[i]
+    bufs['zz_progwin'] = pw; regs['zz_progwin'] = (lo, hi - lo)
+    for n in wins: del regs[n]
 with open(os.path.join(out, 'regions.txt'), 'w') as f:
     for n, (va, ln) in sorted(regs.items()):
         open(os.path.join(out, n + '.bin'), 'wb').write(bytes(bufs[n]))

@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..24f6f05
+index 0000000..ac4f130
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,2356 @@
+@@ -0,0 +1,2363 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -1175,8 +1175,15 @@ index 0000000..24f6f05
 +							/* single-channel layer texture (masks / glyphs): format code 0x8002; 1 byte per texel, linear, exactly as large as the quad that samples it 1:1
 +							 * (evidence: 640x387 and 694x79 quads = the shaded pixel counts, and the backing buffers are too small for 4 bytes per texel) */
 +							uint32_t tw = bbox ? (uint32_t)(bx1 - bx0) : p->width, th = bbox ? (uint32_t)(by1 - by0) : p->height;
++							/* the 0x40-byte header in front of the texels: {2, 2, 0x40, 9, w_aligned, h, w, h, 1, ..}: real size w x h, row stride = width rounded up to 64;
++							 * the texels are alpha (A8: the sample returns (0,0,0,v)) */
++							uint32_t hw = agxRd(this, r8tva - 0x40 + 4 * 6), hh = agxRd(this, r8tva - 0x40 + 4 * 5);
 +
-+							s8t_desc_make(&dc->tmpl.texd[dc->tmpl.ntex], r8tva, tw, th, S8T_FMT_R8, S8T_LAYOUT_LINEAR, tw);
++							if (hw != 0 && hw <= 4096 && hh != 0 && hh <= 4096) {
++								tw = hw;
++								th = hh;
++							}
++							s8t_desc_make(&dc->tmpl.texd[dc->tmpl.ntex], r8tva, tw, th, S8T_FMT_A8, S8T_LAYOUT_LINEAR, (tw + 63) & ~63u);
 +						}
 +						{
 +							uint64_t tva = 0;
@@ -4534,10 +4541,10 @@ index 0000000..2ccd8d0
 +#endif /* S8GFX_STREAM_H */
 diff --git a/iokit/Kernel/arm/s8gfx_tex.h b/iokit/Kernel/arm/s8gfx_tex.h
 new file mode 100755
-index 0000000..35aded3
+index 0000000..157fa98
 --- /dev/null
 +++ b/iokit/Kernel/arm/s8gfx_tex.h
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,274 @@
 +/*
 + * Texture sampler for the A11 (G10) AGX stand-in: integer-only (soft float of s8gfx_sf.h), no libc, builds into the kernel and the host test
 + * (tools/gpu-isa/tests/tex_test.c). Analysis and evidence levels: tools/gpu-isa/analysis/texture-state.md.
@@ -4557,7 +4564,7 @@ index 0000000..35aded3
 +
 +#include "s8gfx_sf.h"
 +
-+enum { S8T_FMT_RGBA8 = 0, S8T_FMT_BGRA8 = 1, S8T_FMT_R8 = 2 };
++enum { S8T_FMT_RGBA8 = 0, S8T_FMT_BGRA8 = 1, S8T_FMT_R8 = 2, S8T_FMT_A8 = 3 };      /* A8: one byte per texel returned in the ALPHA channel (0,0,0,v): the compositor's 0x8002 glyph / mask textures */
 +enum { S8T_LAYOUT_MORTON = 0, S8T_LAYOUT_LINEAR = 1 };
 +enum { S8T_WRAP_CLAMP_EDGE = 0, S8T_WRAP_REPEAT = 1, S8T_WRAP_MIRROR = 2, S8T_WRAP_ZERO = 3 };
 +
@@ -4580,7 +4587,7 @@ index 0000000..35aded3
 +static inline uint32_t
 +s8t_bpp(uint32_t fmt)
 +{
-+	return fmt == S8T_FMT_R8 ? 1 : 4;
++	return (fmt == S8T_FMT_R8 || fmt == S8T_FMT_A8) ? 1 : 4;
 +}
 +
 +static inline void
@@ -4717,7 +4724,10 @@ index 0000000..35aded3
 +	}
 +	a = d->va + s8t_texel_offset(d, (uint32_t)x, (uint32_t)y);
 +	v = rd(ctx, a & ~3ull);
-+	if (d->fmt == S8T_FMT_R8) {
++	if (d->fmt == S8T_FMT_A8) {
++		c[0] = c[1] = c[2] = 0;
++		c[3] = (v >> (8 * (a & 3))) & 0xff;
++	} else if (d->fmt == S8T_FMT_R8) {
 +		c[0] = (v >> (8 * (a & 3))) & 0xff;
 +		c[1] = c[2] = 0;
 +		c[3] = 255;
