@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..eba7581
+index 0000000..2b4a07f
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,2412 @@
+@@ -0,0 +1,2420 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -1194,11 +1194,19 @@ index 0000000..eba7581
 +							 * the texels are alpha (A8: the sample returns (0,0,0,v)) */
 +							uint32_t hw = agxRd(this, r8tva - 0x40 + 4 * 6), hh = agxRd(this, r8tva - 0x40 + 4 * 5);
 +
++							uint32_t recw = ok == 0 ? dc->tmpl.texd[dc->tmpl.ntex].width : 0;      /* the record's own (row) width, before it is overwritten */
++
 +							if (hw != 0 && hw <= 4096 && hh != 0 && hh <= 4096) {
 +								tw = hw;
 +								th = hh;
 +							}
-+							s8t_desc_make(&dc->tmpl.texd[dc->tmpl.ntex], r8tva, tw, th, S8T_FMT_A8, S8T_LAYOUT_LINEAR, (tw + 63) & ~63u);
++							/* row stride = the larger of the record's width and the header width aligned to 32 (date: 694 -> 704, clock 720 -> 736 = the record width) */
++							uint32_t stride = (tw + 31) & ~31u;
++
++							if (recw > stride && recw <= 4096) {
++								stride = recw;
++							}
++							s8t_desc_make(&dc->tmpl.texd[dc->tmpl.ntex], r8tva, tw, th, S8T_FMT_A8, S8T_LAYOUT_LINEAR, stride);
 +						}
 +						{
 +							uint64_t tva = 0;
