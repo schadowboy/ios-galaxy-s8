@@ -779,6 +779,9 @@ struct comp_px {
 	uint32_t pixels, unknown, stored;
 	uint32_t firstOut, lastOut;     /* the first and the last stored pixel (diagnostics) */
 	int constant;                   /* the program's output does not depend on varyings, tile, pixel position or textures: shaded once */
+	int tileOnly;                   /* the output depends on the destination pixel only (no texture): cached per destination value */
+	int cacheValid;
+	uint32_t cacheTile, cacheCb, cacheCg, cacheCr, cacheCa;
 	uint32_t cb, cg, cr, ca;        /* its output as unorm8 */
 };
 
@@ -794,34 +797,52 @@ comp_emit(void * vctx, int px, int py, const f32b * v)
 	}
 	dst = (uint32_t *)(dc->target + (uint64_t)py * dc->pitch + (uint64_t)px * 4);
 	dc->pixels++;
-	if (dc->constant) {
-		fc.stored = 1;
-		fc.unknown = 0;
-	} else {
-		memcpy(&fc, &dc->tmpl, sizeof(fc));
-		fc.varying = v;
-		fc.tile = *dst;
-		fc.has_tile = 1;
-		fc.sr[48] = (uint32_t)px & 31;
-		fc.sr[49] = (uint32_t)py & 31;
-		fc.sr[16] = (uint32_t)px;               /* pixel coordinates (dither texture lookups: e2 .. sr 0x10/0x11) */
-		fc.sr[17] = (uint32_t)py;
-	}
-	if (dc->constant || (s8f_run(&fc, dc->frag, dc->fraglen) && fc.stored)) {
-		uint32_t sb, sg, sr, sa;
+	{
+		uint32_t sb = 0, sg = 0, sr = 0, sa = 0, dv = *dst;
+		bool have = false;
 
 		if (dc->constant) {
 			sb = dc->cb;
 			sg = dc->cg;
 			sr = dc->cr;
 			sa = dc->ca;
+			have = true;
+		} else if (dc->tileOnly && dc->cacheValid && dc->cacheTile == dv) {
+			sb = dc->cacheCb;               /* same destination value as the last shaded pixel: reuse its result */
+			sg = dc->cacheCg;
+			sr = dc->cacheCr;
+			sa = dc->cacheCa;
+			have = true;
 		} else {
-			sb = sf_to_unorm8(fc.out[2]);
-			sg = sf_to_unorm8(fc.out[1]);
-			sr = sf_to_unorm8(fc.out[0]);
-			sa = sf_to_unorm8(fc.out[3]);
+			memcpy(&fc, &dc->tmpl, sizeof(fc));
+			fc.varying = v;
+			fc.tile = dv;
+			fc.has_tile = 1;
+			fc.sr[48] = (uint32_t)px & 31;
+			fc.sr[49] = (uint32_t)py & 31;
+			fc.sr[16] = (uint32_t)px;               /* pixel coordinates (dither texture lookups: e2 .. sr 0x10/0x11) */
+			fc.sr[17] = (uint32_t)py;
+			if (s8f_run(&fc, dc->frag, dc->fraglen) && fc.stored) {
+				sb = sf_to_unorm8(fc.out[2]);
+				sg = sf_to_unorm8(fc.out[1]);
+				sr = sf_to_unorm8(fc.out[0]);
+				sa = sf_to_unorm8(fc.out[3]);
+				have = true;
+				if (dc->tileOnly) {
+					dc->cacheTile = dv;
+					dc->cacheCb = sb;
+					dc->cacheCg = sg;
+					dc->cacheCr = sr;
+					dc->cacheCa = sa;
+					dc->cacheValid = 1;
+				}
+			} else if (fc.unknown != 0) {
+				dc->unknown = fc.unknown;
+			}
 		}
-
+		if (!have) {
+			return;
+		}
 		if (dc->blend) {                /* premultiplied source-over (HYPOTHESIS for the pipeline blend bit) */
 			uint32_t d = *dst, ia = 255 - sa;
 
@@ -840,8 +861,6 @@ comp_emit(void * vctx, int px, int py, const f32b * v)
 		}
 		dc->lastOut = *dst;
 		dc->stored++;
-	} else if (fc.unknown != 0) {
-		dc->unknown = fc.unknown;
 	}
 }
 
@@ -1043,25 +1062,28 @@ AGXDeviceUserClient::execComposite(void)
 
 				/* constant-output probe: three runs with different varyings / destination pixel / position; identical outputs and no texture = a solid colour */
 				if (dc->tmpl.ntex == 0) {
-					f32b pv[3][S8R_MAXV];
-					static const uint32_t ptile[3] = { 0u, 0xffffffffu, 0x80402010u };
+					f32b pv[2][S8R_MAXV];
 					uint32_t po[3][4];
 					bool pok = true;
+					/* run 0: varyings A, tile T0; run 1: varyings B (and other position), tile T0; run 2: varyings A, tile T1 */
+					static const uint32_t ptile[3] = { 0x80402010u, 0x80402010u, 0u };
 
-					for (int a = 0; a < 3; a++) {
+					for (int a = 0; a < 2; a++) {
 						for (int k = 0; k < S8R_MAXV; k++) {
 							pv[a][k] = sf_from_i64((int64_t)(a * 3 + k));
 						}
 					}
 					for (int a = 0; a < 3 && pok; a++) {
+						int vsel = a == 1 ? 1 : 0;
+
 						memcpy(&dc->work, &dc->tmpl, sizeof(dc->work));
-						dc->work.varying = pv[a];
+						dc->work.varying = pv[vsel];
 						dc->work.tile = ptile[a];
 						dc->work.has_tile = 1;
-						dc->work.sr[48] = (uint32_t)a * 7;
-						dc->work.sr[49] = (uint32_t)a * 13;
-						dc->work.sr[16] = (uint32_t)a * 101;
-						dc->work.sr[17] = (uint32_t)a * 77;
+						dc->work.sr[48] = a == 1 ? 9u : 0u;
+						dc->work.sr[49] = a == 1 ? 13u : 0u;
+						dc->work.sr[16] = a == 1 ? 101u : 0u;
+						dc->work.sr[17] = a == 1 ? 77u : 0u;
 						if (!s8f_run(&dc->work, dc->frag, dc->fraglen) || !dc->work.stored) {
 							pok = false;
 							break;
@@ -1071,18 +1093,21 @@ AGXDeviceUserClient::execComposite(void)
 						}
 					}
 					if (pok) {
+						bool eq01 = true, eq02 = true;
+
 						for (int k = 0; k < 4; k++) {
-							if (po[0][k] != po[1][k] || po[1][k] != po[2][k]) {
-								pok = false;
-							}
+							eq01 = eq01 && po[0][k] == po[1][k];
+							eq02 = eq02 && po[0][k] == po[2][k];
 						}
-					}
-					if (pok) {
-						dc->constant = 1;
-						dc->cb = sf_to_unorm8(po[0][2]);
-						dc->cg = sf_to_unorm8(po[0][1]);
-						dc->cr = sf_to_unorm8(po[0][0]);
-						dc->ca = sf_to_unorm8(po[0][3]);
+						if (eq01 && eq02) {
+							dc->constant = 1;
+							dc->cb = sf_to_unorm8(po[0][2]);
+							dc->cg = sf_to_unorm8(po[0][1]);
+							dc->cr = sf_to_unorm8(po[0][0]);
+							dc->ca = sf_to_unorm8(po[0][3]);
+						} else if (eq01) {
+							dc->tileOnly = 1;         /* depends on the destination pixel only: results are cached per destination value */
+						}
 					}
 				}
 
@@ -1162,14 +1187,14 @@ AGXDeviceUserClient::execComposite(void)
 						uint32_t before = dc->pixels;
 
 						s8r_tri(&vt[idxv[0]], &vt[idxv[1]], &vt[idxv[2]], (int)(nvar ? nvar : 1), 0, 0, dc->w, dc->h, comp_emit, dc);
-						if (!dc->constant) {         /* solid draws cost almost nothing: only real shading counts against the budget */
+						if (!dc->constant && !dc->tileOnly) {         /* solid draws cost almost nothing: only real shading counts against the budget */
 							budget = (dc->pixels - before) >= budget ? 0 : budget - (dc->pixels - before);
 						}
 					}
 				}
 				if (OSIncrementAtomic((SInt32 *)&xlogged) < 300) {
 					IOLog("S8AGX: comp: pass %d draw %d%s prim %u n %u kind %u vs 0x%llx fs 0x%llx(+%u) tex %d: %u shaded, %u stored, unknown 0x%02x, budget left %u\n", pi, di,
-					    dc->constant ? " CONST" : "",
+					    dc->constant ? " CONST" : (dc->tileOnly ? " TILEONLY" : ""),
 					    (unsigned)d->prim, (unsigned)d->count, (unsigned)d->kind, (unsigned long long)d->vs.entry, (unsigned long long)d->fs.entry, fstart,
 					    dc->tmpl.ntex, (unsigned)dc->pixels, (unsigned)dc->stored, (unsigned)dc->unknown, (unsigned)budget);
 					if (dc->stored != 0) {
