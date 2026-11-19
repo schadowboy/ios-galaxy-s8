@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..b5d4362
+index 0000000..3cf3362
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,2172 @@
+@@ -0,0 +1,2191 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -753,6 +753,24 @@ index 0000000..b5d4362
 +
 +static uint32_t gPxBudget = 1500000;            /* boot-arg s8agxpx: fragment invocations per submit (software shading is slow) */
 +
++/* log each distinct draw (programs + extent + texture count) once: the same frame repeats for minutes */
++static bool
++comp_new_draw(uint64_t key)
++{
++	static uint64_t seen[512];
++	static int nseen;
++
++	for (int k = 0; k < nseen; k++) {
++		if (seen[k] == key) {
++			return false;
++		}
++	}
++	if (nseen < 512) {
++		seen[nseen++] = key;
++	}
++	return true;
++}
++
 +/* uniform-push records of a pipeline slot fill the uniform file: address, size in halves (0 = 32), destination half index */
 +void
 +AGXDeviceUserClient::bindUniforms(const struct s8s_prog * pg, uint32_t * uni)
@@ -1222,7 +1240,8 @@ index 0000000..b5d4362
 +						}
 +					}
 +				}
-+				if (OSIncrementAtomic((SInt32 *)&xlogged) < 300) {
++				if (comp_new_draw((uint64_t)d->vs.entry * 31 + d->fs.entry * 7 + (uint64_t)(uint32_t)bx0 * 131 + (uint64_t)(uint32_t)by1 * 17 + (uint64_t)(uint32_t)bx1 * 5 +
++				    (uint64_t)dc->tmpl.ntex) && OSIncrementAtomic((SInt32 *)&xlogged) < 1200) {
 +					IOLog("S8AGX: comp: pass %d draw %d%s prim %u n %u kind %u vs 0x%llx fs 0x%llx(+%u) tex %d: %u shaded, %u stored, unknown 0x%02x, budget left %u\n", pi, di,
 +					    dc->constant ? " CONST" : (dc->tileOnly ? " TILEONLY" : ""),
 +					    (unsigned)d->prim, (unsigned)d->count, (unsigned)d->kind, (unsigned long long)d->vs.entry, (unsigned long long)d->fs.entry, fstart,
