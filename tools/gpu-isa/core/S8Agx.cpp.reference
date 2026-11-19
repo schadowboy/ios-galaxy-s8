@@ -766,6 +766,8 @@ AGXDeviceUserClient::bindUniforms(const struct s8s_prog * pg, uint32_t * uni)
 /* one draw's per-pixel state: the fragment program, its uniforms/textures (template context) and the target */
 struct comp_px {
 	struct s8f_ctx tmpl;
+	struct s8f_ctx work;            /* per-pixel context (heap: the kernel stack is small) */
+	struct s8f_ctx vwork;           /* per-vertex context */
 	const uint8_t * frag;
 	uint32_t fraglen;
 	uint8_t * target;
@@ -779,7 +781,7 @@ static void
 comp_emit(void * vctx, int px, int py, const f32b * v)
 {
 	struct comp_px * dc = (struct comp_px *)vctx;
-	struct s8f_ctx fc;
+	struct s8f_ctx & fc = dc->work;
 	uint32_t * dst;
 
 	if (px < 0 || py < 0 || px >= dc->w || py >= dc->h) {
@@ -1021,7 +1023,7 @@ AGXDeviceUserClient::execComposite(void)
 					}
 					for (int q = 0; q < 3; q++) {
 						uint32_t vid = idxv[q];
-						struct s8f_ctx c;
+						struct s8f_ctx & c = dc->vwork;
 
 						if (vid >= (uint32_t)kMaxVtx || vok[vid]) {
 							continue;

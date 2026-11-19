@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..5295b81
+index 0000000..6a46bda
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,1999 @@
+@@ -0,0 +1,2001 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -772,6 +772,8 @@ index 0000000..5295b81
 +/* one draw's per-pixel state: the fragment program, its uniforms/textures (template context) and the target */
 +struct comp_px {
 +	struct s8f_ctx tmpl;
++	struct s8f_ctx work;            /* per-pixel context (heap: the kernel stack is small) */
++	struct s8f_ctx vwork;           /* per-vertex context */
 +	const uint8_t * frag;
 +	uint32_t fraglen;
 +	uint8_t * target;
@@ -785,7 +787,7 @@ index 0000000..5295b81
 +comp_emit(void * vctx, int px, int py, const f32b * v)
 +{
 +	struct comp_px * dc = (struct comp_px *)vctx;
-+	struct s8f_ctx fc;
++	struct s8f_ctx & fc = dc->work;
 +	uint32_t * dst;
 +
 +	if (px < 0 || py < 0 || px >= dc->w || py >= dc->h) {
@@ -1027,7 +1029,7 @@ index 0000000..5295b81
 +					}
 +					for (int q = 0; q < 3; q++) {
 +						uint32_t vid = idxv[q];
-+						struct s8f_ctx c;
++						struct s8f_ctx & c = dc->vwork;
 +
 +						if (vid >= (uint32_t)kMaxVtx || vok[vid]) {
 +							continue;
