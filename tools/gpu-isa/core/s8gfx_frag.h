@@ -575,10 +575,12 @@ s8f_step_frag(struct s8f_ctx * c, const uint8_t * b, unsigned avail)
 	}
 	case 0x16: case 0x56: case 0x96: case 0xd6: case 0x36: case 0xb6: {   /* f16 compare-select, 8 B (G13 fcmpsel layout): D = (a cc b) ? x : y, a = h[b2], b = b3 (half register or minifloat), x = b5, y = b6 (same
 								 * encodings), cc = b7 >> 5 in G13 order (0 ==, 1 <, 2 >, 5 >=, 6 <=). ASSUMED (cc position and the 0x56 variant bit unproven) */
+		/* operand bytes: hint bits 01/10/11 = half register (`16 08 40 40 00 40 40 00` = h2 = (h0 cc h0) ? h0 : h0 of the transparent clear, the 01 case is a register too), 00 = minifloat immediate.
+		 * The old rule (only 10/11 = register) read 0x40 as 2.0 and made the clear programs output blue. */
 		f32b a = sf_h2f(s8f_gh(c, b[2] & 0x3f));
-		f32b bb = s8f_h16src(c, b[3]);
-		uint16_t x = (b[5] >> 6) >= 2 ? s8f_gh(c, b[5] & 0x3f) : sf_f2h(sf_minifloat(b[5]));
-		uint16_t y = (b[6] >> 6) >= 2 ? s8f_gh(c, b[6] & 0x3f) : sf_f2h(sf_minifloat(b[6]));
+		f32b bb = (b[3] >> 6) ? sf_h2f(s8f_gh(c, b[3] & 0x3f)) : sf_minifloat(b[3]);
+		uint16_t x = (b[5] >> 6) ? s8f_gh(c, b[5] & 0x3f) : sf_f2h(sf_minifloat(b[5]));
+		uint16_t y = (b[6] >> 6) ? s8f_gh(c, b[6] & 0x3f) : sf_f2h(sf_minifloat(b[6]));
 		int cc = b[7] >> 5, cond;
 
 #ifdef S8F_CC_SEARCH                                            /* host experiment only: override the condition code per opcode (tests/hh_cc.sh) */
