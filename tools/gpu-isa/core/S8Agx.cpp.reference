@@ -883,6 +883,8 @@ AGXDeviceUserClient::execComposite(void)
 				uint32_t ntri;
 				uint32_t uni[128];
 				uint32_t idxv[3];
+				uint32_t dTried = 0, dOk = 0, dFail = 0, dUnk = 0, dPc = 0, dMask = 0, dW = 0;
+				int32_t dX = 0, dY = 0;
 
 				if (d->kind == S8S_DRAW_OTHER || d->count < 3 || d->count > 4000 || (d->prim != 6 && d->prim != 9)) {
 					continue;
@@ -1003,8 +1005,21 @@ AGXDeviceUserClient::execComposite(void)
 						c.rdctx = this;
 						c.vid = vid;
 						vok[vid] = 2;                   /* tried */
+						dTried++;
 						if (!s8f_run(&c, vbase + vstart, (unsigned)(vlen - vstart > 0x400 ? 0x400 : vlen - vstart)) || (c.expmask & 0xf) != 0xf) {
+							if (dTried == 1 || dFail == 0) {
+								dUnk = c.unknown;
+								dPc = c.pc_fail;
+								dMask = c.expmask;
+								dFail = 1;
+							}
 							continue;
+						}
+						dOk++;
+						if (dOk == 1) {
+							dX = sf_to_fixed(sf_fma(vp[1], sf_mul(c.exp[0], sf_div(SF_ONE, c.exp[3])), vp[0]), 4);
+							dY = sf_to_fixed(sf_fma(vp[3], sf_mul(c.exp[1], sf_div(SF_ONE, c.exp[3])), vp[2]), 4);
+							dW = c.exp[3];
 						}
 						f32b iw = sf_div(SF_ONE, c.exp[3]);
 
@@ -1033,6 +1048,9 @@ AGXDeviceUserClient::execComposite(void)
 					IOLog("S8AGX: comp: pass %d draw %d prim %u n %u kind %u vs 0x%llx fs 0x%llx(+%u) tex %d: %u shaded, %u stored, unknown 0x%02x, budget left %u\n", pi, di,
 					    (unsigned)d->prim, (unsigned)d->count, (unsigned)d->kind, (unsigned long long)d->vs.entry, (unsigned long long)d->fs.entry, fstart,
 					    dc->tmpl.ntex, (unsigned)dc->pixels, (unsigned)dc->stored, (unsigned)dc->unknown, (unsigned)budget);
+					IOLog("S8AGX: comp:   vertices tried %u ok %u; first failure op 0x%02x at +%u exports 0x%x; first ok vertex at (%d/16, %d/16) w %08x; vp %08x %08x %08x %08x uni0 %08x %08x; vbytes %02x %02x %02x %02x\n",
+					    (unsigned)dTried, (unsigned)dOk, (unsigned)dUnk, (unsigned)dPc, (unsigned)dMask, (int)dX, (int)dY, (unsigned)dW, (unsigned)vp[0], (unsigned)vp[1],
+					    (unsigned)vp[2], (unsigned)vp[3], (unsigned)uni[0], (unsigned)uni[2], vbase[vstart], vbase[vstart + 1], vbase[vstart + 2], vbase[vstart + 3]);
 				}
 			}
 		}
