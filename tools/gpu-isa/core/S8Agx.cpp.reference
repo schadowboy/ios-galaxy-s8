@@ -49,7 +49,8 @@
 
 static volatile SInt32 gAgxLogged;
 static char gDumpName[32] = "s8mtl_test";      /* boot-arg s8agxdump=<process name prefix> */
-static uint8_t gNoRes[1024];                    /* boot-arg s8agxnores=<id>,<id>,...: resource ids that are never dumped (keeps the console ring from wrapping) */
+static uint32_t gNoTex = 0;                     /* boot-arg s8agxnotex=1: do not dump caller-memory (texture) resources */
+static uint8_t gNoRes[1024];                   /* boot-arg s8agxnores=<id>,<id>,...: resource ids that are never dumped (keeps the console ring from wrapping) */
 static uint32_t gSkip = 0;                     /* boot-arg s8agxskip=<n>: do not dump the first n submits of that process (later rounds of the test) */
 static uint32_t gSeen = 0;
 
@@ -198,7 +199,7 @@ class AGXDeviceUserClient : public IOUserClient
 	void fillSurfaceTargets(uint32_t pixel);
 	/* resources that are not kernel shared memory: IOSurface-backed (uptr = surface id) or the caller's own memory (uptr = user VA) */
 	enum { kVmMax = 192 };
-	struct agx_vm { uint64_t va, len, uptr; uint32_t surf; IOMemoryMap * map; };
+	struct agx_vm { uint64_t va, len, uptr; uint32_t surf, id; IOMemoryMap * map; };
 	struct agx_vm fVm[kVmMax];
 	uint32_t fVmN;
 	bool resolveVa(uint64_t va, uint8_t ** mem, uint64_t * avail);
@@ -2035,6 +2036,7 @@ AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			fVm[fVmN].len = size;
 			fVm[fVmN].uptr = uptr;
 			fVm[fVmN].surf = ((flags & 0x82) == 0x82 && uptr < 0x10000) ? (uint32_t)uptr : 0;
+			fVm[fVmN].id = fResId;
 			fVm[fVmN].map = NULL;
 			fVmN++;
 		}
@@ -2173,6 +2175,15 @@ AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 						dumpSparse("res", r, n, 0, fResVa[n - 1], (const uint8_t *)fShmemBuf[r]->getBytesNoCopy(), fShmemBuf[r]->getLength());
 					}
 				}
+				/* caller-memory resources (layer textures, glyph masks): the texels, so a host renderer can reproduce the frame. IOSurface-backed ones are too big. */
+				for (uint32_t k = 0; k < fVmN && k < kVmMax && k < 64 && !gNoTex; k++) {
+					uint8_t * tp;
+					uint64_t tav;
+
+					if (fVm[k].surf == 0 && !gNoRes[fVm[k].id] && fVm[k].len <= 0x80000 && resolveVa(fVm[k].va, &tp, &tav) && tav >= fVm[k].len) {
+						dumpSparse("res", kShmemMax - 1 - k, fVm[k].id, 9, fVm[k].va, tp, (size_t)fVm[k].len);
+					}
+				}
 			}
 		}
 		IOLog("S8AGX: submit on command queue %llu: %llu command buffer(s), %u completion record(s) posted\n", cq, count, (unsigned)posted);
@@ -2242,6 +2253,7 @@ S8AgxStart(void)
 	PE_parse_boot_argn("s8agxprogs", gProgName, sizeof(gProgName));
 	PE_parse_boot_argn("s8agxskip", &gSkip, sizeof(gSkip));
 	PE_parse_boot_argn("s8agxpx", &gPxBudget, sizeof(gPxBudget));
+	PE_parse_boot_argn("s8agxnotex", &gNoTex, sizeof(gNoTex));
 	{
 		char nores[96] = "";
 
