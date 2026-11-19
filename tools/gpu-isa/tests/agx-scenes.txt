@@ -1,0 +1,25 @@
+clear only black
+clear only 0.25/0.5/0.75
+red
+green
+blue
+0.5/0.25/0.125
+interpolated colour
+red over white no blend
+red alpha 0.5 blended over white
+fmul imm: in.col * 0.5
+fadd imm: in.col + 0.125
+fmul vv: in.col * in.col
+ffma: fma(in.col, 0.5, 0.25)
+swizzle: (y, x, z, 1)
+saturate scale: saturate(in.col*2-0.5)
+mix: mix(red, blue, x)
+select: x>0.5 ? red : green
+sqrt: sqrt(x)
+rcp: 1/(x+1)
+exp2 log2
+min max: min(x,0.5) max(y,0.25)
+half math
+discard: x<0.5
+sin: sin(x*3)*0.5+0.5
+floor: floor(x*4)/4

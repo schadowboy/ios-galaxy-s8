@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..2be8942
+index 0000000..058de07
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,1381 @@
+@@ -0,0 +1,1447 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -44,7 +44,8 @@ index 0000000..2be8942
 +#include <IOKit/IOBufferMemoryDescriptor.h>
 +#include <IOKit/IOSharedDataQueue.h>
 +#include <pexpert/pexpert.h>
-+#include "s8gfx_sf.h"           /* integer-only float, rasteriser and shader interpreter of the software executor (host-tested in scratch/agx) */
++#include "SweetSurface.h"       /* IOSurface-backed render targets (display path) */
++#include "s8gfx_sf.h"          /* integer-only float, rasteriser and shader interpreter of the software executor (host-tested in scratch/agx) */
 +#include "s8gfx_rast.h"
 +#include "s8gfx_frag.h"
 +
@@ -193,6 +194,11 @@ index 0000000..2be8942
 +	enum { kResMax = 1024 };
 +	uint64_t * fResVa;                /* kResMax entries: GPU virtual address of resource id n at [n - 1] */
 +	uint64_t fGpuVa;                /* next GPU virtual address to give a resource (0 = not started) */
++	enum { kSurfMax = 32 };
++	uint64_t fSurfVa[kSurfMax];     /* GPU VA of IOSurface-backed resources (flags & 0x82 == 0x82), the id is the surface id of the display path */
++	uint32_t fSurfId[kSurfMax];
++	uint32_t fSurfN;
++	void fillSurfaceTargets(uint32_t pixel);
 +
 +	IOReturn createShmem(IOExternalMethodArguments * args);
 +	void executePasses(void);
@@ -836,9 +842,63 @@ index 0000000..2be8942
 +	}
 +}
 +
++/* Milestone: every pass attachment record {fmt, w1, VA>>4, 0x200, 0, 0} whose VA is an IOSurface resource gets a flat pixel; proves pass -> surface -> display */
++void
++AGXDeviceUserClient::fillSurfaceTargets(uint32_t pixel)
++{
++	static volatile SInt32 slogged;
++
++	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
++		uint32_t r = fResShm[n - 1];
++
++		if (r == 0xffffffffu || r >= fShmemCount || fShmemBuf[r] == NULL) {
++			continue;
++		}
++		const uint32_t * d = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
++		uint64_t nd = fShmemBuf[r]->getLength() / 4;
++
++		for (uint64_t i = 0; i + 6 < nd; i++) {
++			if (d[i + 3] != 0x200u || d[i + 4] != 0 || d[i + 5] != 0 || d[i + 2] == 0) {
++				continue;
++			}
++			uint64_t tva = (uint64_t)d[i + 2] << 4;
++
++			for (uint32_t s = 0; s < fSurfN; s++) {
++				if (fSurfVa[s] != tva) {
++					continue;
++				}
++				SweetSurface * ss = sweet_surface_copy(fSurfId[s]);
++
++				if (ss != NULL) {
++					uintptr_t ka = ss->kernelAddress();
++
++					if (ka != 0) {
++						for (uint32_t y = 0; y < ss->height; y++) {
++							uint32_t * row = (uint32_t *)(ka + ss->offset + (uint64_t)y * ss->bytesPerRow);
++
++							for (uint32_t x = 0; x < ss->width; x++) {
++								row[x] = pixel;
++							}
++						}
++						if (OSIncrementAtomic((SInt32 *)&slogged) < 40) {
++							IOLog("S8AGX: exec: filled IOSurface %u (%ux%u pitch %u) at 0x%llx with %08x\n", (unsigned)fSurfId[s], (unsigned)ss->width,
++							    (unsigned)ss->height, (unsigned)ss->bytesPerRow, (unsigned long long)tva, (unsigned)pixel);
++						}
++					}
++					ss->release();
++				}
++			}
++		}
++	}
++}
++
 +void
 +AGXDeviceUserClient::executePasses(void)
 +{
++	if (fSurfN != 0) {
++		fillSurfaceTargets(0xffff00ffu);        /* magenta (B,G,R,A = ff,00,ff,ff), only until the shaders run */
++	}
++
 +	static volatile SInt32 logged;
 +	uint64_t fragVa = 0;
 +	uint64_t vtxVa = 0, vbVa = 0, vtxIdx = 0;
@@ -1169,6 +1229,12 @@ index 0000000..2be8942
 +		if (fResId <= kResMax) {
 +			fResVa[fResId - 1] = va;
 +			fResShm[fResId - 1] = dataRegion;
++		}
++		if ((flags & 0x82) == 0x82 && uptr != 0 && uptr < 0x10000 && fSurfN < kSurfMax) {
++			/* an IOSurface as render target: the "user pointer" is the surface id (SWEET FB swap ... surface N) */
++			fSurfVa[fSurfN] = va;
++			fSurfId[fSurfN++] = (uint32_t)uptr;
++			IOLog("S8AGX: resource %u is IOSurface %u (gpu va 0x%llx)\n", (unsigned)fResId, (unsigned)uptr, (unsigned long long)va);
 +		}
 +		IOLog("S8AGX: resource %u: size 0x%llx flags 0x%x%s gpu va 0x%llx cpu 0x%llx\n", (unsigned)fResId, size, (unsigned)flags,
 +		    sub ? " (sub-buffer)" : (given ? " (caller memory)" : ""), (unsigned long long)va, (unsigned long long)data);

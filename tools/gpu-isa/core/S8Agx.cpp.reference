@@ -1,0 +1,1447 @@
+/*
+ * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
+ *
+ * iOS 16's Metal / IOGPU userland does not talk to a generic GPU interface: it opens the IOKit service of class IOAccelerator
+ * (here AGXAcceleratorG10P_B0, the class the iPhone X's AGXG10P kext registers) and calls the selectors of
+ * IOGPUDeviceUserClient / AGXDeviceUserClient (analysis/agx-kernel-interface.md: tables decoded from the user's own IPSW).
+ * This file registers a service of the same classes and a user client with the same name, so that userland finds a GPU.
+ *
+ * STAGE A (this file): the user client answers every selector with success and zero-filled outputs of the sizes the caller
+ * declares, hands out zeroed memory for every shared-memory type, and LOGS what userland asks (the first calls with a hex dump
+ * of their input). That log tells what the userland driver needs next, until Metal creates its device; the Mali is not used yet.
+ *
+ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
+ *
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
+ *
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. The rights granted to you under the License
+ * may not be used to create, or enable the creation or redistribution of,
+ * unlawful or unlicensed copies of an Apple operating system, or to
+ * circumvent, violate, or enable the circumvention or violation of, any
+ * terms of an Apple operating system software license agreement.
+ *
+ * Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this file.
+ *
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
+ */
+#if defined(ARM64_BOARD_CONFIG_A5XELTE)
+
+#include <IOKit/IOLib.h>
+#include <IOKit/IOKitKeys.h>
+#include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IOService.h>
+#include <IOKit/IOUserClient.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOSharedDataQueue.h>
+#include <pexpert/pexpert.h>
+#include "SweetSurface.h"       /* IOSurface-backed render targets (display path) */
+#include "s8gfx_sf.h"          /* integer-only float, rasteriser and shader interpreter of the software executor (host-tested in scratch/agx) */
+#include "s8gfx_rast.h"
+#include "s8gfx_frag.h"
+
+#define S8AGX_LOG_LIMIT 800
+
+static volatile SInt32 gAgxLogged;
+static char gDumpName[32] = "s8mtl_test";      /* boot-arg s8agxdump=<process name prefix> */
+static uint32_t gSkip = 0;                      /* boot-arg s8agxskip=<n>: do not dump the first n submits of that process (later rounds of the test) */
+static uint32_t gSeen = 0;
+
+extern "C" uint64_t mach_absolute_time(void);
+extern "C" int proc_selfpid(void);
+extern "C" void proc_selfname(char * buf, int size);
+
+static bool
+agx_log_ok(void)
+{
+	return OSIncrementAtomic((SInt32 *)&gAgxLogged) < S8AGX_LOG_LIMIT;
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/*
+ * Metal.framework enumerates GPUs with IOServiceMatching("IOAcceleratorES") (IOGPUFamily's class; found in Metal's strings),
+ * the compositor's side matches "IOAccelerator". The chain of the real stack is ... AGXAccelerator -> IOAccelerator -> IOAcceleratorES
+ * -> IOService, so a service of the stand-in matches both names.
+ */
+class IOAcceleratorES : public IOService
+{
+	OSDeclareDefaultStructors(IOAcceleratorES);
+};
+
+class IOAccelerator : public IOAcceleratorES
+{
+	OSDeclareDefaultStructors(IOAccelerator);
+};
+
+class AGXAccelerator : public IOAccelerator
+{
+	OSDeclareDefaultStructors(AGXAccelerator);
+
+public:
+	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+	/* log which registry properties userland reads (and which of them are missing): that is what Metal sets itself up from */
+	virtual OSPtr<OSObject> copyProperty(const OSSymbol * aKey) const APPLE_KEXT_OVERRIDE;
+	virtual OSPtr<OSObject> copyProperty(const OSString * aKey) const APPLE_KEXT_OVERRIDE;
+	virtual OSPtr<OSObject> copyProperty(const char * aKey) const APPLE_KEXT_OVERRIDE;
+};
+
+class AGXAcceleratorG10P_B0 : public AGXAccelerator
+{
+	OSDeclareDefaultStructors(AGXAcceleratorG10P_B0);
+};
+
+OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+OSDefineMetaClassAndStructors(IOAccelerator, IOAcceleratorES);
+OSDefineMetaClassAndStructors(AGXAccelerator, IOAccelerator);
+OSDefineMetaClassAndStructors(AGXAcceleratorG10P_B0, AGXAccelerator);
+
+bool
+AGXAccelerator::start(IOService * provider)
+{
+	if (!IOService::start(provider)) {
+		return false;
+	}
+	setProperty(kIOUserClientClassKey, "AGXDeviceUserClient");
+	setProperty("IOClass", "AGXAcceleratorG10P_B0");
+	setProperty("IOGLBundleName", "AGXGL");
+	setProperty("MetalPluginName", "AGXMetalA11");
+	setProperty("MetalPluginClassName", "AGXA11Device");
+	setName("AGXAcceleratorG10P_B0");
+	registerService();
+	return true;
+}
+
+static volatile SInt32 gAgxPropLogged;
+
+static void
+agx_log_property(const char * key, bool found)
+{
+	if (key != NULL && OSIncrementAtomic((SInt32 *)&gAgxPropLogged) < 300) {
+		IOLog("S8AGX: property '%s' %s\n", key, found ? "found" : "MISSING");
+	}
+}
+
+OSPtr<OSObject>
+AGXAccelerator::copyProperty(const OSSymbol * aKey) const
+{
+	OSPtr<OSObject> r = IOService::copyProperty(aKey);
+
+	agx_log_property(aKey ? aKey->getCStringNoCopy() : NULL, r != NULL);
+	return r;
+}
+
+OSPtr<OSObject>
+AGXAccelerator::copyProperty(const OSString * aKey) const
+{
+	OSPtr<OSObject> r = IOService::copyProperty(aKey);
+
+	agx_log_property(aKey ? aKey->getCStringNoCopy() : NULL, r != NULL);
+	return r;
+}
+
+OSPtr<OSObject>
+AGXAccelerator::copyProperty(const char * aKey) const
+{
+	OSPtr<OSObject> r = IOService::copyProperty(aKey);
+
+	agx_log_property(aKey, r != NULL);
+	return r;
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+class AGXDeviceUserClient : public IOUserClient
+{
+	OSDeclareDefaultStructors(AGXDeviceUserClient);
+
+	UInt32 fType;
+	task_t fTask;
+	/* shared memory the kernel gave this client (selector 0xd): kernel buffer + its mapping in the client's task */
+	enum { kShmemMax = 512 };
+	IOBufferMemoryDescriptor ** fShmemBuf;       /* kShmemMax entries, allocated in initWithTask (the object itself may be at most 16 KiB) */
+	IOMemoryMap ** fShmemMap;
+	uint8_t ** fShadow;                         /* per shmem region: copy at its last dump (dumps print only changed lines) */
+	uint32_t * fShadowLen;
+	uint32_t * fResShm;                         /* resource id n -> shmem region index (0xffffffff: caller memory) */
+	uint8_t * fShmemType;                       /* IOGPU shmem type of region i (0xff: a plain mapping) */
+	uint32_t fDumpLines;                        /* lines printed by the current dump (budget: the log ring is finite) */
+	uint32_t fSubmitDumps;                      /* command-list dumps done so far (the first few submits are dumped) */
+	UInt32 fShmemCount;
+
+	UInt32 fQueueId;                /* last command queue id handed out (selector 7) */
+	UInt32 fNqId;                   /* last notification queue id handed out (selector 15) */
+	UInt32 fResId;                  /* last resource id handed out (selector 9) */
+	uint64_t fTraceNext;            /* next global trace id range (selector 5) */
+	enum { kNqMax = 32 };
+	IOSharedDataQueue * fNq[kNqMax];        /* notification queue n (id n) at [n - 1]: completion notifications for userland */
+	IOMemoryMap * fNqMap[kNqMax];           /* its mapping in the client's task */
+	uint32_t fCqNq[kNqMax];                 /* command queue id n -> notification queue id (selector 0x19) */
+	bool fNqPortSet[kNqMax];                /* a notification port was registered for queue n */
+	uint32_t fCompletionLogs;
+
+	bool postCompletion(uint32_t cmdQueue, uint64_t cookie, uint64_t t1, uint64_t t2, uint32_t status);
+	uint32_t * fSelCount;           /* 0x200 entries: calls per selector of THIS client (the log shows the first few of each) */
+	enum { kResMax = 1024 };
+	uint64_t * fResVa;                /* kResMax entries: GPU virtual address of resource id n at [n - 1] */
+	uint64_t fGpuVa;                /* next GPU virtual address to give a resource (0 = not started) */
+	enum { kSurfMax = 32 };
+	uint64_t fSurfVa[kSurfMax];     /* GPU VA of IOSurface-backed resources (flags & 0x82 == 0x82), the id is the surface id of the display path */
+	uint32_t fSurfId[kSurfMax];
+	uint32_t fSurfN;
+	void fillSurfaceTargets(uint32_t pixel);
+
+	IOReturn createShmem(IOExternalMethodArguments * args);
+	void executePasses(void);
+	bool findResMem(uint64_t va, uint8_t ** mem, uint64_t * avail);
+	bool findResRegion(uint64_t va, const uint8_t ** base, uint64_t * off, uint64_t * len);
+	uint32_t progHash(uint64_t va);
+	void logPrograms(void);
+	static uint32_t agxRd(void * ctx, uint64_t va);
+	void executeDraws(uint32_t * target, uint64_t npx, uint64_t vtxVa, uint64_t vbVa, const uint32_t * vp, uint64_t fragVa, const uint32_t * dr, int ndraws,
+	    const uint32_t * uni);
+	void dumpSparse(const char * what, uint32_t region, uint32_t id, uint32_t type, uint64_t va, const uint8_t * m, size_t len);
+	IOReturn allocShmem(uint64_t size, uint64_t * userAddress);
+	void releaseShmem(void);
+
+public:
+	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+	virtual void free(void) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, UInt32 refCon) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
+	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
+};
+
+OSDefineMetaClassAndStructors(AGXDeviceUserClient, IOUserClient);
+
+bool
+AGXDeviceUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
+{
+	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
+		return false;
+	}
+	fType = type;
+	fTask = owningTask;
+	fGpuVa = 0x100000000ULL;
+	fTraceNext = 1;
+	fShmemBuf = IONewZero(IOBufferMemoryDescriptor *, kShmemMax);
+	fShmemMap = IONewZero(IOMemoryMap *, kShmemMax);
+	fResVa = IONewZero(uint64_t, kResMax);
+	fShmemType = IONewZero(uint8_t, kShmemMax);
+	fResShm = IONewZero(uint32_t, kResMax);
+	fShadow = IONewZero(uint8_t *, kShmemMax);
+	fShadowLen = IONewZero(uint32_t, kShmemMax);
+	if (fResShm != NULL) {
+		memset(fResShm, 0xff, kResMax * sizeof(uint32_t));
+	}
+	fSelCount = IONewZero(uint32_t, 0x200);
+	if (fShmemBuf == NULL || fShmemMap == NULL || fResVa == NULL || fSelCount == NULL || fShmemType == NULL || fResShm == NULL || fShadow == NULL || fShadowLen == NULL) {
+		return false;
+	}
+	if (agx_log_ok()) {
+		char name[32] = "?";
+
+		proc_selfname(name, sizeof(name));
+		IOLog("S8AGX: user client opened, type %u by %s[%d]\n", (unsigned)type, name, proc_selfpid());
+	}
+	return true;
+}
+
+void
+AGXDeviceUserClient::releaseShmem(void)
+{
+	for (UInt32 i = 0; i < fShmemCount && i < kShmemMax; i++) {
+		if (fShmemMap[i] != NULL) {
+			fShmemMap[i]->release();
+			fShmemMap[i] = NULL;
+		}
+		if (fShmemBuf[i] != NULL) {
+			fShmemBuf[i]->release();
+			fShmemBuf[i] = NULL;
+		}
+	}
+	fShmemCount = 0;
+}
+
+/* Zeroed kernel memory mapped into the client's task, kept until the client closes. */
+IOReturn
+AGXDeviceUserClient::allocShmem(uint64_t size, uint64_t * userAddress)
+{
+	IOBufferMemoryDescriptor * buf;
+	IOMemoryMap * map;
+
+	if (size == 0 || size > (64ULL << 20) || fShmemCount >= kShmemMax) {
+		return kIOReturnNoResources;
+	}
+	size = (size + 0x3fffULL) & ~0x3fffULL;
+	buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, (vm_size_t)size, 0x4000);
+	if (buf == NULL) {
+		return kIOReturnNoMemory;
+	}
+	bzero(buf->getBytesNoCopy(), (size_t)size);
+	map = buf->createMappingInTask(fTask, 0, kIOMapAnywhere);
+	if (map == NULL) {
+		buf->release();
+		return kIOReturnVMError;
+	}
+	fShmemBuf[fShmemCount] = buf;
+	fShmemMap[fShmemCount] = map;
+	fShmemType[fShmemCount] = 0xff;
+	fShmemCount++;
+	*userAddress = (uint64_t)map->getVirtualAddress();
+	return kIOReturnSuccess;
+}
+
+/*
+ * Selector 13 (IOGPUDeviceCreateDeviceShmem in IOGPU): scalars { size, type }, 16 bytes out = { user address (u64), size (u32), id (u32) }.
+ * The kernel allocates zeroed memory and maps it into the calling task; userland keeps it for the device's lifetime.
+ */
+IOReturn
+AGXDeviceUserClient::createShmem(IOExternalMethodArguments * args)
+{
+	uint64_t size;
+	uint64_t type;
+	IOBufferMemoryDescriptor * buf;
+	IOMemoryMap * map;
+	uint8_t * out;
+
+	if (args->scalarInputCount < 2 || args->structureOutput == NULL || args->structureOutputSize < 16) {
+		return kIOReturnBadArgument;
+	}
+	size = args->scalarInput[0] & 0xffffffffULL;
+	type = args->scalarInput[1] & 0xffffffffULL;
+	if (size == 0 || size > (64ULL << 20) || fShmemCount >= kShmemMax) {
+		IOLog("S8AGX: shmem request refused: size 0x%llx type %llu (have %u)\n", size, type, (unsigned)fShmemCount);
+		return kIOReturnNoResources;
+	}
+	size = (size + 0x3fffULL) & ~0x3fffULL;
+	buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, (vm_size_t)size, 0x4000);
+	if (buf == NULL) {
+		return kIOReturnNoMemory;
+	}
+	bzero(buf->getBytesNoCopy(), (size_t)size);
+	map = buf->createMappingInTask(fTask, 0, kIOMapAnywhere);
+	if (map == NULL) {
+		buf->release();
+		IOLog("S8AGX: shmem mapping into the client failed (size 0x%llx type %llu)\n", size, type);
+		return kIOReturnVMError;
+	}
+	fShmemBuf[fShmemCount] = buf;
+	fShmemMap[fShmemCount] = map;
+	fShmemType[fShmemCount] = (uint8_t)type;
+	fShmemCount++;
+	out = (uint8_t *)args->structureOutput;
+	bzero(out, args->structureOutputSize);
+	*(uint64_t *)out = (uint64_t)map->getVirtualAddress();
+	*(uint32_t *)(out + 8) = (uint32_t)size;
+	*(uint32_t *)(out + 12) = fShmemCount;
+	IOLog("S8AGX: shmem #%u type %llu size 0x%llx -> user address 0x%llx\n", (unsigned)fShmemCount, type, size,
+	    (unsigned long long)map->getVirtualAddress());
+	return kIOReturnSuccess;
+}
+
+void
+AGXDeviceUserClient::free(void)
+{
+	for (uint32_t i = 0; i < kNqMax; i++) {
+		if (fNqMap[i] != NULL) {
+			fNqMap[i]->release();
+			fNqMap[i] = NULL;
+		}
+		if (fNq[i] != NULL) {
+			fNq[i]->setNotificationPort(MACH_PORT_NULL);
+			fNq[i]->release();
+			fNq[i] = NULL;
+		}
+	}
+	if (fShmemBuf != NULL) {
+		releaseShmem();
+	}
+	if (fShmemBuf != NULL) {
+		IODelete(fShmemBuf, IOBufferMemoryDescriptor *, kShmemMax);
+		fShmemBuf = NULL;
+	}
+	if (fShmemMap != NULL) {
+		IODelete(fShmemMap, IOMemoryMap *, kShmemMax);
+		fShmemMap = NULL;
+	}
+	if (fResVa != NULL) {
+		IODelete(fResVa, uint64_t, kResMax);
+		fResVa = NULL;
+	}
+	if (fSelCount != NULL) {
+		IODelete(fSelCount, uint32_t, 0x200);
+		fSelCount = NULL;
+	}
+	if (fShmemType != NULL) {
+		IODelete(fShmemType, uint8_t, kShmemMax);
+		fShmemType = NULL;
+	}
+	if (fResShm != NULL) {
+		IODelete(fResShm, uint32_t, kResMax);
+		fResShm = NULL;
+	}
+	if (fShadow != NULL) {
+		for (uint32_t i = 0; i < kShmemMax; i++) {
+			if (fShadow[i] != NULL) {
+				IOFree(fShadow[i], fShadowLen[i]);
+			}
+		}
+		IODelete(fShadow, uint8_t *, kShmemMax);
+		fShadow = NULL;
+	}
+	if (fShadowLen != NULL) {
+		IODelete(fShadowLen, uint32_t, kShmemMax);
+		fShadowLen = NULL;
+	}
+	IOUserClient::free();
+}
+
+IOReturn
+AGXDeviceUserClient::clientClose(void)
+{
+	if (agx_log_ok()) {
+		IOLog("S8AGX: user client closed, type %u\n", (unsigned)fType);
+	}
+	releaseShmem();
+	if (!isInactive()) {
+		terminate();
+	}
+	return kIOReturnSuccess;
+}
+
+IOReturn
+AGXDeviceUserClient::registerNotificationPort(mach_port_t port, UInt32 type, UInt32 refCon)
+{
+	if (agx_log_ok()) {
+		IOLog("S8AGX: registerNotificationPort port %p type %u refCon 0x%x\n", (void *)port,(unsigned)type, (unsigned)refCon);
+	}
+	if (type == 0 && refCon >= 1 && refCon <= kNqMax && fNq[refCon - 1] != NULL) {
+		fNq[refCon - 1]->setNotificationPort(port);    /* the queue's data-available messages go to this port */
+		fNqPortSet[refCon - 1] = true;
+	}
+	return kIOReturnSuccess;
+}
+
+/*
+ * Sparse dump for offline analysis. Header "S8AGX: D <session> <what> <id> type <t> va <va> len <len>", then "S8AGX: L <offset> <64 bytes hex>"
+ * per 64-byte line that is non-zero and CHANGED since the last dump of the same region (the first dump of a region prints every non-zero line).
+ */
+void
+AGXDeviceUserClient::dumpSparse(const char * what, uint32_t region, uint32_t id, uint32_t type, uint64_t va, const uint8_t * m, size_t len)
+{
+	uint32_t lines = 0;
+	uint8_t * shadow;
+
+	if (fDumpLines >= 9000 || fShadow == NULL || region >= kShmemMax) {
+		return;
+	}
+	shadow = fShadow[region];
+	if (shadow == NULL) {
+		shadow = (uint8_t *)IOMallocZero(len);
+		if (shadow == NULL) {
+			return;
+		}
+		fShadow[region] = shadow;
+		fShadowLen[region] = (uint32_t)len;
+		IOLog("S8AGX: D %u %s %u type %u va 0x%llx len 0x%zx\n", (unsigned)fSubmitDumps, what, (unsigned)id, (unsigned)type, (unsigned long long)va, len);
+	} else if (fShadowLen[region] != (uint32_t)len) {
+		return;
+	} else {
+		bool changed = false;
+
+		for (size_t k = 0; k + 64 <= len && !changed; k += 64) {
+			changed = memcmp(m + k, shadow + k, 64) != 0;
+		}
+		if (!changed) {
+			return;
+		}
+		IOLog("S8AGX: D %u %s %u type %u va 0x%llx len 0x%zx\n", (unsigned)fSubmitDumps, what, (unsigned)id, (unsigned)type, (unsigned long long)va, len);
+	}
+	for (size_t k = 0; k + 64 <= len && lines < 1100; k += 64) {
+		bool nz = false;
+		char hex[64 * 2 + 1];
+
+		if (memcmp(m + k, shadow + k, 64) == 0) {
+			continue;
+		}
+		for (size_t b = 0; b < 64; b++) {
+			if (m[k + b] != 0) {
+				nz = true;
+				break;
+			}
+		}
+		memcpy(shadow + k, m + k, 64);
+		if (!nz) {
+			continue;
+		}
+		for (size_t b = 0; b < 64; b++) {
+			snprintf(hex + 2 * b, 3, "%02x", m[k + b]);
+		}
+		fDumpLines++;
+		IOLog("S8AGX: L %zx %s\n", k, hex);
+		lines++;
+	}
+}
+
+/*
+ * MILESTONE 1 executor (software, in the kernel, the first real pixels of the AGX stand-in; analysis/agx-kernel-interface.md 17f):
+ * for a submit of the process named by boot-arg s8agxexec (default s8mtl_test) find the render pass descriptors in the resources the process
+ * created, clear their render target, and run the user fragment program when it is a constant-colour one (immediate loads + tile store).
+ * No floating point in the kernel: floats are handled as bit patterns.
+ */
+static char gExecName[32] = "s8mtl_test";
+static char gProgName[32] = "";                 /* boot-arg s8agxprogs=<process prefix>: log the bytes of every new shader that process submits */
+
+/* float bits -> 8-bit unorm, round half up, integer arithmetic only */
+static uint8_t
+agx_f32_unorm8(uint32_t b)
+{
+	uint32_t e = (b >> 23) & 0xff;
+	uint64_t mant;
+	uint32_t shift;
+	uint64_t r;
+
+	if (b >> 31) {
+		return 0;                       /* negative */
+	}
+	if (e == 0xff) {
+		return (b & 0x7fffff) ? 0 : 255;        /* NaN, +inf */
+	}
+	if (e >= 127) {
+		return 255;                     /* >= 1.0 */
+	}
+	if (e == 0) {
+		return 0;
+	}
+	mant = (b & 0x7fffff) | 0x800000;
+	shift = 23 + (127 - e);
+	if (shift >= 62) {
+		return 0;
+	}
+	r = (mant * 255 + (1ULL << (shift - 1))) >> shift;
+	return r > 255 ? 255 : (uint8_t)r;
+}
+
+bool
+AGXDeviceUserClient::findResMem(uint64_t va, uint8_t ** mem, uint64_t * avail)
+{
+	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
+		uint32_t r = fResShm[n - 1];
+
+		if (r != 0xffffffffu && r < fShmemCount && fShmemBuf[r] != NULL) {
+			uint64_t base = fResVa[n - 1], len = fShmemBuf[r]->getLength();
+
+			if (va >= base && va < base + len) {
+				*mem = (uint8_t *)fShmemBuf[r]->getBytesNoCopy() + (va - base);
+				*avail = base + len - va;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/* the resource containing va: its base pointer, the offset of va inside it and its length */
+bool
+AGXDeviceUserClient::findResRegion(uint64_t va, const uint8_t ** base, uint64_t * off, uint64_t * len)
+{
+	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
+		uint32_t r = fResShm[n - 1];
+
+		if (r != 0xffffffffu && r < fShmemCount && fShmemBuf[r] != NULL) {
+			uint64_t b = fResVa[n - 1], l = fShmemBuf[r]->getLength();
+
+			if (va >= b && va < b + l) {
+				*base = (const uint8_t *)fShmemBuf[r]->getBytesNoCopy();
+				*off = va - b;
+				*len = l;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/* FNV-1a over the first 0x10 bytes at a program address: the compiler reuses addresses, so a changed program at the same pointer must still count as changed */
+uint32_t
+AGXDeviceUserClient::progHash(uint64_t va)
+{
+	const uint8_t * base;
+	uint64_t off, len;
+	uint32_t h = 2166136261u;
+
+	if (!findResRegion(va, &base, &off, &len)) {
+		return 0;
+	}
+	for (uint64_t k = 0; k < 0x10 && off + k < len; k++) {   /* only the first bytes: programs are packed back to back, a longer window reads the neighbours */
+		h = (h ^ base[off + k]) * 16777619u;
+	}
+	return h;
+}
+
+/*
+ * Old state records stay in memory after a pipeline change, so "the last one in memory" is often stale. Remember what every record slot held at the
+ * previous scan: a slot whose program pointer changed is the pipeline the caller just set; with no change the previous choice stays.
+ */
+struct agx_seen { uint32_t n, kind, val; uint64_t i; };
+static struct agx_seen gSeenRec[128];
+static int gNSeenRec;
+static uint64_t gLastVtx, gLastFrag, gLastIdx;
+static uint32_t gLastRes;
+
+static bool
+agx_rec_changed(uint32_t n, uint64_t i, uint32_t kind, uint32_t val)
+{
+	for (int k = 0; k < gNSeenRec; k++) {
+		if (gSeenRec[k].n == n && gSeenRec[k].i == i && gSeenRec[k].kind == kind) {
+			if (gSeenRec[k].val == val) {
+				return false;
+			}
+			gSeenRec[k].val = val;
+			return true;
+		}
+	}
+	if (gNSeenRec < 128) {
+		gSeenRec[gNSeenRec].n = n;
+		gSeenRec[gNSeenRec].i = i;
+		gSeenRec[gNSeenRec].kind = kind;
+		gSeenRec[gNSeenRec].val = val;
+		gNSeenRec++;
+	}
+	return true;
+}
+
+/* per-pixel callback of the rasteriser: run the fragment program on the interpolated varyings and store the colour (BGRA8) */
+struct agx_draw_ctx {
+	const uint8_t * frag;
+	uint32_t fraglen;
+	uint32_t * target;
+	int w;
+	uint32_t pixels;
+	uint32_t unknown;
+};
+
+static void
+agx_emit_pixel(void * vctx, int px, int py, const f32b * v)
+{
+	struct agx_draw_ctx * dc = (struct agx_draw_ctx *)vctx;
+	struct s8f_ctx fc;
+
+	bzero(&fc, sizeof(fc));
+	fc.varying = v;
+	fc.tile = dc->target[py * dc->w + px];          /* ld_tile reads the destination pixel (blending) */
+	fc.has_tile = 1;
+	if (s8f_run(&fc, dc->frag, dc->fraglen) && fc.stored) {
+		dc->target[py * dc->w + px] = (uint32_t)sf_to_unorm8(fc.out[2]) | ((uint32_t)sf_to_unorm8(fc.out[1]) << 8) |
+		    ((uint32_t)sf_to_unorm8(fc.out[0]) << 16) | ((uint32_t)sf_to_unorm8(fc.out[3]) << 24);
+		dc->pixels++;
+	} else if (fc.unknown != 0) {
+		dc->unknown = fc.unknown;
+	}
+}
+
+uint32_t
+AGXDeviceUserClient::agxRd(void * ctx, uint64_t va)
+{
+	AGXDeviceUserClient * self = (AGXDeviceUserClient *)ctx;
+	uint8_t * p;
+	uint64_t avail;
+
+	if (self->findResMem(va, &p, &avail) && avail >= 4) {
+		return *(const uint32_t *)p;
+	}
+	return 0;
+}
+
+/*
+ * Shader corpus: every vertex (0x0001001f/2f) and fragment (0x0009051f/851f/011f) state record that points at a program not logged yet gets its first
+ * 0x100 bytes printed ("S8AGX: P <v|f> <va> +<start> <hex 32 B>", 8 lines per program), so the instruction forms of real clients can be decoded offline.
+ */
+void
+AGXDeviceUserClient::logPrograms(void)
+{
+	static uint64_t seen[400];
+	static int nseen;
+	static volatile SInt32 budget;
+
+	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
+		uint32_t r = fResShm[n - 1];
+
+		if (r == 0xffffffffu || r >= fShmemCount || fShmemBuf[r] == NULL) {
+			continue;
+		}
+		const uint32_t * d = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
+		uint64_t nd = fShmemBuf[r]->getLength() / 4;
+
+		for (uint64_t i = 0; i + 4 < nd; i++) {
+			uint32_t hi = d[i] >> 16, lo = d[i] & 0xffff;
+			bool vtx = hi == 0x0001u && (lo & 0xf) == 0xf && d[i + 2] == 0x108u;
+			bool frg = hi == 0x0009u && (lo & 0xf) == 0xf && (d[i + 2] == 0x108u || d[i + 3] == 0x108u) && d[i + 1] != 0;
+
+			if (!vtx && !frg) {
+				continue;
+			}
+			uint64_t va = 0x100000000ULL | (d[i + 1] & ~1u);
+			bool dup = false;
+
+			for (int k = 0; k < nseen; k++) {
+				if (seen[k] == (va | (vtx ? 1 : 0))) {
+					dup = true;
+					break;
+				}
+			}
+			if (dup || nseen >= 400 || OSAddAtomic(24, (SInt32 *)&budget) > 12000) {
+				continue;
+			}
+			seen[nseen++] = va | (vtx ? 1 : 0);
+			const uint8_t * base;
+			uint64_t off, len;
+
+			if (!findResRegion(va, &base, &off, &len)) {
+				continue;
+			}
+			unsigned start = vtx ? s8v_find_start(base, (unsigned)(len > 0xffffffffULL ? 0xffffffffU : len), (unsigned)off) : (unsigned)off;
+			unsigned from = start > 0x20 ? start - 0x20 : 0;       /* a little context before (the constant-setup run) */
+
+			for (unsigned o = from; o < from + 0x300 && o + 32 <= len; o += 32) {
+				char hex[65];
+
+				for (int k = 0; k < 32; k++) {
+					hex[k * 2] = "0123456789abcdef"[base[o + k] >> 4];
+					hex[k * 2 + 1] = "0123456789abcdef"[base[o + k] & 15];
+				}
+				hex[64] = 0;
+				IOLog("S8AGX: P %c 0x%llx entry %u start %u o %u %s hdr %08x\n", vtx ? 'v' : 'f', (unsigned long long)va, (unsigned)off, start, o, hex,
+				    (unsigned)d[i]);
+			}
+			/* the state record and its neighbourhood (the uniform-push record sits just before it) */
+			if (i >= 8 && i + 8 < nd) {
+				IOLog("S8AGX: R %c 0x%llx res %u idx %llu %08x %08x %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x %08x %08x %08x %08x\n", vtx ? 'v' : 'f',
+				    (unsigned long long)va, (unsigned)n, (unsigned long long)i, d[i - 8], d[i - 7], d[i - 6], d[i - 5], d[i - 4], d[i - 3], d[i - 2], d[i - 1],
+				    d[i], d[i + 1], d[i + 2], d[i + 3], d[i + 4], d[i + 5], d[i + 6], d[i + 7]);
+			}
+		}
+	}
+}
+
+/*
+ * MILESTONE 2: vertex program -> viewport transform -> triangle rasteriser -> fragment program, all software, integer-only floats. The vertex buffer is
+ * read as float4 vertices (stride 16), triangle lists (prim 6) and strips (prim 9) only; target is assumed square.
+ */
+void
+AGXDeviceUserClient::executeDraws(uint32_t * target, uint64_t npx, uint64_t vtxVa, uint64_t vbVa, const uint32_t * vp, uint64_t fragVa,
+    const uint32_t * dr, int ndraws, const uint32_t * uni)
+{
+	static volatile SInt32 logged;
+	const uint8_t * vbase;
+	const uint8_t * fbase;
+	uint64_t voff, vlen, foff, flen;
+	unsigned vstart;
+	int w = 1;
+	struct agx_draw_ctx dc;
+
+	while ((uint64_t)w * w < npx) {
+		w++;
+	}
+	(void)vbVa;
+	if ((uint64_t)w * w != npx || !findResRegion(vtxVa, &vbase, &voff, &vlen) || !findResRegion(fragVa, &fbase, &foff, &flen)) {
+		if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
+			IOLog("S8AGX: exec: draw skipped (target %llu px not square or program/vertex buffer not found)\n", (unsigned long long)npx);
+		}
+		return;
+	}
+	vstart = s8v_find_start(vbase, (unsigned)(vlen > 0xffffffffULL ? 0xffffffffU : vlen), (unsigned)voff);
+	dc.frag = fbase + foff;
+	dc.fraglen = (uint32_t)(flen - foff > 0x400 ? 0x400 : flen - foff);
+	dc.target = target;
+	dc.w = w;
+	dc.pixels = 0;
+	dc.unknown = 0;
+	for (int di = 0; di < ndraws; di++) {
+		uint32_t prim = dr[di * 3], count = dr[di * 3 + 1];
+		struct s8r_vtx vt[64];
+		bool vok[64];
+		uint32_t nvar = 0, unknownOp = 0;
+
+		if ((prim != 6 && prim != 9) || count < 3 || count > 64) {
+			if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
+				IOLog("S8AGX: exec: draw %d prim %u count %u not handled\n", di, (unsigned)prim, (unsigned)count);
+			}
+			continue;
+		}
+		for (uint32_t vid = 0; vid < count; vid++) {
+			struct s8f_ctx c;
+
+			bzero(&c, sizeof(c));
+			memcpy(c.uni, uni, sizeof(c.uni));
+			c.rd = agxRd;
+			c.rdctx = this;
+			c.vid = vid;
+			vok[vid] = false;
+			if (!s8f_run(&c, vbase + vstart, (unsigned)(vlen - vstart > 0x400 ? 0x400 : vlen - vstart)) || (c.expmask & 0xf) != 0xf) {
+				unknownOp = c.unknown ? c.unknown : 0xff;
+				if (vid == 0 && OSIncrementAtomic((SInt32 *)&logged) < 400) {
+					IOLog("S8AGX: exec: vertex program at 0x%llx start +%u: exports 0x%x, uniforms %08x %08x, program bytes %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					    (unsigned long long)vtxVa, vstart, (unsigned)c.expmask, (unsigned)c.uni[0], (unsigned)c.uni[2], vbase[vstart], vbase[vstart + 1],
+					    vbase[vstart + 2], vbase[vstart + 3], vbase[vstart + 4], vbase[vstart + 5], vbase[vstart + 6], vbase[vstart + 7]);
+				}
+				continue;
+			}
+			f32b iw = sf_div(SF_ONE, c.exp[3]);
+
+			vt[vid].x = sf_fma(vp[1], sf_mul(c.exp[0], iw), vp[0]);
+			vt[vid].y = sf_fma(vp[3], sf_mul(c.exp[1], iw), vp[2]);
+			vt[vid].iw = iw;
+			nvar = 0;
+			while (nvar < S8R_MAXV && (c.expmask & (1u << (4 + nvar)))) {
+				vt[vid].v[nvar] = c.exp[4 + nvar];
+				nvar++;
+			}
+			for (uint32_t k = nvar; k < S8R_MAXV; k++) {
+				vt[vid].v[k] = 0;
+			}
+			vok[vid] = true;
+		}
+		if (unknownOp != 0 && OSIncrementAtomic((SInt32 *)&logged) < 400) {
+			IOLog("S8AGX: exec: vertex program has an instruction the interpreter does not know (0x%02x)\n", (unsigned)unknownOp);
+		}
+		uint32_t before = dc.pixels;
+
+		for (uint32_t t = 0; prim == 6 ? t + 3 <= count : t + 3 <= count; t = (prim == 6 ? t + 3 : t + 1)) {
+			uint32_t a = t, b = t + 1, cc2 = t + 2;
+
+			if (prim == 9 && (t & 1)) {
+				b = t + 2;
+				cc2 = t + 1;
+			}
+			if (vok[a] && vok[b] && vok[cc2]) {
+				s8r_tri(&vt[a], &vt[b], &vt[cc2], (int)nvar, 0, 0, w, w, agx_emit_pixel, &dc);
+			}
+			if (prim == 9 && t + 3 >= count) {
+				break;
+			}
+		}
+		if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
+			IOLog("S8AGX: exec: draw %d prim %u count %u: %u pixels written (fragment unknown op 0x%02x); samples (32,32) %08x (24,40) %08x (40,40) %08x (32,50) %08x (8,8) %08x\n",
+			    di, (unsigned)prim, (unsigned)count, (unsigned)(dc.pixels - before), (unsigned)dc.unknown,
+			    (unsigned)target[32 * w + 32], (unsigned)target[40 * w + 24], (unsigned)target[40 * w + 40], (unsigned)target[50 * w + 32],
+			    (unsigned)target[8 * w + 8]);
+		}
+	}
+}
+
+/* Milestone: every pass attachment record {fmt, w1, VA>>4, 0x200, 0, 0} whose VA is an IOSurface resource gets a flat pixel; proves pass -> surface -> display */
+void
+AGXDeviceUserClient::fillSurfaceTargets(uint32_t pixel)
+{
+	static volatile SInt32 slogged;
+
+	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
+		uint32_t r = fResShm[n - 1];
+
+		if (r == 0xffffffffu || r >= fShmemCount || fShmemBuf[r] == NULL) {
+			continue;
+		}
+		const uint32_t * d = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
+		uint64_t nd = fShmemBuf[r]->getLength() / 4;
+
+		for (uint64_t i = 0; i + 6 < nd; i++) {
+			if (d[i + 3] != 0x200u || d[i + 4] != 0 || d[i + 5] != 0 || d[i + 2] == 0) {
+				continue;
+			}
+			uint64_t tva = (uint64_t)d[i + 2] << 4;
+
+			for (uint32_t s = 0; s < fSurfN; s++) {
+				if (fSurfVa[s] != tva) {
+					continue;
+				}
+				SweetSurface * ss = sweet_surface_copy(fSurfId[s]);
+
+				if (ss != NULL) {
+					uintptr_t ka = ss->kernelAddress();
+
+					if (ka != 0) {
+						for (uint32_t y = 0; y < ss->height; y++) {
+							uint32_t * row = (uint32_t *)(ka + ss->offset + (uint64_t)y * ss->bytesPerRow);
+
+							for (uint32_t x = 0; x < ss->width; x++) {
+								row[x] = pixel;
+							}
+						}
+						if (OSIncrementAtomic((SInt32 *)&slogged) < 40) {
+							IOLog("S8AGX: exec: filled IOSurface %u (%ux%u pitch %u) at 0x%llx with %08x\n", (unsigned)fSurfId[s], (unsigned)ss->width,
+							    (unsigned)ss->height, (unsigned)ss->bytesPerRow, (unsigned long long)tva, (unsigned)pixel);
+						}
+					}
+					ss->release();
+				}
+			}
+		}
+	}
+}
+
+void
+AGXDeviceUserClient::executePasses(void)
+{
+	if (fSurfN != 0) {
+		fillSurfaceTargets(0xffff00ffu);        /* magenta (B,G,R,A = ff,00,ff,ff), only until the shaders run */
+	}
+
+	static volatile SInt32 logged;
+	uint64_t fragVa = 0;
+	uint64_t vtxVa = 0, vbVa = 0, vtxIdx = 0;
+	uint32_t vtxRes = 0;
+	uint32_t uni[128];
+	uint32_t vp[4] = { 0, 0, 0, 0 };
+	struct { uint32_t prim, count, inst; } draws[8];
+	int ndraws = 0;
+	uint32_t color = 0;
+	bool haveColor = false;
+
+	/* vertex state records {0x0001001f|0x0001002f, program VA low, 0x108}, the vertex buffer / viewport table (0xc00, VA lo, 1, 0xc00, 0x80000001, ..,
+	 * tx, sx, ty, sy floats) and the draw packets {0x001b0000, 0x6e44pp00 (pp = primitive), count, instances - 1} (analysis/agx-kernel-interface.md 19) */
+	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
+		uint32_t r = fResShm[n - 1];
+
+		if (r == 0xffffffffu || r >= fShmemCount || fShmemBuf[r] == NULL) {
+			continue;
+		}
+		const uint32_t * d = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
+		uint64_t nd = fShmemBuf[r]->getLength() / 4;
+
+		for (uint64_t i = 1; i + 10 < nd; i++) {
+			if ((d[i] == 0x0001001fu || d[i] == 0x0001002fu) && d[i + 2] == 0x108u && agx_rec_changed(n, i, 1, d[i + 1] ^ progHash(0x100000000ULL | (d[i + 1] & ~1u))) && (0x100000000ULL | (d[i + 1] & ~1u)) > vtxVa) {
+				/* among the records that changed, the newest pipeline is the one compiled last = the highest program address */
+				vtxVa = 0x100000000ULL | (d[i + 1] & ~1u);
+				vtxRes = n;
+				vtxIdx = i;
+			}
+			if (d[i - 1] == 0xc00u && d[i + 1] == 1u && d[i + 2] == 0xc00u && d[i + 3] == 0x80000001u) {
+				vbVa = 0x100000000ULL | d[i];
+				vp[0] = d[i + 5];
+				vp[1] = d[i + 6];
+				vp[2] = d[i + 7];
+				vp[3] = d[i + 8];
+			}
+			if (d[i] == 0x001b0000u && (d[i + 1] >> 16) == 0x6e44u && ndraws < 8) {
+				draws[ndraws].prim = (d[i + 1] >> 8) & 0xff;
+				draws[ndraws].count = d[i + 2];
+				draws[ndraws].inst = d[i + 3] + 1;
+				ndraws++;
+			}
+		}
+	}
+
+	/* the user fragment-state record {0x0009051f, program VA low (bit 0 = flag), [extra], 0x108}: the last one wins */
+	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
+		uint32_t r = fResShm[n - 1];
+
+		if (r == 0xffffffffu || r >= fShmemCount || fShmemBuf[r] == NULL) {
+			continue;
+		}
+		const uint32_t * d = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
+		uint64_t nd = fShmemBuf[r]->getLength() / 4;
+
+		for (uint64_t i = 0; i + 4 < nd; i++) {
+			if ((d[i] == 0x0009051fu || d[i] == 0x0009851fu || d[i] == 0x0009052fu || d[i] == 0x0009852fu || d[i] == 0x0009055fu || d[i] == 0x0009012fu) &&
+			    (d[i + 2] == 0x108u || d[i + 3] == 0x108u) && agx_rec_changed(n, i, 2, d[i + 1] ^ progHash(0x100000000ULL | (d[i + 1] & ~1u))) &&
+			    (0x100000000ULL | (d[i + 1] & ~1u)) > fragVa) {
+				fragVa = 0x100000000ULL | (d[i + 1] & ~1u);
+			}
+		}
+	}
+	if (vtxVa != 0) {
+		gLastVtx = vtxVa;
+		gLastRes = vtxRes;
+		gLastIdx = vtxIdx;
+	} else {
+		vtxVa = gLastVtx;
+		vtxRes = gLastRes;
+		vtxIdx = gLastIdx;
+	}
+	/* the uniform-push records right before the vertex state record fill the uniform file: {w0, w1}, address (w1 << 8) | (w0 >> 24 & 0xfe),
+	 * size (w0 >> 20 & 0x1f) halves (0 = 32), destination half (w0 >> 8 & 0xff), type w0 & 0xf = 3 */
+	bzero(uni, sizeof(uni));
+	if (vtxVa != 0 && vtxRes != 0 && vtxRes <= kResMax && fResShm[vtxRes - 1] != 0xffffffffu && fResShm[vtxRes - 1] < fShmemCount &&
+	    fShmemBuf[fResShm[vtxRes - 1]] != NULL) {
+		const uint32_t * dd = (const uint32_t *)fShmemBuf[fResShm[vtxRes - 1]]->getBytesNoCopy();
+
+		for (int64_t k = (int64_t)vtxIdx - 2, cnt = 0; k >= 0 && cnt < 8; k -= 2, cnt++) {
+			if ((dd[k] & 0xf) != 3 || (dd[k + 1] >> 24) != 1) {
+				break;
+			}
+			uint64_t pva = ((uint64_t)dd[k + 1] << 8) | ((dd[k] >> 24) & 0xfe);
+			uint32_t halves = (dd[k] >> 20) & 0x1f, dest = (dd[k] >> 8) & 0xff;
+
+			if (halves == 0) {
+				halves = 32;
+			}
+			for (uint32_t j = 0; j < halves / 2 && dest + 2 * j < 128; j++) {
+				uni[dest + 2 * j] = agxRd(this, pva + 4 * j);
+			}
+		}
+	}
+	if (fragVa != 0) {
+		gLastFrag = fragVa;
+	} else {
+		fragVa = gLastFrag;
+	}
+	if (fragVa != 0) {
+		uint8_t * p;
+		uint64_t avail;
+
+		if (findResMem(fragVa, &p, &avail)) {
+			uint32_t reg[8] = { 0 };
+			uint64_t pc = 0;
+			bool ok = false;
+
+			for (int step = 0; step < 64 && pc + 8 <= avail; step++) {
+				const uint8_t * b = p + pc;
+
+				if (b[0] == 0x52) {                     /* mov_imm: 52 <reg*2> <imm32> */
+					reg[(b[1] / 2) & 7] = b[2] | (b[3] << 8) | (b[4] << 16) | ((uint32_t)b[5] << 24);
+					pc += 6;
+				} else if (b[0] == 0x48) {              /* wait_pix */
+					pc += 4;
+				} else if (b[0] == 0x38) {              /* wait */
+					pc += 2;
+				} else if (b[0] == 0x09) {              /* st_tile: the colour is r0..r3 (RGBA) */
+					color = agx_f32_unorm8(reg[2]) | (agx_f32_unorm8(reg[1]) << 8) | (agx_f32_unorm8(reg[0]) << 16) |
+					    ((uint32_t)agx_f32_unorm8(reg[3]) << 24);
+					haveColor = ok = true;
+					break;
+				} else {
+					break;                          /* an instruction the executor does not know yet */
+				}
+			}
+			if (!ok && OSIncrementAtomic((SInt32 *)&logged) < 400) {
+				IOLog("S8AGX: exec: fragment program at 0x%llx is not a constant-colour one (first byte 0x%02x), pass cleared only\n",
+				    (unsigned long long)fragVa, (unsigned)p[0]);
+			}
+		}
+	}
+	/* the render pass descriptors: fb05050a 00007e01 ... clear RGBA floats at +0x38, target record 1fe3050a 000007e0 <VA>>4 at +0x48 */
+	for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
+		uint32_t r = fResShm[n - 1];
+
+		if (r == 0xffffffffu || r >= fShmemCount || fShmemBuf[r] == NULL) {
+			continue;
+		}
+		const uint32_t * d = (const uint32_t *)fShmemBuf[r]->getBytesNoCopy();
+		uint64_t nd = fShmemBuf[r]->getLength() / 4;
+
+		for (uint64_t i = 0; i + 0x16 < nd; i++) {
+			if (d[i] == 0xfb05050au && d[i + 1] == 0x00007e01u && d[i + 0x12] == 0x1fe3050au && d[i + 0x13] == 0x7e0u) {
+				uint64_t tva = (uint64_t)d[i + 0x14] << 4;
+				uint32_t cc = agx_f32_unorm8(d[i + 14]) << 16 | agx_f32_unorm8(d[i + 15]) << 8 | agx_f32_unorm8(d[i + 16]) |
+				    ((uint32_t)agx_f32_unorm8(d[i + 17]) << 24);      /* BGRA8: B = bits 0-7 */
+				bool drawable = vtxVa != 0 && vbVa != 0 && ndraws > 0 && fragVa != 0;
+
+				if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
+					IOLog("S8AGX: exec: pass state: vertex 0x%llx buffer 0x%llx draws %d fragment 0x%llx viewport %08x %08x %08x %08x\n", (unsigned long long)vtxVa,
+					    (unsigned long long)vbVa, ndraws, (unsigned long long)fragVa, (unsigned)vp[0], (unsigned)vp[1], (unsigned)vp[2], (unsigned)vp[3]);
+				}
+				uint32_t fill = (haveColor && !drawable) ? color : cc;
+				uint8_t * t;
+				uint64_t tavail;
+
+				/* BGRA byte order in memory: B G R A; cc above has R in bits 16-23 and B in 0-7 as little-endian BGRA */
+				if (findResMem(tva, &t, &tavail)) {
+					uint32_t * px = (uint32_t *)t;
+
+					for (uint64_t k = 0; k < tavail / 4; k++) {
+						px[k] = fill;
+					}
+					if (drawable) {
+						executeDraws(px, tavail / 4, vtxVa, vbVa, vp, fragVa, (const uint32_t *)draws, ndraws, uni);
+					}
+					if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
+						IOLog("S8AGX: exec: pass target 0x%llx (0x%llx B) clear %08x%s -> pixel %08x\n", (unsigned long long)tva,
+						    (unsigned long long)tavail, (unsigned)cc, haveColor ? " + constant fragment colour" : "", (unsigned)fill);
+					}
+				} else if (OSIncrementAtomic((SInt32 *)&logged) < 400) {
+					IOLog("S8AGX: exec: pass target 0x%llx has no stand-in memory (caller memory?)\n", (unsigned long long)tva);
+				}
+			}
+		}
+	}
+}
+
+/* One completion record (0x20 B: cookie, two timestamps, status) into the notification queue of a command queue. */
+bool
+AGXDeviceUserClient::postCompletion(uint32_t cmdQueue, uint64_t cookie, uint64_t t1, uint64_t t2, uint32_t status)
+{
+	uint8_t rec[0x20];
+	uint32_t nq;
+
+	if (cmdQueue == 0 || cmdQueue > kNqMax) {
+		return false;
+	}
+	nq = fCqNq[cmdQueue - 1];
+	if (nq == 0 || nq > kNqMax || fNq[nq - 1] == NULL) {
+		return false;
+	}
+	bzero(rec, sizeof(rec));
+	*(uint64_t *)rec = cookie;
+	*(uint64_t *)(rec + 8) = t1;
+	*(uint64_t *)(rec + 0x10) = t2;
+	*(uint32_t *)(rec + 0x18) = status;
+	bool ok = fNq[nq - 1]->enqueue(rec, sizeof(rec));
+
+	if (fCompletionLogs++ < 8) {
+		IOLog("S8AGX: completion record cookie 0x%llx status %u -> notification queue %u: enqueue %s%s\n", (unsigned long long)cookie, (unsigned)status, (unsigned)nq,
+		    ok ? "ok" : "FAILED", fNqPortSet[nq - 1] ? ", port bound" : ", NO PORT");
+	}
+	return ok;
+}
+
+/* Stage A: every shared-memory type is a zeroed 64 KiB buffer, so the userland mapping succeeds and the next call shows up. */
+IOReturn
+AGXDeviceUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory)
+{
+	IOBufferMemoryDescriptor * buf;
+
+	buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, 0x10000, 0x4000);
+	if (agx_log_ok()) {
+		IOLog("S8AGX: clientMemoryForType %u -> %s (64 KiB zeroed)\n", (unsigned)type, buf ? "ok" : "no memory");
+	}
+	if (buf == NULL) {
+		return kIOReturnNoMemory;
+	}
+	bzero(buf->getBytesNoCopy(), 0x10000);
+	*options = 0;
+	*memory = buf;           /* the caller releases it */
+	return kIOReturnSuccess;
+}
+
+IOReturn
+AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
+    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
+{
+	(void)dispatch;
+	(void)target;
+	(void)reference;
+	if (args == NULL) {
+		return kIOReturnBadArgument;
+	}
+	if (selector >= 0x200 || fSelCount == NULL || fSelCount[selector]++ < 8) {
+		char name[32] = "?";
+
+		proc_selfname(name, sizeof(name));
+		IOLog("S8AGX: [%s %d] sel 0x%x scalarIn %u structIn %u (desc %s) scalarOut %u structOut %u (desc %s) async %s\n", name, proc_selfpid(), selector,
+		    args->scalarInputCount, args->structureInputSize, args->structureInputDescriptor ? "yes" : "no",
+		    args->scalarOutputCount, args->structureOutputSize, args->structureOutputDescriptor ? "yes" : "no",
+		    args->asyncWakePort ? "yes" : "no");
+		for (uint32_t i = 0; i < args->scalarInputCount && i < 6; i++) {
+			IOLog("S8AGX:    scalar[%u] = 0x%llx\n", i, args->scalarInput[i]);
+		}
+		if (args->structureInput != NULL && args->structureInputSize != 0) {
+			const uint8_t * p = (const uint8_t *)args->structureInput;
+			uint32_t n = args->structureInputSize < 112 ? args->structureInputSize : 112;
+			char hex[112 * 2 + 1];
+
+			for (uint32_t i = 0; i < n; i++) {
+				snprintf(hex + 2 * i, 3, "%02x", p[i]);
+			}
+			IOLog("S8AGX:    struct[%u] = %s\n", args->structureInputSize, hex);
+		}
+	}
+	if (selector == 0xd) {
+		return createShmem(args);
+	}
+	if (args->scalarOutput != NULL) {
+		bzero(args->scalarOutput, args->scalarOutputCount * sizeof(uint64_t));
+	}
+	if (selector == 5 && args->structureOutput != NULL && args->structureOutputSize >= 16) {
+		/*
+		 * IOGPUDeviceGetNextGlobalTraceID: out { first id (must be non-zero; zero aborts userland), end of the range }. Userland counts from the
+		 * first id up to the end and asks again; when the call fails it uses { 1, 0x100000000 }, so ranges of that size are what it expects.
+		 */
+		uint8_t * o = (uint8_t *)args->structureOutput;
+
+		bzero(o, args->structureOutputSize);
+		*(uint64_t *)o = fTraceNext;
+		*(uint64_t *)(o + 8) = fTraceNext + 0xffffffffULL;
+		fTraceNext += 0xffffffffULL;
+		return kIOReturnSuccess;
+	}
+	if (selector == 9 && args->structureInput != NULL && args->structureInputSize >= 0x68 && args->structureOutput != NULL &&
+	    args->structureOutputSize >= 0x50) {
+		/*
+		 * IOGPUResourceCreate (IOGPU): in 0x68 B (u32 flags@0, alignment@0x30, user pointer@0x38, allocation size u64@0x48), out 0x50 B:
+		 * { GPU virtual address@0, CPU data pointer@8, client-shared page@0x10 (must be non-zero), flag byte@0x18, resource id u32@0x1c,
+		 * resident size@0x20 }. Memory is zeroed kernel memory mapped into the caller; the GPU address is a fresh range (stage A: no GPU work yet).
+		 */
+		const uint8_t * in = (const uint8_t *)args->structureInput;
+		uint8_t * o = (uint8_t *)args->structureOutput;
+		uint64_t size = *(const uint64_t *)(in + 0x48);
+		uint64_t data = 0, shared = 0, va = fGpuVa;
+		uint32_t flags = *(const uint32_t *)in;
+		uint64_t uptr = *(const uint64_t *)(in + 0x38);     /* CPU memory the caller gives (flag 0x80) */
+		uint64_t pbase = *(const uint64_t *)(in + 0x40);    /* the primary buffer's CPU base, for a sub-buffer */
+		uint32_t pid = *(const uint32_t *)(in + 0x50);      /* the primary buffer's resource id, for a sub-buffer */
+		bool given = (flags & 0x80) != 0 && uptr != 0;
+		bool sub = false;
+		uint32_t dataRegion = 0xffffffffu;
+		IOReturn r = kIOReturnSuccess;
+
+		if (size == 0) {
+			size = 0x4000;
+		}
+		if (given) {
+			/* the caller's own memory: the answer must echo its pointer; a sub-buffer sits at the primary's GPU address + the same offset */
+			data = uptr;
+			if (pid != 0 && pid <= fResId && pid <= kResMax && uptr >= pbase) {
+				va = fResVa[pid - 1] + (uptr - pbase);
+				sub = true;
+			}
+		} else {
+			r = allocShmem(size, &data);
+			dataRegion = (r == kIOReturnSuccess) ? fShmemCount - 1 : 0xffffffffu;
+		}
+		if (r == kIOReturnSuccess) {
+			r = allocShmem(0x4000, &shared);
+		}
+		if (r != kIOReturnSuccess) {
+			IOLog("S8AGX: resource create failed (size 0x%llx): 0x%x\n", size, (unsigned)r);
+			return r;
+		}
+		size = (size + 0x3fffULL) & ~0x3fffULL;
+		bzero(o, args->structureOutputSize);
+		*(uint64_t *)o = va;
+		*(uint64_t *)(o + 8) = data;
+		*(uint64_t *)(o + 0x10) = shared;
+		o[0x18] = 1;
+		*(uint32_t *)(o + 0x1c) = ++fResId;
+		*(uint64_t *)(o + 0x20) = size;
+		if (fResId <= kResMax) {
+			fResVa[fResId - 1] = va;
+			fResShm[fResId - 1] = dataRegion;
+		}
+		if ((flags & 0x82) == 0x82 && uptr != 0 && uptr < 0x10000 && fSurfN < kSurfMax) {
+			/* an IOSurface as render target: the "user pointer" is the surface id (SWEET FB swap ... surface N) */
+			fSurfVa[fSurfN] = va;
+			fSurfId[fSurfN++] = (uint32_t)uptr;
+			IOLog("S8AGX: resource %u is IOSurface %u (gpu va 0x%llx)\n", (unsigned)fResId, (unsigned)uptr, (unsigned long long)va);
+		}
+		IOLog("S8AGX: resource %u: size 0x%llx flags 0x%x%s gpu va 0x%llx cpu 0x%llx\n", (unsigned)fResId, size, (unsigned)flags,
+		    sub ? " (sub-buffer)" : (given ? " (caller memory)" : ""), (unsigned long long)va, (unsigned long long)data);
+		if (!sub) {
+			fGpuVa += (size + 0xffffULL) & ~0xffffULL;
+		}
+		return kIOReturnSuccess;
+	}
+	if (selector == 7 && args->structureOutput != NULL && args->structureOutputSize >= 16) {
+		/* IOGPUCommandQueueCreateWithQoS: in 0x408 B (process name 0x400, qos u32, flag byte), out { queue id (must be non-zero), shared state } */
+		uint8_t * o = (uint8_t *)args->structureOutput;
+		uint64_t state = 0;
+		IOReturn r = allocShmem(0x4000, &state);
+
+		if (r != kIOReturnSuccess) {
+			return r;
+		}
+		bzero(o, args->structureOutputSize);
+		*(uint64_t *)o = ++fQueueId;
+		*(uint64_t *)(o + 8) = state;
+		IOLog("S8AGX: command queue %u created (state page 0x%llx)\n", (unsigned)fQueueId, (unsigned long long)state);
+		return kIOReturnSuccess;
+	}
+	if (selector == 0xf && args->structureOutput != NULL && args->structureOutputSize >= 16 && args->scalarInputCount >= 2) {
+		/*
+		 * IOGPUNotificationQueueCreate: scalars { entries, entry size }, out { user address of the queue, queue id (u32, non-zero) }.
+		 * Userland dequeues with IODataQueueDequeue, so the queue is a real IOSharedDataQueue (header + entries) mapped into the client.
+		 */
+		uint8_t * o = (uint8_t *)args->structureOutput;
+		uint64_t entries = args->scalarInput[0] & 0xffffffffULL, esize = args->scalarInput[1] & 0xffffffffULL;
+		IOSharedDataQueue * q;
+		IOMemoryDescriptor * md;
+		IOMemoryMap * map;
+
+		if (fNqId >= kNqMax || entries == 0 || esize == 0 || entries * (esize + 8) > (4ULL << 20)) {
+			return kIOReturnNoResources;
+		}
+		q = IOSharedDataQueue::withCapacity((UInt32)(entries * (esize + 8)));
+		if (q == NULL) {
+			return kIOReturnNoMemory;
+		}
+		md = q->getMemoryDescriptor();
+		map = md ? md->createMappingInTask(fTask, 0, kIOMapAnywhere) : NULL;
+		if (md != NULL) {
+			md->release();
+		}
+		if (map == NULL) {
+			q->release();
+			return kIOReturnVMError;
+		}
+		fNq[fNqId] = q;
+		fNqMap[fNqId] = map;
+		bzero(o, args->structureOutputSize);
+		*(uint64_t *)o = (uint64_t)map->getVirtualAddress();
+		*(uint32_t *)(o + 8) = ++fNqId;
+		IOLog("S8AGX: notification queue %u created: %llu x %llu bytes at 0x%llx\n", (unsigned)fNqId, entries, esize,
+		    (unsigned long long)map->getVirtualAddress());
+		return kIOReturnSuccess;
+	}
+	if (selector == 0x19 && args->scalarInputCount >= 2) {
+		/* attach the notification queue (scalar 1) to the command queue (scalar 0) */
+		uint64_t cq = args->scalarInput[0], nq = args->scalarInput[1];
+
+		if (cq >= 1 && cq <= kNqMax && nq >= 1 && nq <= kNqMax) {
+			fCqNq[cq - 1] = (uint32_t)nq;
+		}
+		IOLog("S8AGX: command queue %llu -> notification queue %llu\n", cq, nq);
+		return kIOReturnSuccess;
+	}
+	if (selector == 0x1a && args->scalarInputCount >= 4 && args->structureInput != NULL) {
+		/*
+		 * IOGPUCommandQueueSubmitCommandBuffers: scalars { command queue id, flag, count, entry size }, struct = count entries; the cookies of
+		 * an entry are u64 at +0x10 and +0x18 (userland calls the function stored in each: "started" and "completed"). Stage A: nothing runs
+		 * on the GPU yet; the command buffers are reported as completed straight away (status 0).
+		 */
+		uint64_t cq = args->scalarInput[0], count = args->scalarInput[2], esize = args->scalarInput[3];
+		const uint8_t * in = (const uint8_t *)args->structureInput;
+		uint32_t posted = 0;
+
+		if (esize < 0x20 || count == 0 || count * esize > args->structureInputSize) {
+			return kIOReturnBadArgument;
+		}
+		{
+			char xname[32] = "?";
+
+			proc_selfname(xname, sizeof(xname));
+			if (strncmp(xname, gExecName, strlen(gExecName)) == 0) {
+				executePasses();        /* before the completion records: the caller reads the target once it sees them */
+			} else if (gProgName[0] != 0 && strncmp(xname, gProgName, strlen(gProgName)) == 0) {
+				logPrograms();          /* corpus of the shaders a real client (the compositor) submits */
+			}
+		}
+		for (uint64_t i = 0; i < count; i++) {
+			const uint8_t * e = in + i * esize;
+			uint64_t t = mach_absolute_time();
+
+			if (postCompletion((uint32_t)cq, *(const uint64_t *)(e + 0x10), t, t, 0)) {
+				posted++;
+			}
+			if (postCompletion((uint32_t)cq, *(const uint64_t *)(e + 0x18), t, mach_absolute_time(), 0)) {
+				posted++;
+			}
+		}
+		if (fSubmitDumps < 48 && fShmemType != NULL) {
+			char pname[32] = "?";
+
+			proc_selfname(pname, sizeof(pname));
+			if (strncmp(pname, gDumpName, strlen(gDumpName)) == 0 && gSeen++ >= gSkip) {
+				/*
+				 * Learn the AGX command format: print every non-zero 64-byte line of (1) the device shared-memory regions (type 0 segment list,
+				 * 1 kernel commands) and (2) every resource userland created (command buffer memory, programs, descriptors), with the resource's GPU
+				 * virtual address, so that offline tools can follow pointers. Only for the first submits of the test process.
+				 */
+				fSubmitDumps++;
+				fDumpLines = 0;
+				for (uint32_t r = 0; r < fShmemCount && r < kShmemMax; r++) {
+					if (fShmemBuf[r] == NULL) {
+						continue;
+					}
+					if (fShmemType[r] != 0xff) {
+						dumpSparse("shmem", r, r, fShmemType[r], 0, (const uint8_t *)fShmemBuf[r]->getBytesNoCopy(), fShmemBuf[r]->getLength());
+					}
+				}
+				for (uint32_t n = 1; n <= fResId && n <= kResMax; n++) {
+					uint32_t r = fResShm[n - 1];
+
+					if (r != 0xffffffffu && r < fShmemCount && fShmemBuf[r] != NULL) {
+						dumpSparse("res", r, n, 0, fResVa[n - 1], (const uint8_t *)fShmemBuf[r]->getBytesNoCopy(), fShmemBuf[r]->getLength());
+					}
+				}
+			}
+		}
+		IOLog("S8AGX: submit on command queue %llu: %llu command buffer(s), %u completion record(s) posted\n", cq, count, (unsigned)posted);
+		return kIOReturnSuccess;
+	}
+	if (selector == 0x100 && args->structureOutput != NULL && args->structureOutputSize >= 0x78) {
+		/*
+		 * AGXGPUCoreConfig (0x78 B; AGXG10P keeps it at accelerator-config+0x368 and publishes num_cores/num_frags/num_gps/num_mgpus/
+		 * core_mask_list from it, offsets read off the kext's property publisher). The A11 GPU (G10P) has 3 cores.
+		 */
+		uint8_t * o = (uint8_t *)args->structureOutput;
+
+		bzero(o, args->structureOutputSize);
+		*(uint32_t *)(o + 0x0c) = 3;            /* num_cores */
+		*(uint32_t *)(o + 0x18) = 1;            /* num_gps */
+		*(uint32_t *)(o + 0x20) = 3;            /* num_frags */
+		*(uint32_t *)(o + 0x30) = 1;            /* num_mgpus */
+		*(uint64_t *)(o + 0x48) = 0x7;          /* core_mask_list[0] */
+		o[0x68] = 1;                            /* core mask list valid */
+		return kIOReturnSuccess;
+	}
+	if (selector == 0x102 && args->structureOutput != NULL && args->structureOutputSize >= 0x1c8) {
+		/* build info: strings only (kext build date, build type) */
+		uint8_t * o = (uint8_t *)args->structureOutput;
+
+		bzero(o, args->structureOutputSize);
+		strlcpy((char *)(o + 0xc8), "Jul 11 2025 16:00:18", 0x20);
+		strlcpy((char *)(o + 0xe8), "release", 8);
+		strlcpy((char *)(o + 0x1a8), "Unknown", 0x20);
+		return kIOReturnSuccess;
+	}
+	if (selector == 0 && args->structureOutput != NULL && args->structureOutputSize >= 0x40) {
+		/*
+		 * IOGPU's device info (dev+0xa0 ..): [0x20] = shared memory size, [0x28] = largest single resource. Zeros here made Metal's
+		 * shared-memory pools fail before any kernel call. Values: 1.5 GiB shared, 1 GiB per resource (the S8 has 2 GiB for iOS).
+		 */
+		uint8_t * o = (uint8_t *)args->structureOutput;
+
+		bzero(o, args->structureOutputSize);
+		*(uint64_t *)(o + 0x20) = 0x60000000ULL;
+		*(uint64_t *)(o + 0x28) = 0x40000000ULL;
+		return kIOReturnSuccess;
+	}
+	if (args->structureOutput != NULL && args->structureOutputSize != 0) {
+		bzero(args->structureOutput, args->structureOutputSize);
+	}
+	return kIOReturnSuccess;
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+extern "C" void S8AgxStart(void);
+
+extern "C" void
+S8AgxStart(void)
+{
+	uint32_t on = 0;
+	IOService * provider = NULL;
+	AGXAcceleratorG10P_B0 * gpu;
+
+	if (!PE_parse_boot_argn("s8agx", &on, sizeof(on)) || on == 0) {
+		return;
+	}
+	PE_parse_boot_argn("s8agxdump", gDumpName, sizeof(gDumpName));
+	PE_parse_boot_argn("s8agxexec", gExecName, sizeof(gExecName));
+	PE_parse_boot_argn("s8agxprogs", gProgName, sizeof(gProgName));
+	PE_parse_boot_argn("s8agxskip", &gSkip, sizeof(gSkip));
+	for (int i = 0; i < 600 && (provider = IOService::getPlatform()) == NULL; i++) {
+		IOSleep(100);
+	}
+	gpu = OSTypeAlloc(AGXAcceleratorG10P_B0);
+	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
+		OSSafeReleaseNULL(gpu);
+		IOLog("S8AGX: cannot create the service\n");
+		return;
+	}
+	if (!gpu->start(provider)) {
+		gpu->detach(provider);
+		IOLog("S8AGX: the service did not start\n");
+	} else {
+		IOLog("S8AGX: service AGXAcceleratorG10P_B0 (IOAccelerator) registered\n");
+	}
+	gpu->release();
+}
+
+#endif /* ARM64_BOARD_CONFIG_A5XELTE */

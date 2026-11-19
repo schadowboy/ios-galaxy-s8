@@ -1,0 +1,35 @@
+clear only black
+clear only 0.25/0.5/0.75
+red
+green
+blue
+0.5/0.25/0.125
+interpolated colour
+red over white no blend
+red alpha 0.5 blended
+fmul imm
+fadd imm
+fmul vv
+ffma
+swizzle
+saturate scale
+mix
+select
+sqrt
+rcp
+exp2 log2
+min max
+half math
+discard
+sin
+floor
+tex nearest
+tex linear
+tex tint
+tex premult
+tex blend over
+uint bitops
+int compare select
+fract abs
+pow
+unorm pack
