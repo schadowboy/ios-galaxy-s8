@@ -1182,7 +1182,23 @@ AGXDeviceUserClient::execComposite(void)
 						{
 							uint64_t tva = 0;
 
-							if (r8tva == 0 && (s8s_texrec_va(w6, &tva) || !ok)) {
+							if (r8tva == 0 && ok == 0) {
+								/* a real texture record (analysis/texture-state.md sec. 9): size, format and layout from the descriptor; a texture that IS an IOSurface keeps
+								 * the surface's real (possibly padded) pitch */
+								struct s8t_desc * td = &dc->tmpl.texd[dc->tmpl.ntex];
+
+								for (uint32_t m = 0; m < fVmN && m < kVmMax; m++) {
+									if (fVm[m].surf != 0 && td->va >= fVm[m].va && td->va < fVm[m].va + fVm[m].len) {
+										SweetSurface * ss = sweet_surface_copy(fVm[m].surf);
+
+										if (ss != NULL) {
+											td->pitch = ss->bytesPerRow;
+											td->layout = S8T_LAYOUT_LINEAR;
+											ss->release();
+										}
+									}
+								}
+							} else if (r8tva == 0 && ok != 0) {
 								/* compositor records: address from the attachment form; size/format words are not decoded yet, so take them from the
 								 * backing IOSurface (linear BGRA8 with its pitch) or, for other memory, from the pass size (ASSUMED) */
 								uint32_t tw = p->width, th = p->height, tp = p->width * 4;

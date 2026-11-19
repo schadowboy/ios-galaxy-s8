@@ -420,6 +420,7 @@ int main(int argc, char ** argv)
 
 					for (j = 0; j < 6; j++) w6[j] = agxrd(0, d->fs.push[kk].va + 4 * j);
 					memcpy(dc->texw[ti], w6, sizeof(w6));
+					if (getenv("TEXDUMP")) printf("  TEXREC pass %d draw %d tex %u: %08x %08x %08x %08x %08x %08x\n", p, di, ti, w6[0], w6[1], w6[2], w6[3], w6[4], w6[5]);
 					ok = s8t_desc_decode(&dc->tmpl.texd[ti], w6);
 					form = s8s_texrec_va(w6, &tva);
 					if (!form) tva = dc->tmpl.texd[ti].va;
@@ -446,6 +447,12 @@ int main(int argc, char ** argv)
 						st2 = &tgts[ti2];
 						/* a previous pass's target: linear BGRA8 with that target's pitch (the kernel's Morton + pass-size guess is wrong for these) */
 						s8t_desc_make(&dc->tmpl.texd[ti], TGT_BASE + TGT_STEP * (uint64_t)ti2 + (tva - st2->va), st2->w, st2->h, S8T_FMT_BGRA8, S8T_LAYOUT_LINEAR, st2->pitch);
+					} else if (!ok && form == 2) {
+						/* a real texture record: size / format / layout come from the descriptor (s8gfx_tex.h, analysis/texture-state.md sec. 9) */
+						struct s8t_desc * td = &dc->tmpl.texd[ti];
+
+						if (synth_all || !texels_present(tva)) { s8t_desc_make(td, SYN_BASE + 0x1000000ULL * ti, td->width, td->height, td->fmt, S8T_LAYOUT_LINEAR, td->width * s8t_bpp(td->fmt)); dc->synth[ti] = 1; }
+						else td->va = tva;
 					} else if (form || !ok) {
 						uint32_t tw = bbox ? (uint32_t)(bx1 - bx0) : ps->width, th = bbox ? (uint32_t)(by1 - by0) : ps->height;
 

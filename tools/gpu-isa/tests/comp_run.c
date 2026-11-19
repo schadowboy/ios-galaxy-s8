@@ -32,7 +32,7 @@ static int g_const_tex;
 static uint32_t texrd(void * ctx, uint64_t va)
 {
 	(void)ctx;
-	if (g_const_tex) return 0xffbf4080u;                    /* RGBA8 bytes 80 40 bf ff = (0.502, 0.251, 0.749, 1.0) */
+	if (g_const_tex) return getenv("HH_TEX") ? (uint32_t)strtoul(getenv("HH_TEX"), 0, 16) : 0xffbf4080u;    /* RGBA8 bytes 80 40 bf ff = (0.502, 0.251, 0.749, 1.0) */
 	return (uint32_t)(va * 2654435761u) | 0xff000000u;
 }
 static float tofl(f32b b) { float x; memcpy(&x, &b, 4); return x; }
@@ -79,8 +79,10 @@ int main(int argc, char ** argv)
 		c.trd = texrd;
 		total++;
 		g_cur_prog = idx;
+		if (idx == g_trace_prog && getenv("HH_TILE")) c.tile = (uint32_t)strtoul(getenv("HH_TILE"), 0, 16);
 		{
-			int ok = s8f_run(&c, buf, len);
+			unsigned st0 = (idx == g_trace_prog && getenv("HH_START")) ? (unsigned)strtoul(getenv("HH_START"), 0, 16) : 0;
+			int ok = s8f_run(&c, buf + st0, len - st0);
 
 			if (c.pc_end) end_n++;
 			if (ok && c.stored) store_n++;

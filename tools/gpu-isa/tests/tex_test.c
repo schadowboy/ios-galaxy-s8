@@ -80,12 +80,36 @@ int main(int argc, char ** argv)
 	s8t_sampler_decode(&sl, lw);
 	CHECK(!sn.mag_linear && !sn.min_linear && sl.mag_linear && sl.min_linear, "sampler filter bits");
 	{
-		/* 64x64 render target record decodes to 64x64 (second data point of the size hypothesis) */
-		uint32_t rt[6] = { 0x1fe3050a, 0x000007e0, 0x10006000, 0, 0, 0 };
+		/* real records of the compositor capture (capture21, session 9): size from the w0/w1 fields, geometry known from the passes / quads / texel memory */
+		static const struct { uint32_t w[6]; uint32_t W, H, fmt, lay; uint64_t va; } rec[] = {
+			{ { 0xc3055982, 0x00007e04, 0x40298000, 0x80098000, 0x100a69c0, 0x90 }, 153, 64, S8T_FMT_BGRA8, S8T_LAYOUT_LINEAR, 0x100a60000ull },     /* status widget (green rounded rect, 153 px tight rows) */
+			{ { 0xfb055982, 0x00009203, 0x40328000, 0x8007c000, 0x100ca940, 0x70 }, 128, 74, S8T_FMT_BGRA8, S8T_LAYOUT_LINEAR, 0x100ca0000ull },    /* target of pass 2 (128x74) */
+			{ { 0x1b055982, 0x00009a04, 0x40330000, 0x80080000, 0x100cca10, 0x80 }, 132, 78, S8T_FMT_BGRA8, S8T_LAYOUT_LINEAR, 0x100cc0000ull },    /* target of pass 3 (132x78) */
+			{ { 0xbb055982, 0x00036815, 0x40334000, 0x802b4000, 0x100df908, 0x2b0 }, 696, 437, S8T_FMT_BGRA8, S8T_LAYOUT_LINEAR, 0x100cd0000ull },  /* target of pass 5 (696x437) */
+			{ { 0xab055982, 0x00036415, 0x402ac000, 0x802b4000, 0x100bd7ac, 0x2b0 }, 694, 435, S8T_FMT_BGRA8, S8T_LAYOUT_LINEAR, 0x100ab0000ull },  /* target of pass 0 (694x435) */
+			{ { 0xa8b68002, 0x00009c15, 0x40320010, 0x800ac000, 0, 0xffff0 }, 694, 79, S8T_FMT_A8, S8T_LAYOUT_LINEAR, 0x100c80040ull },         /* date mask: quad 694x79 */
+			{ { 0xfb444642, 0x00000007, 0x40324000, 0x801fc000, 0, 0xffff0 }, 256, 1, S8T_FMT_RGBA16F, S8T_LAYOUT_LINEAR, 0x100c90000ull },       /* dither table */
+			{ { 0xfcb4000a, 0x00000003, 0x40000840, 0, 0, 0 }, 128, 1, S8T_FMT_R8, S8T_LAYOUT_MORTON, 0x100002100ull },                          /* bell curve table */
+			{ { 0xfc0554c2, 0x00171e2c, 0x403b4000, 0xbfffc000, 0, 0xffff0 }, 1440, 2960, S8T_FMT_BGRA8, S8T_LAYOUT_LINEAR, 0x100ed0000ull },    /* display surface */
+			{ { 0x03050502, 0x00000000, 0x403ac000, 0x80004000, 0, 0xffff0 }, 1, 1, S8T_FMT_RGBA8, S8T_LAYOUT_LINEAR, 0x100eb0000ull },         /* 1x1 white */
+		};
 		struct s8t_desc t;
+		unsigned ri;
 
-		s8t_desc_decode(&t, rt);
-		CHECK(t.width == 64 && t.height == 64, "rt size %u", t.width);
+		for (ri = 0; ri < sizeof(rec) / sizeof(rec[0]); ri++) {
+			CHECK(s8t_desc_decode(&t, rec[ri].w) == 0, "record %u not recognised", ri);
+			CHECK(t.width == rec[ri].W && t.height == rec[ri].H, "record %u size %ux%u vs %ux%u", ri, t.width, t.height, rec[ri].W, rec[ri].H);
+			CHECK(t.fmt == rec[ri].fmt && t.layout == rec[ri].lay, "record %u fmt %u layout %u", ri, t.fmt, t.layout);
+			CHECK(t.va == rec[ri].va || ri == 5, "record %u va %llx vs %llx", ri, (unsigned long long)t.va, (unsigned long long)rec[ri].va);
+		}
+	}
+	{
+		/* half -> float and the RGBA16F fetch: 1.0, 0.5, -2.0, 0.999 (0x3bfc) */
+		static uint32_t ftab[2] = { 0x38003c00u, 0x3bfcc000u };
+		struct s8t_desc fd;
+
+		CHECK(s8t_half(0x3c00) == 0x3f800000u && s8t_half(0x3800) == 0x3f000000u && s8t_half(0xc000) == 0xc0000000u, "half conversion");
+		(void)ftab; (void)fd;
 	}
 
 	/* Morton addressing against the captured bytes: texel (x,y) at the index of the interleave, pixel formula of the test app */

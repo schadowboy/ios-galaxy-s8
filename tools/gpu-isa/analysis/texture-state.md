@@ -20,7 +20,7 @@ the data, not separable), U = unknown.
 - word2 = VA >> 2 (V): 0x40001440 << 2 = 0x100005100 = res_1+0x5100, the texel bytes (bit 30 is VA bit 32). Render target records use VA >> 4 (`1fe3050a 000007e0 10006000 00000200`).
 - word0 low 16 bits 0x050a (record marker, also in render target and pass records) (H); word0 >> 24 = 0x1b = 00 01 10 11: probably the identity channel
   swizzle (2 bits per channel) (H); word0 bits 16-23 = 0x44 (4x4 RGBA8 2D?) U. The only format seen is 4x4 RGBA8 = 1b44.
-- word1 = 0x600 for 4x4 and 0x7e0 for the 64x64 BGRA8 render target (V on the two points): equals 0x800 - (0x800 >> k) for a 2^k square size, i.e.
+- (SUPERSEDED by sec. 9: word1 holds height-1 at bit 9 and the high width bits at 0-8) word1 = 0x600 for 4x4 and 0x7e0 for the 64x64 BGRA8 render target (V on the two points): equals 0x800 - (0x800 >> k) for a 2^k square size, i.e.
   (2^k - 1) << (11 - k). Either "size field left-aligned to bit 10" or a log2 + mask encoding (H). Width and height cannot be separated (both square), levels not seen.
 - Format: RGBA8 byte order is certain from the memory (R,G,B,A bytes, V); which bits say RGBA8 vs BGRA8 vs R8 is U (render target record has 1fe3 in the top half, BGRA8).
 - Layout (V for 4x4): Morton / twiddled, y in the LOW bit: byte offset = 4 * interleave(y0,x0,y1,x1) (pixel (x,y) index: (0,0)=0,(0,1)=1,(1,0)=2,(1,1)=3,(0,2)=4,(2,0)=8). For
@@ -90,3 +90,48 @@ int dims[][2] = {{2,2},{8,8},{16,16},{32,16},{16,32},{64,64},{128,64}};
 // E8 rounding: 2x2 texture {0,255}: sample linear at u = 0.5 + k/256 for k = 0..255 via a gradient quad; the bilinear weight quantisation (8 vs 6 vs 16 bit) shows as step widths in the result (needs the real GPU or the executor's pixel read-back).
 ```
 E1+E2+E3 are the cheapest and settle the descriptor; E7 settles the tiling that the compositor depends on.
+
+## 9. Real texture records of the compositor (capture21 session 9, comp_render.c TEXDUMP=1; 2026-11-19) SUPERSEDES the size guesses of sec. 2
+Fields now decoded from 12 distinct real records (V = checked on texel memory / geometry of the passes):
+```
+w0 bits 0-15   type code. bit 3 = layout (1 Morton, 0 linear). (code & ~8): 0x0502 RGBA8, 0x5982 BGRA8, 0x0002 R8, 0x8002 A8, 0x4642 RGBA16F, 0x0142 LA8 (L,A 2 B), 0x54c2 BGRA8 (display surface)
+w0 bits 16-26  constant per format family (0x305 for the 0x5982 / 0x0502 / 0x54c2 records, 0x344 for 0x4642/0x464a and the capture9 test texture): channel swizzle / sRGB flags, undecoded
+(w0 >> 27) | (w1 & 0x1ff) << 5      = width - 1   (14 bits)   V: 4x4, 153x64, 128x74, 132x78, 696x437, 694x435, 694x79, 1440x2960, 256x1, 128x1, 64x64, 1x1
+(w1 >> 9) & 0x3fff                  = height - 1  (14 bits)   V (same list)
+w2 = VA >> 2, bit 30 = VA bit 32     V (every record)
+w3 bit 31 set, bits 12+ ~ (align4(width in 4-byte words) - 4): 124, 128, 692, 152 ... for the BGRA8 records; NOT the pitch (the 153x64 widget has tight 612-byte rows); 0x3fffc000 for the display surface. Undecoded.
+w4 = (VA + size_of_pixels, 64-byte aligned) >> 4 and w5 = a size (0x70, 0x80, 0x2b0 ...): present for samples of earlier passes' targets (lossless-compression metadata pointer?); ignored: the stand-in renders plain linear targets.
+```
+The old "word1 = 0x800 - (0x800 >> k)" rule was a coincidence of the two square points: 0x600 is height-1 = 3 at bit 9, and the 64x64 target record `1fe3050a 000007e0` is a render-target/PBE record of another layout (its w1 0x7e0 does not decode this way).
+
+Evidence per record (all linear unless stated):
+| w0 / w1 | decoded | texel memory check |
+|---|---|---|
+| c3055982 00007e04 (VA 0x100a60000) | BGRA8 153x64 | `59 c7 34 ff` = B,G,R,A = iOS green #34C759; first non-zero rows 612 bytes apart = tight 153-px stride; rendered as a clean green bar (before: 103x63 with pitch 412 gave stripes) |
+| fb055982 00009203 / 1b055982 00009a04 / bb055982 00036815 / ab055982 00036415 | BGRA8 128x74 / 132x78 / 696x437 / 694x435 | = the target sizes of passes 2, 3, 5, 0; w4 - VA = pixel bytes rounded up to 64 |
+| a8b68002 00009c15 / f8b68002 00030415 | A8 694x79 / 704x387 (descriptor width = row stride; the header at -0x40 gives the real size) | agrees with Agent J's A8 findings (height 79 and 387) |
+| fb444642 00000007 (0x100c90000) | RGBA16F 256x1, 2048-byte row | texels `fc3b 0000 0000 fc3b | f43b 0000 0000 f43b ...` = (0.9990, 0, 0, 0.9990), (0.9966, ..): a 256-entry half table (dither / ramp) |
+| fcb4000a 00000003 (0x100002100) | R8 128x1 (Morton = linear for one row) | 00 1d 37 50 66 7b 8d 9e ... ff ff ff fe ... 00: a bell-shaped (Gaussian-like) weight curve, 1 byte per entry |
+| fc0554c2 00171e2c (0x100ed0000) | BGRA8 1440x2960 | exactly the display surface (pass 9 draw 6 reads it back: the dither / resolve pass) |
+| 03050502 00000000 (0x100eb0000) | RGBA8 1x1 | texel `ff ff ff ff` = white: the home-indicator bar (draws 3, 4: 516x15 at (462,2921)) samples a 1x1 white texture; with the correct 1x1 the bar renders white (before: black) |
+| fb44464a 00007e01 (0x100e60000) | code 0x464a = RGBA16F, MORTON, 64x64 | = pass 8's 55x55 target viewed as 64x64 (memory not in the capture, pass 8's vertex programs fail anyway) |
+| 2ca40142 00017207 (0x100ea0000) | LA8 230x186?? | IOSurface of the LA08 icon: texels not in the capture. The decoded 230x186 and the 90x90 quad do not agree (w3 hints a 120-word = 240-px stride): UNRESOLVED, keep the synthetic gradient until texels are captured |
+
+Not texture state: `0305050a 00000000 40000c80` and `fb05050a 00003e00 40000880` (pass attachments, decode as 1x1 / 32x1 nonsense).
+
+Sampler words: only 000e0000/00c00780 (nearest) and 028e0000/00c00780 (linear) occur in this capture too (draw 5 of pass 9 = 028e0000, linear).
+
+### Glue for the kernel (S8Agx.cpp execComposite, around line 1182)
+Replace the "size/format words are not decoded yet" branch by the descriptor. `s8t_desc_decode()` now returns 0 and fills va, width, height, fmt, layout and a tight pitch for every real record, so:
+```
+if (r8tva == 0 && ok == 0 && s8s_texrec_va(w6, &tva) == 2) {          // form 2 = w2 bit 30: a real texture record
+    struct s8t_desc *td = &dc->tmpl.texd[dc->tmpl.ntex];                // already decoded: va, W x H, fmt, layout, pitch = W * bpp
+    // a texture that IS an IOSurface or an earlier pass's target keeps the surface's real pitch (it may be padded):
+    for each fVm[m] containing td->va with surf: td->pitch = ss->bytesPerRow; td->layout = LINEAR; (size and format stay from the descriptor)
+    // everything else (caller memory such as the 1x1 white, the half / R8 tables, the 153x64 widget) uses the descriptor as decoded
+} else { existing 0x8002 / attachment-form handling }
+```
+Do not force S8T_FMT_BGRA8 / the pass size any more (they were wrong for the widget, the 1x1 white and the tables). s8t_sample returns RGBA16F texels as floats directly (half conversion in the header), so the dither table and the bell curve are usable as soon as Agent H's f16 ops exist.
+
+### Remaining (updated)
+w0 bits 16-26 and the exact meaning of w3 / w4 / w5 (compression?); Morton tiling for big textures (no big Morton texture in any capture: all compositor textures are linear, only tiny tables and 464a are Morton); mips; wrap / min-mag split; the LA8 icon geometry (needs texels). Experiments E1-E3 of sec. 8 remain the way to pin the format code bits (E2) and the sampler bits (E3).

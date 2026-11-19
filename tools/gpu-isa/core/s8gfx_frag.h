@@ -578,6 +578,10 @@ s8f_step_frag(struct s8f_ctx * c, const uint8_t * b, unsigned avail)
 		uint16_t y = (b[6] >> 6) >= 2 ? s8f_gh(c, b[6] & 0x3f) : sf_f2h(sf_minifloat(b[6]));
 		int cc = b[7] >> 5, cond;
 
+#ifdef S8F_CC_SEARCH                                            /* host experiment only: override the condition code per opcode (tests/hh_cc.sh) */
+		cc = (op == 0x56) ? S8F_CC56 : (op == 0x36) ? S8F_CC36 : cc;
+#endif
+
 		switch (cc) {
 		case 1: cond = s8f_lt(a, bb); break;
 		case 2: cond = s8f_lt(bb, a); break;

@@ -25,7 +25,13 @@ int main(int argc, char ** argv)
 				printf("  %04x%c", pc, pc == entry ? '*' : ' ');
 				for (unsigned i = 0; i < n; i++) printf(" %02x", buf[pc + i]);
 				printf("\n");
-				if (buf[pc] == 0x08 && buf[pc + 1] == 1) break;
+				if (buf[pc] == 0x08 && buf[pc + 1] == 1) {
+					if (argc <= 3 || pc > entry + 8) break;          /* 3rd argument: keep listing the shaders that follow in the image up to the one containing the entry + 8 */
+					pc += 4;
+					while (pc + 2 <= len && buf[pc] == 0x08 && buf[pc + 1] == 0) pc += 2;
+					printf("  ---- next shader\n");
+					continue;
+				}
 				pc += n;
 			}
 		}

@@ -6,9 +6,10 @@
  *   s8t_sampler_decode() 2-word sampler state (as pushed by the 0x13 push record)        -> struct s8t_sampler
  *   s8t_sample()         u, v (normalised, float bits) -> RGBA float bits, nearest or bilinear, level 0 only
  *
- * What is verified on captured data (capture9, 4x4 RGBA8): the texel address (word2 << 2), Morton addressing with y in the LOW bit, RGBA8 byte order,
- * and the nearest / linear bit of the sampler word. Everything else (size field, format field, wrap modes, min/mag split, tiling of large textures)
- * is a HYPOTHESIS; the struct fields can be filled in by hand (s8t_desc_make) when the caller knows better (e.g. from the IOGPU resource size).
+ * Verified on captured data: the texel address (word2 << 2 | bit 30 = VA bit 32), width / height fields of word0/word1 (capture9 4x4 and capture21: 153x64, 128x74,
+ * 696x437, 694x79, 1440x2960, 256x1, 128x1), Morton (y in the LOW bit) for the 4x4 test texture and linear tight packing for the BGRA8 widget, the format codes
+ * listed at s8t_desc_decode (RGBA8, BGRA8, R8 table, A8 masks, RGBA16F table), and the nearest / linear bit of the sampler word. Wrap modes, min/mag split, tiling
+ * of large Morton textures, mips and the stride word are NOT decoded; the struct fields can be filled in by hand (s8t_desc_make).
  * Filtering model (assumption, no hardware oracle exists yet): coordinates and texel positions in 16.16 fixed point, bilinear weights truncated to
  * 8 bits, the result sum(w * texel8) / (65536 * 255) rounded to nearest by the soft float divide.
  */
@@ -17,7 +18,9 @@
 
 #include "s8gfx_sf.h"
 
-enum { S8T_FMT_RGBA8 = 0, S8T_FMT_BGRA8 = 1, S8T_FMT_R8 = 2, S8T_FMT_A8 = 3 };      /* A8: one byte per texel returned in the ALPHA channel (0,0,0,v): the compositor's 0x8002 glyph / mask textures */
+enum { S8T_FMT_RGBA8 = 0, S8T_FMT_BGRA8 = 1, S8T_FMT_R8 = 2, S8T_FMT_A8 = 3, S8T_FMT_RGBA16F = 4, S8T_FMT_LA8 = 5 };
+/* A8: one byte per texel returned in the ALPHA channel (0,0,0,v): the compositor's 0x8002 glyph / mask textures. RGBA16F: 8 bytes per texel (the dither table, code 0x4642).
+ * LA8: 2 bytes per texel, returned as (L, L, L, A) (IOSurface LA08 icons, code 0x0142; byte order L then A is an assumption). */
 enum { S8T_LAYOUT_MORTON = 0, S8T_LAYOUT_LINEAR = 1 };
 enum { S8T_WRAP_CLAMP_EDGE = 0, S8T_WRAP_REPEAT = 1, S8T_WRAP_MIRROR = 2, S8T_WRAP_ZERO = 3 };
 
@@ -40,7 +43,7 @@ struct s8t_sampler {
 static inline uint32_t
 s8t_bpp(uint32_t fmt)
 {
-	return (fmt == S8T_FMT_R8 || fmt == S8T_FMT_A8) ? 1 : 4;
+	return (fmt == S8T_FMT_R8 || fmt == S8T_FMT_A8) ? 1 : fmt == S8T_FMT_LA8 ? 2 : fmt == S8T_FMT_RGBA16F ? 8 : 4;
 }
 
 static inline void
@@ -57,38 +60,38 @@ s8t_desc_make(struct s8t_desc * d, uint64_t va, uint32_t w, uint32_t h, uint32_t
 }
 
 /*
- * Decode a texture state record. Recognised: low 16 bits of word 0 = 0x050a (both the texture record 1b44050a and the render target record 1fe3050a carry it).
- *   word2          = VA >> 2                                         [verified: 0x40001440 -> 0x100005100]
- *   word1 bits 0-10 = 0x800 - (0x800 >> k) for a (square) size of 2^k  [hypothesis from two points: 4x4 -> 0x600, 64x64 -> 0x7e0]
- *   word0 >> 16    = 0x1b44 -> RGBA8 2D (only value seen); anything else is taken as RGBA8 too, known = 0
- * Returns 0 when the record is recognised, -1 otherwise (d is still filled with defaults).
+ * Decode a texture state record (6 words; capture9 and the real compositor capture21 fix this layout, see analysis/texture-state.md sec. 9):
+ *   word0 bits 0-15  = type code: bit 3 = layout (1 Morton, 0 linear), (code & ~8) selects the format: 0x0502 RGBA8, 0x5982 BGRA8, 0x0002 R8, 0x8002 A8,
+ *                      0x4642 RGBA16F, 0x0142 LA8, 0x54c2 BGRA8 (the display surface); unlisted codes are taken as BGRA8 and known = 0
+ *   (word0 >> 27) | (word1 & 0x1ff) << 5   = width - 1   (14 bits)
+ *   (word1 >> 9) & 0x3fff                  = height - 1  (14 bits)
+ *   word2 = VA >> 2, bit 30 = VA bit 32;  word3 (stride-like, undecoded), word4/5 = end-of-pixels pointer (VA >> 4) and size of the lossless-compression metadata, ignored
+ * Linear textures are tightly packed here (pitch = width * bpp, verified on the 153x64 BGRA8 widget); the caller overrides pitch / size (s8t_desc_make) for passes' targets.
+ * Returns 0 when the record is recognised (word2 has VA bit 32 and (word0 & 7) == 2), -1 otherwise.
  */
 static inline int
 s8t_desc_decode(struct s8t_desc * d, const uint32_t w[6])
 {
-	uint32_t m = w[1] & 0x7ff;
-	uint32_t k = 0;
-	uint32_t size = 0;
+	uint32_t code = w[0] & 0xffff;
 
-	d->va = (uint64_t)w[2] << 2;
-	d->fmt = S8T_FMT_RGBA8;
-	d->layout = S8T_LAYOUT_MORTON;
+	d->va = ((uint64_t)(w[2] & 0x3fffffffu) << 2) | ((w[2] & 0x40000000u) ? 0x100000000ull : 0);
+	d->fmt = S8T_FMT_BGRA8;
+	d->layout = (code & 8) ? S8T_LAYOUT_MORTON : S8T_LAYOUT_LINEAR;
 	d->levels = 1;
-	d->known = 0;
-	if ((w[0] & 0xffff) != 0x050a || m == 0) {
-		d->width = d->height = 0;
-		d->pitch = 0;
-		return -1;
+	d->known = 1;
+	switch (code & ~8u) {
+	case 0x0502: d->fmt = S8T_FMT_RGBA8; break;
+	case 0x5982: case 0x54c2: break;
+	case 0x0002: d->fmt = S8T_FMT_R8; break;
+	case 0x8002: d->fmt = S8T_FMT_A8; break;
+	case 0x4642: d->fmt = S8T_FMT_RGBA16F; break;
+	case 0x0142: d->fmt = S8T_FMT_LA8; break;
+	default: d->known = 0; break;
 	}
-	/* m = 0x800 - 0x800 / size: the lowest set bit is at 11 - k */
-	while (!((m >> k) & 1)) {
-		k++;
-	}
-	size = 1u << (11 - k);
-	d->width = d->height = size;
-	d->pitch = size * 4;
-	d->known = ((w[0] >> 16) == 0x1b44);
-	return 0;
+	d->width = ((w[0] >> 27) | ((w[1] & 0x1ffu) << 5)) + 1;
+	d->height = ((w[1] >> 9) & 0x3fffu) + 1;
+	d->pitch = d->width * s8t_bpp(d->fmt);
+	return ((w[0] & 7) == 2 && (w[2] & 0x40000000u)) ? 0 : -1;
 }
 
 /* sampler state, two words. word0 bit 23 = linear (magnify), bit 25 = linear (minify): both set by filter::linear, both clear for nearest [verified as a pair]. Wrap modes: not decoded (clamp_to_edge). */
@@ -180,6 +183,11 @@ s8t_fetch(const struct s8t_desc * d, uint32_t (*rd)(void *, uint64_t va), void *
 	if (d->fmt == S8T_FMT_A8) {
 		c[0] = c[1] = c[2] = 0;
 		c[3] = (v >> (8 * (a & 3))) & 0xff;
+	} else if (d->fmt == S8T_FMT_LA8) {
+		uint32_t h = (v >> (8 * (a & 3))) & 0xffff;
+
+		c[0] = c[1] = c[2] = h & 0xff;
+		c[3] = h >> 8;
 	} else if (d->fmt == S8T_FMT_R8) {
 		c[0] = (v >> (8 * (a & 3))) & 0xff;
 		c[1] = c[2] = 0;
@@ -195,6 +203,41 @@ s8t_fetch(const struct s8t_desc * d, uint32_t (*rd)(void *, uint64_t va), void *
 		c[2] = (v >> 16) & 0xff;
 		c[3] = v >> 24;
 	}
+}
+
+/* IEEE half -> float bits (denormal halves flush to zero like the soft float does) */
+static inline f32b
+s8t_half(uint32_t h)
+{
+	uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 0x3ff;
+
+	if (e == 0) {
+		return s << 31;
+	}
+	if (e == 31) {
+		return (s << 31) | 0x7f800000u | (m << 13);
+	}
+	return (s << 31) | ((e + 112) << 23) | (m << 13);
+}
+
+/* RGBA16F texel (x, y) as float bits; outside (x or y < 0) = 0 */
+static inline void
+s8t_fetch_f(const struct s8t_desc * d, uint32_t (*rd)(void *, uint64_t va), void * ctx, int32_t x, int32_t y, f32b c[4])
+{
+	uint64_t a;
+	uint32_t lo, hi;
+
+	if (x < 0 || y < 0) {
+		c[0] = c[1] = c[2] = c[3] = 0;
+		return;
+	}
+	a = d->va + s8t_texel_offset(d, (uint32_t)x, (uint32_t)y);
+	lo = rd(ctx, a);
+	hi = rd(ctx, a + 4);
+	c[0] = s8t_half(lo & 0xffff);
+	c[1] = s8t_half(lo >> 16);
+	c[2] = s8t_half(hi & 0xffff);
+	c[3] = s8t_half(hi >> 16);
 }
 
 /* a * 2^16 as int32 (rounded to nearest at 2^-16, saturating); >> 16 of the result is the floor */
@@ -234,6 +277,10 @@ s8t_sample(const struct s8t_desc * d, const struct s8t_sampler * s, f32b u, f32b
 		int32_t fx = s8t_fix16_floor(su), fy = s8t_fix16_floor(sv);
 		int32_t x = fx >> 16, y = fy >> 16;     /* arithmetic shift = floor */
 
+		if (d->fmt == S8T_FMT_RGBA16F) {
+			s8t_fetch_f(d, rd, ctx, s8t_wrap(x, W, s->wrap_s), s8t_wrap(y, H, s->wrap_t), out);
+			return;
+		}
 		s8t_fetch(d, rd, ctx, s8t_wrap(x, W, s->wrap_s), s8t_wrap(y, H, s->wrap_t), c);
 		for (k = 0; k < 4; k++) {
 			out[k] = sf_div(sf_from_i64(c[k]), 0x437f0000u);
@@ -256,6 +303,26 @@ s8t_sample(const struct s8t_desc * d, const struct s8t_sampler * s, f32b u, f32b
 		ys[0] = s8t_wrap(y0, H, s->wrap_t);
 		ys[1] = s8t_wrap(y0 + 1, H, s->wrap_t);
 		wt[0] = w00; wt[1] = w10; wt[2] = w01; wt[3] = w11;
+		if (d->fmt == S8T_FMT_RGBA16F) {
+			f32b facc[4] = { 0, 0, 0, 0 }, tf[4];
+
+			for (i = 0; i < 4; i++) {
+				f32b wf;
+
+				if (wt[i] == 0) {
+					continue;
+				}
+				wf = sf_div(sf_from_i64(wt[i]), sf_from_i64(65536));
+				s8t_fetch_f(d, rd, ctx, xs[i & 1], ys[i >> 1], tf);
+				for (k = 0; k < 4; k++) {
+					facc[k] = sf_fma(tf[k], wf, facc[k]);
+				}
+			}
+			for (k = 0; k < 4; k++) {
+				out[k] = facc[k];
+			}
+			return;
+		}
 		for (i = 0; i < 4; i++) {
 			if (wt[i] == 0) {
 				continue;
