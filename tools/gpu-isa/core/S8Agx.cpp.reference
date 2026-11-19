@@ -796,6 +796,8 @@ comp_emit(void * vctx, int px, int py, const f32b * v)
 	fc.has_tile = 1;
 	fc.sr[48] = (uint32_t)px & 31;
 	fc.sr[49] = (uint32_t)py & 31;
+	fc.sr[16] = (uint32_t)px;               /* pixel coordinates (dither texture lookups: e2 .. sr 0x10/0x11) */
+	fc.sr[17] = (uint32_t)py;
 	dc->pixels++;
 	if (s8f_run(&fc, dc->frag, dc->fraglen) && fc.stored) {
 		uint32_t sb = sf_to_unorm8(fc.out[2]), sg = sf_to_unorm8(fc.out[1]), sr = sf_to_unorm8(fc.out[0]), sa = sf_to_unorm8(fc.out[3]);

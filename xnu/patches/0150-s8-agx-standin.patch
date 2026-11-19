@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..1230bd6
+index 0000000..0e3886c
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,2019 @@
+@@ -0,0 +1,2021 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -802,6 +802,8 @@ index 0000000..1230bd6
 +	fc.has_tile = 1;
 +	fc.sr[48] = (uint32_t)px & 31;
 +	fc.sr[49] = (uint32_t)py & 31;
++	fc.sr[16] = (uint32_t)px;               /* pixel coordinates (dither texture lookups: e2 .. sr 0x10/0x11) */
++	fc.sr[17] = (uint32_t)py;
 +	dc->pixels++;
 +	if (s8f_run(&fc, dc->frag, dc->fraglen) && fc.stored) {
 +		uint32_t sb = sf_to_unorm8(fc.out[2]), sg = sf_to_unorm8(fc.out[1]), sr = sf_to_unorm8(fc.out[0]), sa = sf_to_unorm8(fc.out[3]);
