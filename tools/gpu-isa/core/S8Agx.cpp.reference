@@ -858,10 +858,17 @@ AGXDeviceUserClient::execComposite(void)
 			uint64_t ta = 0;
 
 			if (!streamRd(this, p->stream, &first) || first != 0x80000001u || p->width == 0 || p->height == 0 || p->width > 4096 || p->height > 4096) {
+				if (OSIncrementAtomic((SInt32 *)&xlogged) < 300) {
+					IOLog("S8AGX: comp: skip pass %d/%d: stale block (stream 0x%llx first %08x %ux%u)\n", pi, np, (unsigned long long)p->stream, (unsigned)first,
+					    (unsigned)p->width, (unsigned)p->height);
+				}
 				continue;                       /* stale block */
 			}
 			s8s_pass_target(streamRd, this, p);
 			if (!p->has_target || !resolveVa(p->target_va, &tp, &ta)) {
+				if (OSIncrementAtomic((SInt32 *)&xlogged) < 300) {
+					IOLog("S8AGX: comp: skip pass %d/%d: target 0x%llx has_target %u not resolvable\n", pi, np, (unsigned long long)p->target_va, (unsigned)p->has_target);
+				}
 				continue;
 			}
 			uint32_t pitch = p->width * 4;
@@ -877,6 +884,10 @@ AGXDeviceUserClient::execComposite(void)
 				}
 			}
 			if ((uint64_t)pitch * p->height > ta) {
+				if (OSIncrementAtomic((SInt32 *)&xlogged) < 300) {
+					IOLog("S8AGX: comp: skip pass %d/%d: target 0x%llx too small (pitch %u x %u > avail 0x%llx)\n", pi, np, (unsigned long long)p->target_va, (unsigned)pitch,
+					    (unsigned)p->height, (unsigned long long)ta);
+				}
 				continue;
 			}
 			struct s8s_stats st;
@@ -897,9 +908,16 @@ AGXDeviceUserClient::execComposite(void)
 				int32_t dX = 0, dY = 0;
 
 				if (d->kind == S8S_DRAW_OTHER || d->count < 3 || d->count > 4000 || (d->prim != 6 && d->prim != 9)) {
+					if (OSIncrementAtomic((SInt32 *)&xlogged) < 300) {
+						IOLog("S8AGX: comp: skip pass %d draw %d: kind %u prim %u count %u\n", pi, di, (unsigned)d->kind, (unsigned)d->prim, (unsigned)d->count);
+					}
 					continue;
 				}
 				if (!findResRegion(d->vs.entry, &vbase, &voff, &vlen) || !findResRegion(d->fs.entry, &fbase, &foff, &flen)) {
+					if (OSIncrementAtomic((SInt32 *)&xlogged) < 300) {
+						IOLog("S8AGX: comp: skip pass %d draw %d: program not in shared memory (vs 0x%llx fs 0x%llx)\n", pi, di, (unsigned long long)d->vs.entry,
+						    (unsigned long long)d->fs.entry);
+					}
 					continue;
 				}
 				vstart = s8v_find_start(vbase, (unsigned)(vlen > 0xffffffffULL ? 0xffffffffU : vlen), (unsigned)voff);
