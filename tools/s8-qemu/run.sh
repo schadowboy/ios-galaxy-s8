@@ -25,7 +25,7 @@ QEMU=${S8_QEMU:-$S8_WORK/qemu-build/qemu-system-aarch64}
 BASE=${S8_DISK_BASE:-/root/work/s8qemu-ufs0.img}   # make_gpt.py output (docs/platform.md 4.2)
 export PATH="$PATH:$S8_WORK/qemu-build"       # qemu-img from our build if not installed
 OVERLAY=$S8_WORK/run/overlay.qcow2
-GDB=""; WAIT=""; SNAP=""; HEADLESS=0; CROP=0; FRESH=0; PAYLOAD=1; BOOTARGS=""; MEM=2560M; SMP=4
+GDB=""; WAIT=""; SNAP=""; HEADLESS=0; CROP=0; FRESH=0; PAYLOAD=1; BOOTARGS=""; MEM=4G; SMP=4
 while [ $# -gt 0 ]; do
   case "$1" in
     --gdb) GDB=1 ;;
