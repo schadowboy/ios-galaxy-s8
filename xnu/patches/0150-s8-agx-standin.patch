@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..2e6eb2c
+index 0000000..2ea5077
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,2423 @@
+@@ -0,0 +1,2430 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -755,7 +755,8 @@ index 0000000..2e6eb2c
 +	return 0;
 +}
 +
-+static uint32_t gPxBudget = 1500000;            /* boot-arg s8agxpx: fragment invocations per submit (software shading is slow) */
++static uint32_t gDrawPx = 800000;               /* boot-arg s8agxdrawpx: shaded-pixel cap per draw */
++static uint32_t gPxBudget = 1500000;           /* boot-arg s8agxpx: fragment invocations per submit (software shading is slow) */
 +
 +/* Dump a window of a program region around an entry point as an extra capture region (same "D"/"L" line format as dumpSparse; id 9000+): a host renderer
 + * then replays the draws with the very programs this boot compiled. Each entry address is dumped once. */
@@ -875,7 +876,8 @@ index 0000000..2e6eb2c
 +	int w, h;
 +	int blend;
 +	uint32_t pixels, unknown, stored;
-+	uint32_t firstOut, lastOut;     /* the first and the last stored pixel (diagnostics) */
++	uint32_t cap;                   /* shaded-pixel cap of this draw (a monster backdrop draw must not eat the whole submit budget) */
++	uint32_t firstOut, lastOut;    /* the first and the last stored pixel (diagnostics) */
 +	uint32_t texw[S8F_NTEX][6];     /* raw texture-state words of each bound texture (diagnostics: descriptor decoding) */
 +	uint32_t smpw[S8F_NTEX][2];     /* raw sampler words */
 +	int workInit;                   /* the per-pixel context was initialised from the template for this draw */
@@ -897,6 +899,9 @@ index 0000000..2e6eb2c
 +		return;
 +	}
 +	dst = (uint32_t *)(dc->target + (uint64_t)py * dc->pitch + (uint64_t)px * 4);
++	if (!dc->constant && !dc->tileOnly && dc->pixels >= dc->cap) {
++		return;
++	}
 +	dc->pixels++;
 +	{
 +		uint32_t sb = 0, sg = 0, sr = 0, sa = 0, dv = *dst;
@@ -1109,6 +1114,7 @@ index 0000000..2e6eb2c
 +					vp[3] = sf_from_i64(-(int64_t)p->height / 2);
 +				}
 +				bzero(dc, sizeof(*dc));
++				dc->cap = gDrawPx;
 +				bzero(uni, sizeof(uni));
 +				bindUniforms(&d->vs, uni);
 +				bindUniforms(&d->fs, dc->tmpl.uni);          /* the fragment stage has its own uniform file */
@@ -2381,6 +2387,7 @@ index 0000000..2e6eb2c
 +	PE_parse_boot_argn("s8agxprogs", gProgName, sizeof(gProgName));
 +	PE_parse_boot_argn("s8agxskip", &gSkip, sizeof(gSkip));
 +	PE_parse_boot_argn("s8agxpx", &gPxBudget, sizeof(gPxBudget));
++	PE_parse_boot_argn("s8agxdrawpx", &gDrawPx, sizeof(gDrawPx));
 +	PE_parse_boot_argn("s8agxnotex", &gNoTex, sizeof(gNoTex));
 +	PE_parse_boot_argn("s8agxnoprog", &gNoProgDump, sizeof(gNoProgDump));
 +	PE_parse_boot_argn("s8agxkeepdither", &gKeepDither, sizeof(gKeepDither));
