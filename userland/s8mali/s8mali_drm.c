@@ -567,7 +567,14 @@ drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
 	return 0;
 }
 
-/* Buffers and sync objects as file descriptors for other programs and drivers, and timelines: none of that here. */
+/*
+ * Buffers as file descriptors for other programs: there are none. Memory somebody else made does come in, as the S9+ shim
+ * does it: an IOSurface, by its ID, where Linux's driver expects a dma-buf descriptor (Mesa's pan_kmod_bo_import ->
+ * drmPrimeFDToHandle(fd, surface_id), with the S9+ hunks of panfrost-darwin.patch, NOT in our Mesa patches yet). The kernel
+ * selector 0x7e is NOT in S8Mali yet (s8mali_drm.h, struct s8mali_surface), so today this fails with ENOSYS from the
+ * kernel's kIOReturnUnsupported, which is what Mesa's caller expects of a surface it could not make a buffer of (it then
+ * copies). Exporting a buffer (drmPrimeHandleToFD) stays unsupported: nobody needs it.
+ */
 int
 drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
 {
@@ -581,28 +588,61 @@ drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
 int
 drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 {
+	struct s8mali_surface request;
+	int error;
+
 	(void)fd;
-	(void)prime_fd;
-	(void)handle;
-	return none();
+	if (!opened) {
+		return none();
+	}
+	memset(&request, 0, sizeof(request));
+	request.surface = (uint32_t)prime_fd; /* (the IOSurface's ID) */
+	error = call(S8MALI_SEL_SURFACE, &request, sizeof(request));
+	if (error != 0) {
+		errno = error;
+		return -1;
+	}
+	*handle = request.handle;
+	return 0;
 }
 
 int
+s8mali_surface(int fd, struct s8mali_surface *surface)
+{
+	int error;
+
+	(void)fd;
+	if (!opened) {
+		return none();
+	}
+	surface->handle = S8MALI_SURFACE_DESCRIBE;
+	error = call(S8MALI_SEL_SURFACE, surface, sizeof(*surface));
+	if (error != 0) {
+		errno = error;
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Sync objects as file descriptors (what EGL's fence fd and Linux's syncobj fd are): here, as the sync files above, another
+ * descriptor of /dev/null with the job number kept beside it. Both directions carry the same number.
+ */
+int
 drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle)
 {
-	(void)fd;
-	(void)obj_fd;
-	(void)handle;
-	return none();
+	int error = drmSyncobjCreate(fd, 0, handle);
+
+	if (error != 0) {
+		return error;
+	}
+	return drmSyncobjImportSyncFile(fd, *handle, obj_fd);
 }
 
 int
 drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd)
 {
-	(void)fd;
-	(void)handle;
-	(void)obj_fd;
-	return none();
+	return drmSyncobjExportSyncFile(fd, handle, obj_fd);
 }
 
 int

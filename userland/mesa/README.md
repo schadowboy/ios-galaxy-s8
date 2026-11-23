@@ -18,6 +18,11 @@ Patches (`patches/`, applied with `git apply`; regenerate with `tools/mesa-mkpat
 
 `overlay/src/s8-drm/`: `xf86drm.h` stand-in and `s8_drm_stub.c` (weak functions, all failing, so the library falls back to softpipe).
 
-Missing: the real DRM implementation (`userland/s8mali/s8mali_drm.c` lacks drmPrimeFDToHandle, drmSyncobj*, drmCommandWrite*,
-drmGetCap); IOSurface import (S9+ pan_kmod.c/pan_bo.c hunks) is not ported. Dylib install names are Meson's default
-(`@rpath/...`); use `install_name_tool -id` as needed.
+DRM side (`userland/s8mali/s8mali_drm.c`, handed to Mesa as a `s8_drm_ops` table by `userland/hook/gl_osmesa_s8.c` / `s8gl_test.c`):
+what Mesa 25.0.7's panfrost uses is implemented: drmOpenWithType/drmIoctl (all panfrost selectors)/drmGetVersion/drmCloseBufferHandle/
+drmCommandWrite(Read)/drmGetCap (all 0)/drmSyncobj{Create,Destroy,Reset,Wait,Import/ExportSyncFile,FDToHandle,HandleToFD} (job numbers kept
+in the process)/hakios_drm_map+unmap. Still failing on purpose: drmPrimeHandleToFD, drmSyncobjTimelineWait, drmSyncobjTransfer (ENOSYS; panthor/
+export only). drmPrimeFDToHandle calls kernel selector 0x7e (IOSurface as a buffer, `struct s8mali_surface` in `s8mali_drm.h`, semantics
+written there) which S8Mali does not implement yet, so it fails with ENOSYS; the Mesa side of it (S9+ `panfrost-darwin.patch` hunks in pan_kmod.c,
+pan_bo.c, the osmesa target's `osmesa_surface_resource`, and `glEGLImageTargetTexture2DOES` taking the surface ID) is NOT ported (would be
+patch 0006). Dylib install names are Meson's default (`@rpath/...`); use `install_name_tool -id` as needed.

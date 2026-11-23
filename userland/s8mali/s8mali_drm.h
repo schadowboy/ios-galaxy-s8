@@ -40,7 +40,11 @@
 #define DRM_PANFROST_GET_BO_OFFSET 0x05
 #define DRM_PANFROST_MADVISE 0x08
 #define S8MALI_SEL_GEM_CLOSE 0x09 /* DRM_IOCTL_GEM_CLOSE & 0xff */
+#define S8MALI_SEL_SURFACE_SEQ 0x7c /* S9+ HakiosMali kHakiosMaliSurfaceSeq: the job after which an IOSurface is drawn (NOT in S8Mali yet) */
 #define S8MALI_SEL_WAIT_SEQ 0x7d  /* wait for a job by its number (struct s8mali_wait_seq) */
+#define S8MALI_SEL_SURFACE 0x7e   /* S9+ kHakiosMaliSurface: an IOSurface's memory as a buffer (struct s8mali_surface) (NOT in S8Mali yet) */
+#define S8MALI_SEL_SHOW 0x7f      /* S9+ kHakiosMaliShow: a test's pixels onto the panel (not needed) */
+#define S8MALI_SURFACE_DESCRIBE 0xffffffffu /* struct s8mali_surface.handle: only describe the buffer, make none */
 
 #ifndef _PANFROST_DRM_H_ /* Mesa's uapi header, if one is included instead */
 #define PANFROST_BO_NOEXEC 1
@@ -113,6 +117,31 @@ struct s8mali_wait_seq {
 	uint64_t seq;
 	int64_t timeout_ns; /* relative */
 };
+/*
+ * Selector 0x7e (the S9+ project's HakiosMali kHakiosMaliSurface, hakios.mali.cpp struct mali_surface; 48 bytes), which S8Mali
+ * does NOT implement yet (kIOReturnUnsupported -> ENOSYS). Semantics, from the S9+ shim (hakios.drm.c drmPrimeFDToHandle and
+ * hakios_drm_surface): the kernel looks the IOSurface up by `surface` (its ID, what IOSurfaceGetID() returns; for us a
+ * SweetSurface of patch 0046) and
+ *   - handle == S8MALI_SURFACE_DESCRIBE: only fills size/offset/row_bytes/width/height/pixel_format/planes (describe);
+ *   - otherwise: makes a BO of the surface's own memory in the GPU address space (every page of it mapped RW into AS0 like a
+ *     CREATE_BO buffer, same VA rules: 0x2000000..4 GiB, 16 KiB aligned), keeps the surface alive while the BO exists,
+ *     returns the new BO handle in `handle` (the same handle then works with GET_BO_OFFSET, SUBMIT's bo_handles and
+ *     GEM_CLOSE; the CPU mapping is the surface's, no IOConnectMapMemory64 needed), `size` = the BO's size, `offset` = where
+ *     the pixels start inside it, `row_bytes` = bytes a row. Asking twice for one surface returns the same handle (the shim
+ *     calls this with the driver's table of BOs locked in the S9+ code); the BO ends at GEM_CLOSE or when the surface goes.
+ * Memory attributes: the S9+ driver used write-combined/uncached memory for surfaces the GPU draws; S8's SweetSurface memory
+ * is ordinary cached kernel memory, so the kernel side must either remap it uncached/WC for the CPU or clean/invalidate the
+ * data cache around jobs (FlushPoC_DcacheRegion) -- the GPU is not coherent. That is the "kernel work" this needs.
+ * 0x7c (surface seq) lets the display driver wait for the job that drew a surface; for us hook_gl_surface_wait()/glFinish
+ * does that in user space before AppleCLCD::swap reads the pixels (gpu-plan.md), so 0x7c is not needed first.
+ */
+struct s8mali_surface {
+	uint32_t surface; /* in: the IOSurface's ID */
+	uint32_t handle;  /* in: S8MALI_SURFACE_DESCRIBE or anything else (make the BO); out: the BO's handle */
+	uint64_t size;    /* out: how big the buffer is */
+	uint32_t offset, row_bytes; /* out: where the pixels start in it and how long a row of them is */
+	uint32_t width, height, pixel_format, planes; /* out: and what they are */
+};
 
 /* ioctl codes as Linux's: only the low byte (the selector) and the size (IOCPARM_LEN) are used */
 #define S8MALI_IOCTL(n, type) _IOWR('d', DRM_COMMAND_BASE + (n), type)
@@ -135,13 +164,34 @@ typedef struct _drmVersion {
 	char *desc;
 } drmVersion, *drmVersionPtr;
 
-/* All return 0 / a fd >= 0 / a pointer, or -1 (MAP_FAILED, NULL) with errno. */
+/* All return 0 / a fd >= 0 / a pointer, or -1 (MAP_FAILED, NULL) with errno (drmCommand*: 0 or minus an errno, as libdrm's). */
 int drmOpenWithType(const char *name, const char *busid, int type);
 int drmIoctl(int fd, unsigned long request, void *arg);
 drmVersionPtr drmGetVersion(int fd);
 void drmFreeVersion(drmVersionPtr version);
 int drmCloseBufferHandle(int fd, uint32_t handle);
 void drmClose(int fd);
+int drmCommandWrite(int fd, unsigned long index, const void *data, unsigned long size);
+int drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size);
+int drmGetCap(int fd, uint64_t capability, uint64_t *value);
+/* an IOSurface comes in by its ID where Linux has a dma-buf descriptor: needs the kernel's selector 0x7e (see above) */
+int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd);
+int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle);
+int s8mali_surface(int fd, struct s8mali_surface *surface); /* describe only (selector 0x7e, handle = DESCRIBE): 0 or -1/errno */
+/* sync objects = job numbers kept in this process (the kernel has numbers, not fences) */
+int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle);
+int drmSyncobjDestroy(int fd, uint32_t handle);
+int drmSyncobjReset(int fd, const uint32_t *handles, uint32_t count);
+int drmSyncobjWait(int fd, uint32_t *handles, unsigned count, int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled);
+int drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle);
+int drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd);
+int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd);
+int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd);
+int drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned count, int64_t timeout_nsec, unsigned flags,
+    uint32_t *first_signaled);
+int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle, uint64_t src_point, uint32_t flags);
+/* wait up to `seconds` for the S8Mali service to be registered (1: found) */
+int s8mali_wait_service(int seconds);
 void *hakios_drm_map(int fd, uint32_t handle, uint64_t size);
 void hakios_drm_unmap(int fd, uint32_t handle, void *address);
 
