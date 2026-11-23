@@ -95,15 +95,13 @@ s8rtc_regs_to_epoch(const uint8_t r[S8RTC_NREGS], unsigned min_year, int64_t * s
 
 #ifndef S8RTC_HOST_TEST
 
-extern "C" {
+#include <IOKit/IOLib.h>
 #include <mach/mach_types.h>
 #include <mach/mach_time.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
-}
-#include <IOKit/IOLib.h>
 
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 

@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..1111111
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Rtc.cpp
-@@ -0,0 +1,434 @@
+@@ -0,0 +1,432 @@
 +/*
 + * S8Rtc: write-back of the wall clock to the S2MPS17 PMIC RTC of the Galaxy S8 (patch 0151).
 + *
@@ -101,15 +101,13 @@ index 0000000..1111111
 +
 +#ifndef S8RTC_HOST_TEST
 +
-+extern "C" {
++#include <IOKit/IOLib.h>
 +#include <mach/mach_types.h>
 +#include <mach/mach_time.h>
 +#include <kern/clock.h>
 +#include <kern/locks.h>
 +#include <libkern/libkern.h>
 +#include <pexpert/pexpert.h>
-+}
-+#include <IOKit/IOLib.h>
 +
 +extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +
