@@ -1,0 +1,41 @@
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1386,6 +1386,14 @@ PEGetUTCTimeOfDay(clock_sec_t * secs, clock_usec_t * usecs)
+ 		gIOPlatform->getUTCTimeOfDay(secs, &nsecs);
+ 	}
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* 0151: boot-arg s8rtcwrite=1|2 reads the PMIC RTC directly (iokit/Kernel/arm/S8Rtc.cpp); s8rtc= below stays the fallback */
++	extern bool s8_rtc_get_utc(uint64_t *secs, uint32_t *nsecs);
++	uint64_t s8secs = 0;
++	uint32_t s8ns = 0;
++	if (*secs == 0 && s8_rtc_get_utc(&s8secs, &s8ns)) {
++		*secs = (clock_sec_t)s8secs;
++		nsecs = (clock_nsec_t)s8ns;
++	}
+ 	uint64_t s8rtc = 0;
+ 	if (*secs == 0 && PE_parse_boot_argn("s8rtc", &s8rtc, sizeof(s8rtc)) && s8rtc) {
+ 		uint64_t ns;
+@@ -1406,6 +1414,11 @@ PESetUTCTimeOfDay(clock_sec_t secs, clock_usec_t usecs)
+ 	if (gIOPlatform) {
+ 		gIOPlatform->setUTCTimeOfDay(secs, usecs * NSEC_PER_USEC);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* 0151: write the time iOS sets through to the PMIC RTC (boot-arg s8rtcwrite=1|2, S8Rtc.cpp) */
++	extern void s8_rtc_set_utc(uint64_t secs, uint32_t usecs);
++	s8_rtc_set_utc((uint64_t)secs, (uint32_t)usecs);
++#endif
+ }
+
+ coprocessor_type_t
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -18,6 +18,7 @@ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitc
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/S8Mali.cpp                                      optional iokitcpp
+ iokit/Kernel/arm/S8Agx.cpp                                       optional iokitcpp
++iokit/Kernel/arm/S8Rtc.cpp                                       optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp

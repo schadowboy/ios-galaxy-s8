@@ -1,0 +1,435 @@
+/*
+ * S8Rtc: write-back of the wall clock to the S2MPS17 PMIC RTC of the Galaxy S8 (patch 0151).
+ *
+ * The loader (shim/dreamlte/pmic.c) reads the RTC at boot and passes it as boot-arg s8rtc= (UTC seconds at system-counter
+ * zero); patch 0124's PEGetUTCTimeOfDay adds the counter. Nothing wrote the RTC back, so a time set by iOS was lost at the
+ * next reboot. With boot-arg s8rtcwrite=1 (default OFF; =2 additionally initialises a reset RTC's control register) this file
+ *   - reads the RTC directly the first time XNU asks for the time (falls back to s8rtc= if the read fails or looks invalid),
+ *   - writes it when XNU sets the clock (PESetUTCTimeOfDay), logging 'S8RTC: wrote epoch N, readback M'.
+ *
+ * Register map and sequence follow Samsung's rtc-s2mps17.c / rtc-s2mp.h (CONFIG_RTC_DRV_S2MPS17, layout with MSEC) and the
+ * SPEEDY transfer follows shim/dreamlte/pmic.c speedy() (which works on the phone, also after ACPM is attached):
+ *   SPEEDY master 0x15b50000, slave 2 = RTC. 0x00 CTRL (bit0 BCD_EN, bit1 24h), 0x02 UPDATE (bit0 RUDR, bit1 WUDR,
+ *   bit2 FREEZE, bit4 AUDR), 0x03 CAPSEL, 0x04 MSEC, 0x05..0x0b SEC MIN HOUR WEEKDAY DATE MONTH YEAR, binary.
+ *   HOUR: bits 4:0 hour, bit 6 = PM flag (set for hour >= 12). WEEKDAY: one-hot 1 << tm_wday (Sunday = 0).
+ *   YEAR: year - 2000. Read: write UPDATE |= RUDR, wait 1 ms, read the 7 bytes. Write: write the 7 bytes, UPDATE |= WUDR,
+ *   wait 1 ms. See tools/rtc/RTC-NOTES.md.
+ *
+ * The pure time conversion between the register image and the Unix epoch lies between the 'pure begin/end' markers; tools/rtc
+ * compiles exactly that region on the host (test_s8rtc.sh).
+ */
+#if defined(ARM64_BOARD_CONFIG_A5XELTE)
+
+#include <stdint.h>
+
+/* ---- pure begin ---- */
+#define S8RTC_NREGS 7 /* SEC MIN HOUR WEEKDAY DATE MONTH YEAR */
+#define S8RTC_YEAR_MIN 2000
+#define S8RTC_YEAR_MAX 2099
+
+/* Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm). */
+static int64_t
+s8rtc_days_from_civil(int64_t y, unsigned m, unsigned d)
+{
+	y -= m <= 2;
+	int64_t era = (y >= 0 ? y : y - 399) / 400;
+	unsigned yoe = (unsigned)(y - era * 400);
+	unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+	unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	return era * 146097 + (int64_t)doe - 719468;
+}
+
+static void
+s8rtc_civil_from_days(int64_t z, int64_t * y, unsigned * m, unsigned * d)
+{
+	z += 719468;
+	int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+	unsigned doe = (unsigned)(z - era * 146097);
+	unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+	int64_t yy = (int64_t)yoe + era * 400;
+	unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	unsigned mp = (5 * doy + 2) / 153;
+	*d = doy - (153 * mp + 2) / 5 + 1;
+	*m = mp < 10 ? mp + 3 : mp - 9;
+	*y = yy + (*m <= 2);
+}
+
+/* Unix seconds -> the 7 register bytes (binary, 24 h with the PM flag, one-hot weekday). 0 on success, -1 if outside 2000..2099. */
+static int
+s8rtc_epoch_to_regs(uint64_t secs, uint8_t r[S8RTC_NREGS])
+{
+	if (secs < 946684800ULL || secs > 4102444799ULL) { /* 2000-01-01 .. 2099-12-31 */
+		return -1;
+	}
+	int64_t days = (int64_t)(secs / 86400);
+	unsigned rem = (unsigned)(secs % 86400);
+	int64_t y;
+	unsigned m, d;
+	s8rtc_civil_from_days(days, &y, &m, &d);
+	unsigned hour = rem / 3600;
+	r[0] = (uint8_t)(rem % 60);
+	r[1] = (uint8_t)(rem / 60 % 60);
+	r[2] = (uint8_t)(hour | (hour >= 12 ? 0x40 : 0));
+	r[3] = (uint8_t)(1u << (unsigned)((days + 4) % 7)); /* 1970-01-01 was a Thursday; Sunday = 0 */
+	r[4] = (uint8_t)d;
+	r[5] = (uint8_t)m;
+	r[6] = (uint8_t)(y - S8RTC_YEAR_MIN);
+	return 0;
+}
+
+/* The 7 register bytes -> Unix seconds, like the loader's decode (hour & 0x1f, the PM flag ignored). 0 on success, -1 if a field
+ * is out of range or the year is below min_year (a reset RTC reads year 2000). The weekday is not checked. */
+static int
+s8rtc_regs_to_epoch(const uint8_t r[S8RTC_NREGS], unsigned min_year, int64_t * secs)
+{
+	unsigned sec = r[0] & 0x7f, min = r[1] & 0x7f, hour = r[2] & 0x1f;
+	unsigned day = r[4] & 0x1f, mon = r[5] & 0x0f, year = S8RTC_YEAR_MIN + (r[6] & 0x7f);
+
+	if (sec > 59 || min > 59 || hour > 23 || day < 1 || mon < 1 || mon > 12 || year < min_year || year > S8RTC_YEAR_MAX) {
+		return -1;
+	}
+	*secs = s8rtc_days_from_civil(year, mon, day) * 86400 + (int64_t)hour * 3600 + (int64_t)min * 60 + sec;
+	return 0;
+}
+/* ---- pure end ---- */
+
+#ifndef S8RTC_HOST_TEST
+
+extern "C" {
+#include <mach/mach_types.h>
+#include <mach/mach_time.h>
+#include <kern/clock.h>
+#include <kern/locks.h>
+#include <kern/misc_protos.h>
+#include <libkern/libkern.h>
+#include <pexpert/pexpert.h>
+}
+#include <IOKit/IOLib.h>
+
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+extern "C" int s8_rtc_read_epoch(uint64_t * secs);
+extern "C" int s8_rtc_write_epoch(uint64_t secs);
+extern "C" bool s8_rtc_get_utc(uint64_t * secs, uint32_t * nsecs);
+extern "C" void s8_rtc_set_utc(uint64_t secs, uint32_t usecs);
+
+#define SPEEDY_PA       0x15b50000UL
+#define SPEEDY_SIZE     0x1000
+#define SP_FIFO_CTRL    0x004
+#define SP_CMD          0x008
+#define SP_INT_ENABLE   0x00c
+#define SP_INT_STATUS   0x010
+#define SP_TX_DATA      0x034
+#define SP_RX_DATA      0x038
+#define SP_FIFO_RESET   (1u << 31)
+#define SP_LEN(rx, tx)  ((rx) | (tx) << 8)
+#define SP_RANDOM       (1u << 19)
+#define SP_WRITE        (1u << 20)
+#define SP_SLAVE(x)     (((x) & 0xf) << 15)
+#define SP_ADDR(x)      (((x) & 0xff) << 7)
+#define SP_DONE         (1u << 0)
+#define SP_ERRORS       0x00370000u /* RX mode/glitch/end-bit, TX line busy, TX stop bit (i2c-speedy.c); informational only */
+#define SP_TIMEOUT_US   10000
+
+#define SLAVE_RTC       2
+#define RTC_CTRL        0x00
+#define RTC_UPDATE      0x02
+#define RTC_CAPSEL      0x03
+#define RTC_SEC         0x05 /* 0x04 is MSEC, not written */
+#define CTRL_BCD        0x01
+#define CTRL_24H        0x02
+#define UPD_RUDR        0x01
+#define UPD_WUDR        0x02
+#define UPD_FREEZE      0x04
+#define UPD_AUDR        0x10
+#define UPD_CMDS        (UPD_RUDR | UPD_WUDR | UPD_FREEZE | UPD_AUDR)
+
+#define MIN_PLAUSIBLE   1704067200ULL /* 2024-01-01, like the loader's year >= 2024 test: older means the RTC lost its battery */
+
+static LCK_GRP_DECLARE(s8rtc_grp, "s8rtc");
+static LCK_MTX_DECLARE(s8rtc_lock, &s8rtc_grp);
+
+static volatile uint8_t * sp_base;
+static int g_gate = -1;     /* boot-arg s8rtcwrite: 0 off, 1 on, 2 on + initialise a reset control register */
+static bool g_have_base;    /* g_base_ns valid */
+static int64_t g_base_ns;   /* UTC nanoseconds at mach_absolute_time() == 0 */
+static uint64_t g_last_written = ~0ULL;
+
+static inline uint32_t
+rd(uint32_t off)
+{
+	return *(volatile uint32_t *)(sp_base + off);
+}
+
+static inline void
+wr(uint32_t off, uint32_t v)
+{
+	*(volatile uint32_t *)(sp_base + off) = v;
+}
+
+static uint64_t
+now_ns(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns;
+}
+
+/* Busy wait; the longest user is the 1 ms RUDR/WUDR settle time Samsung's driver uses (usleep_range(1000, 1000)). */
+static void
+spin_us(uint32_t us)
+{
+	uint64_t deadline;
+
+	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &deadline);
+	deadline += mach_absolute_time();
+	while (mach_absolute_time() < deadline) {
+	}
+}
+
+static int
+gate(void)
+{
+	if (g_gate < 0) {
+		uint32_t v = 0;
+
+		if (!PE_parse_boot_argn("s8rtcwrite", &v, sizeof(v))) {
+			v = 0;
+		}
+		g_gate = v > 2 ? 1 : (int)v;
+	}
+	return g_gate;
+}
+
+static bool
+map_speedy(void)
+{
+	if (sp_base == NULL) {
+		sp_base = (volatile uint8_t *)ml_io_map(SPEEDY_PA, SPEEDY_SIZE);
+	}
+	return sp_base != NULL;
+}
+
+/* One random-access byte transfer, the sequence of pmic.c speedy(). Returns the byte (read) / 0 (write), or -1 on timeout.
+ * The transfer is polled (no interrupt): INT_STATUS bit 0 DONE, normally a few tens of microseconds. A transfer can fail when the
+ * APM (ACPM firmware) is using the same line (TX_LINE_BUSY), so a timeout is retried twice. */
+static int
+sp_xfer(unsigned slave, unsigned reg, bool write, uint8_t val)
+{
+	for (int attempt = 0; attempt < 3; attempt++) {
+		uint64_t deadline;
+
+		wr(SP_FIFO_CTRL, SP_FIFO_RESET);
+		spin_us(10);
+		wr(SP_FIFO_CTRL, SP_LEN(1, 1));
+		wr(SP_INT_ENABLE, write ? 0x80300011u : 0x80070301u);
+		wr(SP_INT_STATUS, 0xffffffffu);
+		wr(SP_CMD, SP_RANDOM | (write ? SP_WRITE : 0) | SP_SLAVE(slave) | SP_ADDR(reg));
+		if (write) {
+			wr(SP_TX_DATA, val);
+		}
+		nanoseconds_to_absolutetime((uint64_t)SP_TIMEOUT_US * NSEC_PER_USEC, &deadline);
+		deadline += mach_absolute_time();
+		do {
+			uint32_t s = rd(SP_INT_STATUS);
+
+			if (s & SP_DONE) {
+				wr(SP_INT_STATUS, 0xffffffffu);
+				if (s & SP_ERRORS) {
+					IOLog("S8RTC: slave %u reg 0x%02x %s done with error status 0x%08x\n", slave, reg, write ? "write" : "read", s);
+				}
+				return write ? 0 : (int)(rd(SP_RX_DATA) & 0xff);
+			}
+		} while (mach_absolute_time() < deadline);
+		spin_us(100);
+	}
+	return -1;
+}
+
+static int
+rtc_rd(unsigned reg)
+{
+	return sp_xfer(SLAVE_RTC, reg, false, 0);
+}
+
+static int
+rtc_wr(unsigned reg, uint8_t v)
+{
+	return sp_xfer(SLAVE_RTC, reg, true, v);
+}
+
+/* UPDATE: keep the configuration bits Samsung keeps (update_reg), set exactly one command bit. */
+static int
+rtc_update(uint8_t cmd)
+{
+	int u = rtc_rd(RTC_UPDATE);
+
+	if (u < 0) {
+		return -1;
+	}
+	if (rtc_wr(RTC_UPDATE, (uint8_t)((u & ~UPD_CMDS) | cmd)) < 0) {
+		return -1;
+	}
+	spin_us(1000);
+	return 0;
+}
+
+/* Latch (RUDR) and read the counters; ns_latch = mach_absolute_time in ns right after the latch. Lock held. */
+static int
+read_locked(uint64_t * secs, uint64_t * ns_latch)
+{
+	uint8_t r[S8RTC_NREGS];
+	int64_t t;
+
+	if (!map_speedy() || rtc_update(UPD_RUDR) < 0) {
+		return -1;
+	}
+	uint64_t ns = now_ns();
+
+	for (unsigned i = 0; i < S8RTC_NREGS; i++) {
+		int v = rtc_rd(RTC_SEC + i);
+
+		if (v < 0) {
+			return -1;
+		}
+		r[i] = (uint8_t)v;
+	}
+	if (s8rtc_regs_to_epoch(r, S8RTC_YEAR_MIN, &t) < 0) {
+		IOLog("S8RTC: invalid RTC contents %02x %02x %02x %02x %02x %02x %02x\n", r[0], r[1], r[2], r[3], r[4], r[5], r[6]);
+		return -2;
+	}
+	*secs = (uint64_t)t;
+	if (ns_latch) {
+		*ns_latch = ns;
+	}
+	return 0;
+}
+
+/* Write the counters and commit them with WUDR, then read them back. Returns 0 if the readback is within 2 s of 'secs'. */
+static int
+write_locked(uint64_t secs)
+{
+	uint8_t r[S8RTC_NREGS];
+	uint64_t back = 0;
+
+	if (s8rtc_epoch_to_regs(secs, r) < 0) {
+		IOLog("S8RTC: epoch %llu outside 2000..2099, not written\n", secs);
+		return -3;
+	}
+	if (!map_speedy()) {
+		return -1;
+	}
+	int ctrl = rtc_rd(RTC_CTRL);
+
+	if (ctrl < 0) {
+		return -1;
+	}
+	if ((ctrl & CTRL_BCD) || !(ctrl & CTRL_24H)) {
+		if (gate() < 2 || (ctrl & CTRL_BCD)) {
+			IOLog("S8RTC: RTC control 0x%02x is not binary/24h, not written (s8rtcwrite=2 initialises a cleared register)\n", ctrl);
+			return -4;
+		}
+		/* Samsung's s2m_rtc_init_reg for a reset RTC: binary, 24 h, then CAP_SEL 0xf0, then a pending-update pulse. */
+		int cap = rtc_rd(RTC_CAPSEL);
+		if (rtc_wr(RTC_CTRL, CTRL_24H) < 0 || rtc_update(UPD_AUDR) < 0 || cap < 0 || rtc_wr(RTC_CAPSEL, (uint8_t)(cap | 0xf0)) < 0) {
+			return -1;
+		}
+		IOLog("S8RTC: initialised RTC control (was 0x%02x, capsel 0x%02x)\n", ctrl, cap);
+	}
+	for (unsigned i = 0; i < S8RTC_NREGS; i++) {
+		if (rtc_wr(RTC_SEC + i, r[i]) < 0) {
+			return -1;
+		}
+	}
+	if (rtc_update(UPD_WUDR) < 0) {
+		return -1;
+	}
+	for (int i = 0; i < 20; i++) { /* WUDR clears itself; up to 4 ms more, warn if it does not (the QEMU model never clears it) */
+		int u = rtc_rd(RTC_UPDATE);
+
+		if (u >= 0 && !(u & UPD_WUDR)) {
+			break;
+		}
+		if (i == 19) {
+			IOLog("S8RTC: WUDR did not clear (update 0x%02x)\n", u);
+		}
+		spin_us(200);
+	}
+	int rc = read_locked(&back, NULL);
+
+	IOLog("S8RTC: wrote epoch %llu, readback %llu%s\n", secs, back, rc < 0 ? " (readback failed)" : "");
+	if (rc < 0) {
+		return rc;
+	}
+	return (back >= secs ? back - secs : secs - back) <= 2 ? 0 : -5;
+}
+
+extern "C" int
+s8_rtc_read_epoch(uint64_t * secs)
+{
+	lck_mtx_lock(&s8rtc_lock);
+	int rc = read_locked(secs, NULL);
+	lck_mtx_unlock(&s8rtc_lock);
+	return rc;
+}
+
+extern "C" int
+s8_rtc_write_epoch(uint64_t secs)
+{
+	lck_mtx_lock(&s8rtc_lock);
+	int rc = write_locked(secs);
+	lck_mtx_unlock(&s8rtc_lock);
+	return rc;
+}
+
+/* PEGetUTCTimeOfDay hook. false (and nothing touched) unless s8rtcwrite is set, or the RTC cannot be read / is implausible,
+ * so the caller falls back to the loader's s8rtc= boot-arg. The RTC is read once; later calls extrapolate with the counter. */
+extern "C" bool
+s8_rtc_get_utc(uint64_t * secs, uint32_t * nsecs)
+{
+	if (gate() == 0) {
+		return false;
+	}
+	lck_mtx_lock(&s8rtc_lock);
+	if (!g_have_base) {
+		uint64_t e = 0, ns = 0;
+
+		if (read_locked(&e, &ns) < 0 || e < MIN_PLAUSIBLE) {
+			printf("S8RTC: RTC not usable (epoch %llu), falling back to s8rtc=\n", e);
+			lck_mtx_unlock(&s8rtc_lock);
+			return false;
+		}
+		g_base_ns = (int64_t)e * 1000000000LL - (int64_t)ns;
+		g_have_base = true;
+		printf("S8RTC: time from the PMIC RTC: epoch %llu\n", e);
+	}
+	int64_t t = g_base_ns + (int64_t)now_ns();
+
+	lck_mtx_unlock(&s8rtc_lock);
+	*secs = (uint64_t)(t / 1000000000LL);
+	*nsecs = (uint32_t)(t % 1000000000LL);
+	return true;
+}
+
+/* PESetUTCTimeOfDay hook: remember the new time for later gets and write it to the RTC. */
+extern "C" void
+s8_rtc_set_utc(uint64_t secs, uint32_t usecs)
+{
+	if (gate() == 0) {
+		return;
+	}
+	lck_mtx_lock(&s8rtc_lock);
+	g_base_ns = (int64_t)secs * 1000000000LL + (int64_t)usecs * 1000LL - (int64_t)now_ns();
+	g_have_base = true;
+	if (secs != g_last_written) {
+		if (write_locked(secs) == 0) {
+			g_last_written = secs;
+		}
+	}
+	lck_mtx_unlock(&s8rtc_lock);
+}
+
+#endif /* !S8RTC_HOST_TEST */
+
+#endif /* ARM64_BOARD_CONFIG_A5XELTE */
