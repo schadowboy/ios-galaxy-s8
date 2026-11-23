@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/S8Agx.cpp b/iokit/Kernel/arm/S8Agx.cpp
 new file mode 100755
-index 0000000..2ea5077
+index 0000000..c5ae17b
 --- /dev/null
 +++ b/iokit/Kernel/arm/S8Agx.cpp
-@@ -0,0 +1,2430 @@
+@@ -0,0 +1,2446 @@
 +/*
 + * S8Agx: the kernel-side stand-in for Apple's GPU stack as iOS userland sees it (boot-arg s8agx=1, needs s8mali_drv=1).
 + *
@@ -877,6 +877,9 @@ index 0000000..2ea5077
 +	int blend;
 +	uint32_t pixels, unknown, stored;
 +	uint32_t cap;                   /* shaded-pixel cap of this draw (a monster backdrop draw must not eat the whole submit budget) */
++	uint32_t shaded;                /* pixels actually shaded (the rest of a capped draw reuses the last colour) */
++	int haveLast;
++	uint32_t lsb, lsg, lsr, lsa;    /* the last shaded source colour */
 +	uint32_t firstOut, lastOut;    /* the first and the last stored pixel (diagnostics) */
 +	uint32_t texw[S8F_NTEX][6];     /* raw texture-state words of each bound texture (diagnostics: descriptor decoding) */
 +	uint32_t smpw[S8F_NTEX][2];     /* raw sampler words */
@@ -899,9 +902,6 @@ index 0000000..2ea5077
 +		return;
 +	}
 +	dst = (uint32_t *)(dc->target + (uint64_t)py * dc->pitch + (uint64_t)px * 4);
-+	if (!dc->constant && !dc->tileOnly && dc->pixels >= dc->cap) {
-+		return;
-+	}
 +	dc->pixels++;
 +	{
 +		uint32_t sb = 0, sg = 0, sr = 0, sa = 0, dv = *dst;
@@ -919,7 +919,18 @@ index 0000000..2ea5077
 +			sr = dc->cacheCr;
 +			sa = dc->cacheCa;
 +			have = true;
++		} else if (dc->shaded >= dc->cap) {
++			/* over the draw's shading cap: the remaining pixels reuse the last shaded colour (exact for a uniform backdrop, a crude fill otherwise) */
++			if (!dc->haveLast) {
++				return;
++			}
++			sb = dc->lsb;
++			sg = dc->lsg;
++			sr = dc->lsr;
++			sa = dc->lsa;
++			have = true;
 +		} else {
++			dc->shaded++;
 +			if (!dc->workInit) {
 +				memcpy(&fc, &dc->tmpl, sizeof(fc));     /* once per draw: uniforms, textures, samplers are constant */
 +				dc->workInit = 1;
@@ -947,6 +958,11 @@ index 0000000..2ea5077
 +				sr = sf_to_unorm8(fc.out[0]);
 +				sa = sf_to_unorm8(fc.out[3]);
 +				have = true;
++				dc->lsb = sb;
++				dc->lsg = sg;
++				dc->lsr = sr;
++				dc->lsa = sa;
++				dc->haveLast = 1;
 +				if (dc->tileOnly) {
 +					dc->cacheTile = dv;
 +					dc->cacheCb = sb;
@@ -1457,11 +1473,11 @@ index 0000000..2ea5077
 +					}
 +					if (idxv[0] < (uint32_t)kMaxVtx && idxv[1] < (uint32_t)kMaxVtx && idxv[2] < (uint32_t)kMaxVtx && vok[idxv[0]] == 1 && vok[idxv[1]] == 1 &&
 +					    vok[idxv[2]] == 1) {
-+						uint32_t before = dc->pixels;
++						uint32_t before = dc->shaded;
 +
 +						s8r_tri(&vt[idxv[0]], &vt[idxv[1]], &vt[idxv[2]], (int)(nvar ? nvar : 1), 0, 0, dc->w, dc->h, comp_emit, dc);
 +						if (!dc->constant && !dc->tileOnly) {         /* solid draws cost almost nothing: only real shading counts against the budget */
-+							budget = (dc->pixels - before) >= budget ? 0 : budget - (dc->pixels - before);
++							budget = (dc->shaded - before) >= budget ? 0 : budget - (dc->shaded - before);
 +						}
 +					}
 +				}
