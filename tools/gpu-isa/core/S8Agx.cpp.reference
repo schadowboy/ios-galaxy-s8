@@ -1297,7 +1297,7 @@ AGXDeviceUserClient::execComposite(void)
 					}
 				}
 				dc->frag = fbase + fstart;
-				dc->fraglen = (uint32_t)(flen - fstart > 0x1000 ? 0x1000 : flen - fstart);
+				dc->fraglen = (uint32_t)(flen - fstart > 0x8000 ? 0x8000 : flen - fstart);
 				dc->target = tp;
 				dc->pitch = pitch;
 				dc->w = (int)p->width;

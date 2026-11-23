@@ -465,7 +465,7 @@ int main(int argc, char ** argv)
 			}
 			{ uint32_t si = 0; for (kk = 0; kk < d->fs.npush && si < S8F_NTEX; kk++) if (d->fs.push[kk].type == S8S_PUSH_SAMPLER) { uint32_t w2[2] = { agxrd(0, d->fs.push[kk].va), agxrd(0, d->fs.push[kk].va + 4) }; dc->smpw[si][0] = w2[0]; dc->smpw[si][1] = w2[1]; s8t_sampler_decode(&dc->tmpl.texs[si++], w2); } }
 			dc->frag = fbase + fstart;
-			dc->fraglen = (uint32_t)(flen - fstart > 0x1000 ? 0x1000 : flen - fstart);
+			dc->fraglen = (uint32_t)(flen - fstart > 0x4000 ? 0x4000 : flen - fstart);      /* 0x4000 (was 0x1000): the camera-glass fragment program is longer than 4 KB */
 			dc->target = tg->m; dc->pitch = tg->pitch; dc->w = (int)ps->width; dc->h = (int)ps->height; dc->blend = (int)d->blend;
 			/* constant-output probe (same as the kernel) */
 			if (dc->tmpl.ntex == 0) {
