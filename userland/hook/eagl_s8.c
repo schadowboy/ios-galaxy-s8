@@ -61,7 +61,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
-#include <ucontext.h>
+#include <sys/ucontext.h>
 #include <unistd.h>
 
 #include "hook_gl.h"
