@@ -20,6 +20,15 @@ struct s8r_vtx {
 
 typedef void (*s8r_emit)(void * ctx, int px, int py, const f32b * varying);
 
+/* native-FP windows (s8gfx_nfp.h): the kernel defines these before including this header to run the pixel work with the hardware FPU in short
+ * windows; on the host and by default they do nothing. */
+#ifndef S8R_FP_BEGIN
+#define S8R_FP_DECL
+#define S8R_FP_BEGIN()  ((void)0)
+#define S8R_FP_END()    ((void)0)
+#define S8R_FP_CHUNK    128
+#endif
+
 /* scissor: pixels [x0,x1) x [y0,y1) only */
 static inline void
 s8r_tri(const struct s8r_vtx * a, const struct s8r_vtx * b, const struct s8r_vtx * c, int nv, int x0, int y0, int x1, int y1, s8r_emit emit, void * ctx)
@@ -32,6 +41,7 @@ s8r_tri(const struct s8r_vtx * a, const struct s8r_vtx * b, const struct s8r_vtx
 	f32b farea;
 	int swap = 0;
 	int32_t px, py;
+	S8R_FP_DECL
 
 	if (area == 0) {
 		return;
@@ -62,7 +72,12 @@ s8r_tri(const struct s8r_vtx * a, const struct s8r_vtx * b, const struct s8r_vtx
 		farea = sf_from_i64(area);
 
 		for (py = miny; py <= maxy; py++) {
+			S8R_FP_BEGIN();
 			for (px = minx; px <= maxx; px++) {
+				if (px != minx && ((px - minx) % S8R_FP_CHUNK) == 0) {
+					S8R_FP_END();
+					S8R_FP_BEGIN();
+				}
 				int32_t sx = px * 256 + 128, sy = py * 256 + 128;       /* pixel centre */
 				/* edge functions: e0 opposite a (edge b->c), e1 opposite b (edge c->a), e2 opposite c (edge a->b) */
 				int64_t e0 = (int64_t)(cx - bx) * (sy - by) - (int64_t)(cy - by) * (sx - bx);
@@ -92,6 +107,7 @@ s8r_tri(const struct s8r_vtx * a, const struct s8r_vtx * b, const struct s8r_vtx
 				}
 				emit(ctx, px, py, out);
 			}
+			S8R_FP_END();
 		}
 	}
 	(void)farea;

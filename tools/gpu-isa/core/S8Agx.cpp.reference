@@ -41,6 +41,13 @@
 #include <kern/clock.h>
 #include "SweetSurface.h"      /* IOSurface-backed render targets (display path) */
 #include "s8gfx_sf.h"          /* integer-only float, rasteriser and shader interpreter of the software executor (host-tested in scratch/agx) */
+#define S8_NATIVE_FP 1          /* run-time switch (boot-arg s8agxnfp=1): the same arithmetic on the hardware FPU through inline asm in short windows */
+#define S8NFP_PREEMPT 0         /* keep preemption enabled: the texture-memory mapping paths can sleep (see analysis: tools/gpu-isa/core/s8gfx_nfp.h) */
+#include "s8gfx_nfp.h"
+#define S8R_FP_DECL     struct s8_fpsave s8r_fp;
+#define S8R_FP_BEGIN()  s8_fp_begin(&s8r_fp)
+#define S8R_FP_END()    s8_fp_end(&s8r_fp)
+#define S8R_FP_CHUNK    128
 #include "s8gfx_rast.h"
 #include "s8gfx_frag.h"
 #include "s8gfx_stream.h"       /* compositor command stream: passes, draws, pipeline slots */
@@ -834,6 +841,8 @@ bool
 AGXDeviceUserClient::compVertex(struct s8f_ctx & c, uint32_t vid, const uint8_t * code, unsigned codelen, const uint32_t * uni, const uint32_t * vp, struct s8r_vtx * out,
     uint32_t * nvar)
 {
+	S8FpWindow fpw;         /* the vertex program is short: one native-FP window around it */
+
 	bzero(&c, sizeof(c));
 	memcpy(c.uni, uni, sizeof(c.uni));
 	c.rd = agxRd;
@@ -2401,6 +2410,21 @@ S8AgxStart(void)
 	PE_parse_boot_argn("s8agxnotex", &gNoTex, sizeof(gNoTex));
 	PE_parse_boot_argn("s8agxnoprog", &gNoProgDump, sizeof(gNoProgDump));
 	PE_parse_boot_argn("s8agxkeepdither", &gKeepDither, sizeof(gKeepDither));
+	{
+		int nfp = 0;
+
+		if (PE_parse_boot_argn("s8agxnfp", &nfp, sizeof(nfp)) && nfp) {
+			s8nfp_enable(1);
+			int st = s8nfp_selftest();
+
+			if (st) {
+				s8nfp_enable(0);
+				IOLog("S8AGX: native FP selftest failed 0x%x, soft float stays\n", st);
+			} else {
+				IOLog("S8AGX: native FP on\n");
+			}
+		}
+	}
 	{
 		char nores[96] = "";
 
