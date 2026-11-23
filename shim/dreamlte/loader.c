@@ -586,6 +586,25 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 		if (gp)
 			gpu0_probe(kv, out, gpu0_flush);
 	}
+	/* hapticprobe=N: one vibration pulse via MAX77865 + PWM1 (tools/haptic/HAPTIC-PLAN.md; default off).
+	 * 1 = 150 ms full strength, 2 = 300 ms full strength, 3 = 150 ms half strength. */
+	{
+		int hv = 0;
+		extern void haptic_pulse(void (*)(const char *, uint64_t), void (*)(const char *), void (*)(void),
+					 unsigned, unsigned);
+		for (int i = 0; i + 12 < BOOT_LINE_LENGTH && p->cmdline[i]; i++) {
+			const char *k = "hapticprobe=";
+			int m = 0;
+			while (k[m] && p->cmdline[i + m] == k[m])
+				m++;
+			if (k[m] || (i && p->cmdline[i - 1] != ' '))
+				continue;
+			hv = p->cmdline[i + 12] >= '1' && p->cmdline[i + 12] <= '3' ? p->cmdline[i + 12] - '0' : 0;
+			break;
+		}
+		if (hv)
+			haptic_pulse(kv, out, gpu0_flush, hv == 2 ? 300 : 150, hv == 3 ? 5000 : 10000);
+	}
 	/* smp_probe(kv, out) proved the PMU power-up (boot 19); it leaves the
 	 * probed cores' PMU power on, which hid the 0 -> 0xF edge XNU needs. */
 	(void)smp_probe;
