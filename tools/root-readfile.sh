@@ -13,7 +13,8 @@ mkdir -p $MP "$DEST"
 mountpoint -q $MP && umount $MP
 fsck.hfsplus -f -y "$OUT" 2>&1 | tr -d '\000' | tail -1 || true
 mount -t hfsplus -o loop,force,rw "$OUT" $MP
-for p in "$@"; do cp -v "$MP$p" "$DEST/" || echo "missing $p"; done
+[ -z "${FINDCRASH:-}" ] || find $MP/private/var -iname '*.ips' -o -iname '*backboardd*crash*' -o -iname '*.crash' 2>/dev/null | head -20
+for p in "$@"; do cp -rv "$MP$p" "$DEST/" || echo "missing $p"; done
 umount $MP
 rm -f "$OUT"
 sync; echo 3 > /proc/sys/vm/drop_caches

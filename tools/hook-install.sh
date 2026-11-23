@@ -24,7 +24,11 @@ mkdir -p $MP/usr/local/lib
 for d in "$@"; do
   install -o 0 -g 0 -m 755 "$d" $MP/usr/local/lib/$(basename "$d")
 done
-ls -la $MP/usr/local/lib/
+if [ -n "${OSMESA:-}" ]; then      # optional: a new Mesa into the directory libs8gl searches
+  mkdir -p $MP/usr/local/lib/s8mesa
+  install -o 0 -g 0 -m 755 "$OSMESA" $MP/usr/local/lib/s8mesa/libOSMesa.8.dylib
+fi
+ls -la $MP/usr/local/lib/ $MP/usr/local/lib/s8mesa/
 sync
 umount $MP
 fsck.hfsplus -f -y "$OUT" 2>&1 | tr -d '\000' | tail -2 || true

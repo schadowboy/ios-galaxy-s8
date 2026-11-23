@@ -53,6 +53,7 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -60,6 +61,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include "hook_gl.h"
@@ -2307,6 +2309,64 @@ my_dealloc(id self, SEL selector)
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
 }
 
+/* Crash report for the log: no crash reporter runs on this system, so a fault in the GL layer or in Mesa would leave nothing but a restarted
+ * backboardd. SA_RESETHAND: after the report the same fault happens again and kills the process as before. */
+#ifdef __APPLE__
+static void
+s8gl_fault(int sig, siginfo_t *si, void *uctx)
+{
+	ucontext_t *uc = uctx;
+	uint64_t pc = uc->uc_mcontext->__ss.__pc, lr = uc->uc_mcontext->__ss.__lr, sp = uc->uc_mcontext->__ss.__sp;
+	uint64_t *fp = (uint64_t *)uc->uc_mcontext->__ss.__fp;
+	Dl_info di;
+
+	say("s8gl: FAULT signal %d code %d address %p pc %#llx lr %#llx sp %#llx\n", sig, si->si_code, si->si_addr,
+	    (unsigned long long)pc, (unsigned long long)lr, (unsigned long long)sp);
+	for (int k = 0; k < 2; k++) {
+		uint64_t a = k == 0 ? pc : lr;
+
+		if (dladdr((void *)a, &di) && di.dli_sname != NULL) {
+			say("s8gl:   %s %s+%#llx (image %s)\n", k == 0 ? "pc" : "lr", di.dli_sname, (unsigned long long)(a - (uint64_t)di.dli_saddr),
+			    di.dli_fname ? di.dli_fname : "?");
+		} else if (dladdr((void *)a, &di)) {
+			say("s8gl:   %s image %s +%#llx\n", k == 0 ? "pc" : "lr", di.dli_fname ? di.dli_fname : "?", (unsigned long long)(a - (uint64_t)di.dli_fbase));
+		}
+	}
+	for (int n = 0; n < 14 && fp != NULL && ((uintptr_t)fp & 7) == 0; n++) {
+		uint64_t ret = fp[1];
+
+		if (dladdr((void *)ret, &di) && di.dli_sname != NULL) {
+			say("s8gl:   #%d %#llx %s+%#llx (%s)\n", n, (unsigned long long)ret, di.dli_sname, (unsigned long long)(ret - (uint64_t)di.dli_saddr),
+			    di.dli_fname ? di.dli_fname : "?");
+		} else {
+			say("s8gl:   #%d %#llx\n", n, (unsigned long long)ret);
+		}
+		fp = (uint64_t *)fp[0];
+	}
+}
+
+static void
+s8gl_fault_install(void)
+{
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = s8gl_fault;
+	sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGSEGV, &sa, NULL);
+	sigaction(SIGBUS, &sa, NULL);
+	sigaction(SIGILL, &sa, NULL);
+	sigaction(SIGABRT, &sa, NULL);
+	sigaction(SIGTRAP, &sa, NULL);
+}
+#else
+static void
+s8gl_fault_install(void)
+{
+}
+#endif
+
 static int installed;
 
 __attribute__((constructor)) static void
@@ -2347,6 +2407,7 @@ s8gl_install(void)
 		bootargs[0] = 0;
 	}
 	say("s8gl: libs8gl loaded in %s pid %d (boot-args: %s)\n", name, getpid(), bootargs);
+	s8gl_fault_install();
 	if (arg_int("gl", -1) == 0) {
 		say("s8gl: gl=0: nothing is replaced\n");
 		return;
