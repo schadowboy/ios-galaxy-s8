@@ -100,7 +100,6 @@ extern "C" {
 #include <mach/mach_time.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
-#include <kern/misc_protos.h>
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
 }

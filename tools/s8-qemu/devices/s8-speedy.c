@@ -10,8 +10,8 @@
  * [18:15] slave, [14:7] register. A read puts the byte in RX_DATA, DONE is set
  * at once.
  * PMIC (slave 1): 256-byte register file, zero at reset (ID 0x00 unknown).
- * RTC  (slave 2): 0x04..0x0a = sec min hour weekday(1<<wday) day month year-2000,
- * binary, host UTC time at read time; other registers a register file.
+ * RTC  (slave 2): see rtc_latch/rtc_commit below (proposed model with MSEC at 0x04, SEC..YEAR at 0x05..0x0b,
+ * RUDR/WUDR latch/commit, settable), other registers a register file. Proposed replacement for s8-speedy.c (0151).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -28,26 +28,66 @@ struct S8SpeedyState {
     uint32_t fifo_ctrl, int_en, int_status, rx;
     uint8_t pmic[256];
     uint8_t rtc[256];
+    uint8_t rtc_lat[8];
+    time_t rtc_off;
 };
+
+/*
+ * RTC model of the real S2MPS17 (Samsung rtc-s2mps17.c): 0x00 CTRL (reset 0x02 = binary, 24 h), 0x02 UPDATE,
+ * 0x04 MSEC, 0x05..0x0b SEC MIN HOUR(PM = bit 6) WEEKDAY(1 << wday) DATE MONTH YEAR-2000.
+ * Time registers are read from a latched image: UPDATE.RUDR (bit 0) latches host time + offset, then clears itself.
+ * UPDATE.WUDR (bit 1) commits the written registers 0x05..0x0b as the new time (offset to the host clock), then clears itself.
+ */
+static void rtc_latch(S8SpeedyState *s)
+{
+    struct tm tm;
+    time_t t = time(NULL) + s->rtc_off;
+
+    gmtime_r(&t, &tm);
+    s->rtc_lat[0] = 0;
+    s->rtc_lat[1] = tm.tm_sec;
+    s->rtc_lat[2] = tm.tm_min;
+    s->rtc_lat[3] = tm.tm_hour | (tm.tm_hour >= 12 ? 0x40 : 0);
+    s->rtc_lat[4] = 1u << tm.tm_wday;
+    s->rtc_lat[5] = tm.tm_mday;
+    s->rtc_lat[6] = tm.tm_mon + 1;
+    s->rtc_lat[7] = tm.tm_year - 100;
+}
+
+static void rtc_commit(S8SpeedyState *s)
+{
+    struct tm tm = { 0 };
+
+    tm.tm_sec = s->rtc[0x05] & 0x7f;
+    tm.tm_min = s->rtc[0x06] & 0x7f;
+    tm.tm_hour = s->rtc[0x07] & 0x1f;
+    tm.tm_mday = s->rtc[0x09] & 0x1f;
+    tm.tm_mon = (s->rtc[0x0a] & 0x0f) - 1;
+    tm.tm_year = (s->rtc[0x0b] & 0x7f) + 100;
+    s->rtc_off = timegm(&tm) - time(NULL);
+}
 
 static uint8_t rtc_read(S8SpeedyState *s, unsigned reg)
 {
-    struct tm tm;
-    time_t t = time(NULL);
+    if (reg >= 0x04 && reg <= 0x0b) {
+        return s->rtc_lat[reg - 0x04];
+    }
+    return s->rtc[reg];
+}
 
-    if (reg < 0x04 || reg > 0x0a) {
-        return s->rtc[reg];
+static void rtc_write(S8SpeedyState *s, unsigned reg, uint8_t v)
+{
+    if (reg == 0x02) {
+        s->rtc[reg] = v & ~0x03;        /* RUDR and WUDR clear themselves */
+        if (v & 0x02) {
+            rtc_commit(s);
+        }
+        if (v & 0x01) {
+            rtc_latch(s);
+        }
+        return;
     }
-    gmtime_r(&t, &tm);
-    switch (reg) {
-    case 0x04: return tm.tm_sec;
-    case 0x05: return tm.tm_min;
-    case 0x06: return tm.tm_hour;
-    case 0x07: return 1u << tm.tm_wday;
-    case 0x08: return tm.tm_mday;
-    case 0x09: return tm.tm_mon + 1;
-    default:   return tm.tm_year - 100;
-    }
+    s->rtc[reg] = v;
 }
 
 static uint64_t speedy_read(void *opaque, hwaddr off, unsigned size)
@@ -93,7 +133,7 @@ static void speedy_write(void *opaque, hwaddr off, uint64_t v, unsigned size)
             }
         } else if (slave == 2) {
             if (write) {
-                s->rtc[reg] = txbyte;
+                rtc_write(s, reg, txbyte);
             } else {
                 s->rx = rtc_read(s, reg);
             }
@@ -131,6 +171,9 @@ static void speedy_reset(DeviceState *dev)
     s->fifo_ctrl = s->int_en = s->int_status = s->rx = 0;
     memset(s->pmic, 0, sizeof(s->pmic));
     memset(s->rtc, 0, sizeof(s->rtc));
+    s->rtc[0x00] = 0x02;
+    s->rtc_off = 0;
+    rtc_latch(s);
 }
 
 static void speedy_class_init(ObjectClass *klass, const void *data)
