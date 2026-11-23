@@ -117,6 +117,11 @@ With it, run the kernel with `s8rtcwrite=1` and expect: `S8RTC: time from the PM
 time with `date -s`-equivalent in the guest; then the next `S8Rtc` read shows the offset applied, and the loader's `rtc unix` stays on the host clock only
 across a QEMU restart (the model keeps the offset in memory only).
 
+## Result on the phone (2026-11-23, kernel CI run 45236517973, patch 0151)
+* Boot 1 (`s8rtcwrite=1 s8rtctest=<real epoch + 3600>`): the kernel read the PMIC RTC (epoch 1795459438 = real time), wrote 1795462934 and read back exactly 1795462934: AP-side SPEEDY writes to RTC slave 2 work, WUDR/RUDR and the register map from Samsung's driver are right.
+* Boot 2 (restore): the kernel read 1795463252 = the test value plus the ~5 min elapsed: the written time PERSISTED across a reboot and kept ticking; it then wrote the real epoch back (read back exactly). Residual error about 35 s (the epoch was baked into the image); iOS corrects it when it gets network time.
+* The default image has the gate off (`s8rtcwrite` absent): `s8-ios-boot-v174-stock`. With `s8rtcwrite=1` iOS's own clock changes are written through (`PESetUTCTimeOfDay`), not yet exercised on the phone.
+
 ## Risks
 
 * The first real write path to RTC slave 2 from the kernel; a wrong time lands in a battery-backed RTC (recoverable by writing again).
