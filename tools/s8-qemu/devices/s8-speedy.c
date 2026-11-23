@@ -106,7 +106,10 @@ static uint64_t speedy_read(void *opaque, hwaddr off, unsigned size)
 static void speedy_write(void *opaque, hwaddr off, uint64_t v, unsigned size)
 {
     S8SpeedyState *s = opaque;
-    static uint8_t txbyte;
+    /* A write is the command (slave, register) followed by the data byte in TX_DATA (that is the driver's order: the loader's speedy() and
+     * the kernel's S8Rtc both write CMD first, then TX_DATA): it completes when the data byte arrives. */
+    static bool wpend;
+    static unsigned wslave, wreg;
 
     switch (off) {
     case 0x04:
@@ -119,25 +122,31 @@ static void speedy_write(void *opaque, hwaddr off, uint64_t v, unsigned size)
         s->int_status &= ~(uint32_t)v;
         break;
     case 0x34:
-        txbyte = v;
+        if (wpend) {
+            wpend = false;
+            if (wslave == 1) {
+                s->pmic[wreg] = v;
+            } else if (wslave == 2) {
+                rtc_write(s, wreg, v);
+            }
+            s->int_status |= 1;
+        }
         break;
     case 0x08: {
         unsigned slave = (v >> 15) & 0xf, reg = (v >> 7) & 0xff;
         bool write = v & (1u << 20);
 
+        if (write) {
+            wpend = true;
+            wslave = slave;
+            wreg = reg;
+            break;
+        }
         if (slave == 1) {
-            if (write) {
-                s->pmic[reg] = txbyte;
-            } else {
-                s->rx = s->pmic[reg];
-            }
+            s->rx = s->pmic[reg];
         } else if (slave == 2) {
-            if (write) {
-                rtc_write(s, reg, txbyte);
-            } else {
-                s->rx = rtc_read(s, reg);
-            }
-        } else if (!write) {
+            s->rx = rtc_read(s, reg);
+        } else {
             s->rx = 0xff;
         }
         s->int_status |= 1;
