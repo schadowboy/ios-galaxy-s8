@@ -54,3 +54,5 @@ xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall \
 	-o "$OUT/s8pm_test" "$HERE/s8mali/s8pm_test.c"
 "$LDID" -S"$HERE/s8mali/s8mali_test.entitlements" "$OUT/s8pm_test"
 (cd "$OUT" && shasum -a 256 s8mali_test s8gl_test s8mtl_test s8pm_test | tee SHA256SUMS)
+# libs8gl.dylib (EAGLContext replacement over Mesa, userland/hook): built by hook/build-hook.sh; BUILD_HOOK=1 does it from here too
+if [ "${BUILD_HOOK:-0}" = 1 ]; then bash "$HERE/hook/build-hook.sh" "$OUT/hook"; fi

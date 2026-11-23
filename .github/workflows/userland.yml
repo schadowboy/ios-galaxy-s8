@@ -60,7 +60,7 @@ jobs:
           path: out/
           if-no-files-found: error
 
-      - name: Build and sign libhook_log
+      - name: Build and sign libhook_log and libs8gl (Mesa is dlopen()ed at run time: no Mesa artifact is needed here)
         run: bash userland/hook/build-hook.sh "$PWD/out-hook"
 
       - uses: actions/upload-artifact@v4

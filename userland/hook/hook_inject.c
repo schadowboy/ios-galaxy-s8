@@ -44,7 +44,7 @@
 #include "hook_addrs_20H392.h"
 #include "hook_gl.h"
 
-#define HOOK_GL_LIB "/usr/lib/libhook_gl.dylib"      /* stage 2 output; absent now */
+#define HOOK_GL_LIB "/usr/lib/libs8gl.dylib"         /* stage 2: eagl_s8.c + gl_osmesa_s8.c, built by build-hook.sh; its constructor replaces the EAGLContext methods */
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
