@@ -400,6 +400,21 @@ s8_rtc_get_utc(uint64_t * secs, uint32_t * nsecs)
 		g_base_ns = (int64_t)e * 1000000000LL - (int64_t)ns;
 		g_have_base = true;
 		printf("S8RTC: time from the PMIC RTC: epoch %llu\n", e);
+		/* debug: boot-arg s8rtctest=<epoch> writes that time into the RTC once (the kernel clock keeps the time read above); with the REAL
+		 * current epoch it restores the RTC after a test write */
+		uint64_t tv = 0;
+
+		if (PE_parse_boot_argn("s8rtctest", &tv, sizeof(tv)) && tv) {
+			uint64_t e2 = 0, ns2 = 0;
+
+			printf("S8RTC: test write of epoch %llu\n", tv);
+			if (write_locked(tv) == 0) {
+				g_last_written = tv;
+			}
+			if (read_locked(&e2, &ns2) == 0) {
+				printf("S8RTC: test readback epoch %llu\n", e2);
+			}
+		}
 	}
 	int64_t t = g_base_ns + (int64_t)now_ns();
 
