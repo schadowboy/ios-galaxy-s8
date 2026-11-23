@@ -16,7 +16,10 @@ Everything below runs in the loader (before XNU), as bring-up experiments. All o
 ## W3d result (run on the phone, image v168-wifi10d)
 - OTP CIS read works: VID bytes `82 33` = SEMCO module, variant `r02j` (NOT Murata r020, which was a guess). `nvram.txt_r02j_b0` is in firmware/samsung/wifi.
 - Valid channels for DE: 13 x 2.4 GHz + 24 x 5 GHz (CLM works). Noise floor -101 dBm on channels 1, 6, 11, 36 (the receiver hardware is alive). btc_mode 0 did not change the empty scan.
-- Next run (image v169-wifi-r02j) uses `nvram.txt_r02j_b0` staged with `tools/wifi-nvram-prep.py` into `shim/dreamlte/fw/wifi_nvram.bin`; result to be added here.
+- Run with `nvram.txt_r02j_b0` staged with `tools/wifi-nvram-prep.py` into `shim/dreamlte/fw/wifi_nvram.bin` (image v169-wifi-r02j, log logs/loader-wifir02j.txt): **THE SCAN WORKS: 11 BSS found** by the legacy WLC_SCAN/WLC_SCAN_RESULTS (version 109 records, WPA2-PSK, channel 40 (5 GHz), RSSI about -78 dBm, including the user's own AP); noise floor -98 dBm. So the wrong NVRAM variant (Murata r020 instead of SEMCO r02j) was the cause of the deaf receiver. The Wi-Fi module is SEMCO (OTP VID `82 33`).
+
+## Next (not started)
+W4: join (SET_SSID / WPA2 key via 'wsec', 'wpa_auth', 'sup_wpa', 'wsec_pmk' iovars or the 4-way handshake in host: the firmware has an internal supplicant, 'sup_wpa 1' + PSK), DHCP needs a data path: tx/rx flowrings (flowring create via MSG_TYPE_FLOW_RING_CREATE, rx post ring) + the kernel driver (en0 ifnet) and the IO80211 family shim so Settings shows Wi-Fi. All of that must be moved from the loader into the XNU kernel (the loader exits at "JUMP TO XNU").
 
 ## Open
 1. Deaf receiver: wrong NVRAM variant (check the OTP VID line `W3: OTP VID bytes`), BT coexistence (`btc_mode=1` with BT down), rsdb slice, or no networks in range during the test.
