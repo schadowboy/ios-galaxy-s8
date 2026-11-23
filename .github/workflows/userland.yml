@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       runner_labels:
-        description: 'runs-on labels as JSON, e.g. ["self-hosted","macOS","X64"] (default hosted macos-15)'
-        default: '["macos-15"]'
+        description: 'runs-on labels as JSON, e.g. ["self-hosted","macOS","X64"] (empty: the repository variable RUNNER_LABELS, else hosted macos-15)'
+        default: ''
   push:
     branches: [s8-dreamlte]
     paths:
@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ${{ fromJSON(inputs.runner_labels || '["macos-15"]') }}
+    runs-on: ${{ fromJSON(inputs.runner_labels || vars.RUNNER_LABELS || '["macos-15"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
