@@ -1,0 +1,34 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -288,6 +288,21 @@
+ 	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
+ 	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
+ 	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
++	/*
++	 * Wide-colour formats: once CoreAnimation draws with a GPU renderer (the GLES one on the Mali) it asks for the
++	 * screen's own surfaces as 'b3a8' (ten bits a colour, alpha in a plane of its own) and for snapshots as 'w30r'/'l10r'.
++	 * The software renderer, the panel and the scan-out copy here all know eight-bit BGRA only. The surface is made as
++	 * one plane of BGRA with the same geometry and says so: whoever uses it reads the format back from the surface.
++	 * (Same rule as the S9+ port's MiniIOSurface; boot-arg-free because nothing here can show the wide formats.)
++	 */
++	bool wide = (s->pixelFormat == 0x62336138 /* 'b3a8' */ || s->pixelFormat == 0x77333072 /* 'w30r' */ ||
++	    s->pixelFormat == 0x77333052 /* 'w30R' */ || s->pixelFormat == 0x6c313072 /* 'l10r' */);
++	if (wide) {
++		s->pixelFormat = 0x42475241;    /* 'BGRA' */
++		s->bytesPerElement = 4;
++		s->elementWidth = 1;
++		s->elementHeight = 1;
++	}
+ 	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
+ 	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
+ 	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
+@@ -302,6 +317,9 @@
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+ 	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	if (wide) {
++		planes = NULL;          /* one plane of BGRA (see above); the alpha plane the client asked for is not made */
++	}
+ 	s->planeCount = 0;
+ 	if (planes != NULL) {
+ 		uint64_t next = s->offset;
