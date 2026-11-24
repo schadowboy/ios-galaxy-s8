@@ -50,6 +50,10 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach/mach_time.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/vm_map.h>
+#endif
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
@@ -2330,6 +2334,24 @@ s8gl_fault(int sig, siginfo_t *si, void *uctx)
 			    di.dli_fname ? di.dli_fname : "?");
 		} else if (dladdr((void *)a, &di)) {
 			say("s8gl:   %s image %s +%#llx\n", k == 0 ? "pc" : "lr", di.dli_fname ? di.dli_fname : "?", (unsigned long long)(a - (uint64_t)di.dli_fbase));
+		}
+	}
+	/* registers x0..x28, and for each that points at readable memory the first 0x80 bytes behind it (the IOSurface client whose state
+	 * pointer, client+0x70, is NULL is somewhere in here) */
+	for (int r = 0; r < 29; r++) {
+		uint64_t v = uc->uc_mcontext->__ss.__x[r];
+		uint64_t words[16];
+		vm_size_t got = 0;
+
+		if (v > 0x100000000ULL && v < 0x800000000ULL && vm_read_overwrite(mach_task_self(), (vm_address_t)v, sizeof(words),
+		    (vm_address_t)words, &got) == KERN_SUCCESS && got == sizeof(words)) {
+			say("s8gl:   x%d %#llx: %llx %llx %llx %llx %llx %llx %llx %llx | %llx %llx %llx %llx %llx %llx %llx %llx\n", r, (unsigned long long)v,
+			    (unsigned long long)words[0], (unsigned long long)words[1], (unsigned long long)words[2], (unsigned long long)words[3],
+			    (unsigned long long)words[4], (unsigned long long)words[5], (unsigned long long)words[6], (unsigned long long)words[7],
+			    (unsigned long long)words[8], (unsigned long long)words[9], (unsigned long long)words[10], (unsigned long long)words[11],
+			    (unsigned long long)words[12], (unsigned long long)words[13], (unsigned long long)words[14], (unsigned long long)words[15]);
+		} else {
+			say("s8gl:   x%d %#llx\n", r, (unsigned long long)v);
 		}
 	}
 	for (int n = 0; n < 14 && fp != NULL && ((uintptr_t)fp & 7) == 0; n++) {
