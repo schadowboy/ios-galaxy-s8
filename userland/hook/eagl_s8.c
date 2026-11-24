@@ -2350,6 +2350,24 @@ s8gl_fault(int sig, siginfo_t *si, void *uctx)
 			    (unsigned long long)words[4], (unsigned long long)words[5], (unsigned long long)words[6], (unsigned long long)words[7],
 			    (unsigned long long)words[8], (unsigned long long)words[9], (unsigned long long)words[10], (unsigned long long)words[11],
 			    (unsigned long long)words[12], (unsigned long long)words[13], (unsigned long long)words[14], (unsigned long long)words[15]);
+			if (r == 19) {          /* the IOSurfaceRef of the fault: its client is the pointer at +8; dump that and what it points at */
+				for (int k = 0; k < 6; k++) {
+					uint64_t w[24];
+					vm_size_t g = 0;
+
+					if (words[k] > 0x100000000ULL && words[k] < 0x800000000ULL && vm_read_overwrite(mach_task_self(),
+					    (vm_address_t)words[k], sizeof(w), (vm_address_t)w, &g) == KERN_SUCCESS && g == sizeof(w)) {
+						say("s8gl:     x19[%d] %#llx: %llx %llx %llx %llx %llx %llx %llx %llx | %llx %llx %llx %llx %llx %llx %llx %llx | "
+						    "%llx %llx %llx %llx %llx %llx %llx %llx\n", k, (unsigned long long)words[k],
+						    (unsigned long long)w[0], (unsigned long long)w[1], (unsigned long long)w[2], (unsigned long long)w[3],
+						    (unsigned long long)w[4], (unsigned long long)w[5], (unsigned long long)w[6], (unsigned long long)w[7],
+						    (unsigned long long)w[8], (unsigned long long)w[9], (unsigned long long)w[10], (unsigned long long)w[11],
+						    (unsigned long long)w[12], (unsigned long long)w[13], (unsigned long long)w[14], (unsigned long long)w[15],
+						    (unsigned long long)w[16], (unsigned long long)w[17], (unsigned long long)w[18], (unsigned long long)w[19],
+						    (unsigned long long)w[20], (unsigned long long)w[21], (unsigned long long)w[22], (unsigned long long)w[23]);
+					}
+				}
+			}
 		} else {
 			say("s8gl:   x%d %#llx\n", r, (unsigned long long)v);
 		}
