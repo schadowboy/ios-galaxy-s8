@@ -202,6 +202,7 @@ static void eagl_resolve_missing(const char *name);
 
 /* ---- the log ---------------------------------------------------------------------------------------- */
 
+int s8mali_log(const char *text, size_t n);     /* s8mali_drm.c */
 #define S8GL_LOG_FILE "/private/var/tmp/hook_log.txt"
 static int log_fd = -2;
 static int console_fd = -2;
@@ -225,7 +226,7 @@ log_write(const char *line, size_t n)
 	if (console_fd == -2) {
 		console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
 	}
-	if (console_fd >= 0 && strncmp(line, "s8gl: gl:", 9) != 0 && strncmp(line, "s8gl:  ", 7) != 0) {
+	if (strncmp(line, "s8gl: gl:", 9) != 0 && strncmp(line, "s8gl:  ", 7) != 0) {
 		char text[260];
 		size_t m = n < 240 ? n : 240;
 
@@ -233,7 +234,10 @@ log_write(const char *line, size_t n)
 		if (text[m - 1] != '\n') {
 			text[m++] = '\n';
 		}
-		(void)write(console_fd, text, m);
+		/* through the S8Mali service into the kernel log once that is open (the console is muted when the screen is up) */
+		if (s8mali_log(text, m) != 0) {
+			(void)write(console_fd, text, m);
+		}
 	}
 }
 

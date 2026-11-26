@@ -1,0 +1,20 @@
+--- a/iokit/Kernel/arm/S8Mali.cpp
++++ b/iokit/Kernel/arm/S8Mali.cpp
+@@ -589,5 +589,17 @@
+ 	(void)reference;
+ 	STEP_Q("externalMethod selector=0x%x in=%zu", selector, size);
++	if (selector == 0x70) {         /* a line of text from the user side (libs8gl) into the kernel log: printf lines go on arriving after the console is muted */
++		char text[240];
++		size_t n = args->structureInputSize < sizeof(text) - 1 ? args->structureInputSize : sizeof(text) - 1;
++
++		if (args->structureInput == NULL) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(text, args->structureInput, n);
++		text[n] = 0;
++		printf("%s", text);
++		return kIOReturnSuccess;
++	}
+ 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL || gLock == NULL) {
+ 		return kIOReturnBadArgument;
+ 	}

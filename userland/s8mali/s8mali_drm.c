@@ -158,6 +158,27 @@ call(unsigned number, void *data, size_t size)
 	}
 }
 
+/*
+ * A line of text into the kernel's log through the S8Mali service (selector 0x70, patch 0158): the kernel mutes its text console
+ * when the screen comes up, but the lines it prints itself go on arriving, and tools/pull-kernlog.ps1 reads them within seconds.
+ * 0: sent; -1: the service is not open (or refused): the caller falls back to the console.
+ */
+int
+s8mali_log(const char *text, size_t n)
+{
+	char buf[240];
+
+	if (!opened) {
+		return -1;
+	}
+	if (n > sizeof(buf) - 1) {
+		n = sizeof(buf) - 1;
+	}
+	memcpy(buf, text, n);
+	buf[n] = 0;
+	return IOConnectCallStructMethod(connection, 0x70, buf, n + 1, NULL, NULL) == 0 ? 0 : -1;
+}
+
 int64_t
 s8mali_now_ns(void)
 {
