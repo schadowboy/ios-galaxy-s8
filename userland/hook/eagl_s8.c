@@ -203,6 +203,7 @@ static void eagl_resolve_missing(const char *name);
 /* ---- the log ---------------------------------------------------------------------------------------- */
 
 int s8mali_log(const char *text, size_t n);     /* s8mali_drm.c */
+size_t s8mali_stats(char *out, size_t size);    /* s8mali_drm.c: what the calls into the kernel service cost since the last call */
 #define S8GL_LOG_FILE "/private/var/tmp/hook_log.txt"
 static int log_fd = -2;
 static int console_fd = -2;
@@ -1206,6 +1207,10 @@ frame_end(struct eagl *e, bool finished)
 		e->most_triangles = e->triangles;
 	}
 	if (e->frames <= 40 || e->frames % 20 == 0) {
+		char kernel_calls[400];
+
+		(void)s8mali_stats(kernel_calls, sizeof(kernel_calls));
+		say("s8gl: kernel calls this frame: %s\n", kernel_calls[0] != 0 ? kernel_calls : "none");
 		say("s8gl: frame %u: %u GL calls, %u draws, %u triangles, %u clears; %u textures refilled from IOSurfaces "
 		    "(%llu KB); %u picture%s copied out, %u drawn in place; %llu us (%llu handing on, %llu waiting, %llu "
 		    "copying out), %llu before it for the IOSurfaces\n", e->frames, e->calls, e->draws, e->triangles, e->clears,

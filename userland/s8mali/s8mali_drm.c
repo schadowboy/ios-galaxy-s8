@@ -131,12 +131,58 @@ s8mali_last_kr(void)
 	return last_kr;
 }
 
+int64_t s8mali_now_ns(void);
+
+/* what the calls into the kernel service cost, by selector (0x100: mapping a buffer into the process): s8mali_stats() prints and clears */
+static struct {
+	uint64_t count, ns, most;
+} stats[0x101];
+
+static void
+stat_add(unsigned number, int64_t began)
+{
+	uint64_t took = (uint64_t)(s8mali_now_ns() - began);
+	unsigned at = number < 0x100 ? number : 0x100;
+
+	stats[at].count++;
+	stats[at].ns += took;
+	if (took > stats[at].most) {
+		stats[at].most = took;
+	}
+}
+
+/* "0x42 x3 120us (most 80us); ..." of every selector used since the last call; returns the length */
+size_t
+s8mali_stats(char *out, size_t size)
+{
+	size_t used = 0;
+
+	out[0] = 0;
+	for (unsigned i = 0; i <= 0x100; i++) {
+		int n;
+
+		if (stats[i].count == 0) {
+			continue;
+		}
+		n = snprintf(out + used, size - used, "%s%#x x%llu %lluus (most %lluus)", used ? "; " : "", i, (unsigned long long)stats[i].count,
+		    (unsigned long long)(stats[i].ns / 1000), (unsigned long long)(stats[i].most / 1000));
+		if (n < 0 || (size_t)n >= size - used) {
+			break;
+		}
+		used += (size_t)n;
+		stats[i].count = stats[i].ns = stats[i].most = 0;
+	}
+	return used;
+}
+
 static int
 call(unsigned number, void *data, size_t size)
 {
 	size_t returned = size;
+	int64_t began = s8mali_now_ns();
 	kern_return_t result = IOConnectCallStructMethod(connection, number, data, size, data, &returned);
 
+	stat_add(number, began);
 	last_kr = (int)result;
 	switch ((uint32_t)result) {
 	case 0:
@@ -700,9 +746,12 @@ hakios_drm_map(int fd, uint32_t handle, uint64_t size)
 	mach_vm_size_t mapped = 0;
 	kern_return_t kr;
 
+	int64_t began = s8mali_now_ns();
+
 	(void)fd;
 	(void)size;
 	kr = IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped, S8_kIOMapAnywhere);
+	stat_add(0x100, began);
 	last_kr = (int)kr;
 	if (kr != 0) {
 		return (void *)-1; /* mmap()'s MAP_FAILED */
