@@ -1,0 +1,113 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -446,6 +446,84 @@
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+ 
++/*
++ * IOSurfaceWrapClientImage (selector 6): a surface around a picture of the caller's own. CoreAnimation's OpenGL ES renderer
++ * asks for one for each image it draws from (a picture, a glyph mask, a gradient). The request is 32 bytes (S9+ port,
++ * MiniIOSurface::methodWrapClientImage, seen on its phone): address (8), width, height, pixel format, bytes per element,
++ * bytes per row, size (4 each). The S9+ kernel makes the surface's pixels that memory itself; here the surface is its own wired
++ * memory and gets a copy of the bytes (the images are not drawn into after the wrap). Before this the selector fell into the
++ * "accept and ignore" case: success with an all-zero reply, from which IOSurface.framework built a client without pixels or
++ * state page (IOSurfaceClientGetBulkAttachments then read address 0x30 in backboardd).
++ */
++static SweetSurface *
++sweet_surface_wrap_image(task_t task, IOExternalMethodArguments *args, IOReturn *ret)
++{
++	struct {
++		uint64_t address;
++		uint32_t width, height, format, bytesPerElement, bytesPerRow, size;
++	} rq;
++
++	*ret = kIOReturnBadArgument;
++	if (args->structureInput == NULL || args->structureInputSize < sizeof(rq)) {
++		return NULL;
++	}
++	memcpy(&rq, args->structureInput, sizeof(rq));
++	if (rq.address == 0 || rq.size == 0 || rq.size > SWEET_SURFACE_MAX_ALLOC || rq.width > SWEET_SURFACE_MAX_DIM ||
++	    rq.height > SWEET_SURFACE_MAX_DIM || rq.bytesPerElement == 0 || rq.bytesPerElement > 64) {
++		return NULL;
++	}
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		*ret = kIOReturnNoMemory;
++		return NULL;
++	}
++	s->width = rq.width;
++	s->height = rq.height;
++	s->pixelFormat = rq.format;
++	s->bytesPerElement = (uint16_t)rq.bytesPerElement;
++	s->elementWidth = 1;
++	s->elementHeight = 1;
++	s->cacheMode = 0;
++	s->offset = 0;
++	s->bytesPerRow = rq.bytesPerRow != 0 ? rq.bytesPerRow : rq.width * rq.bytesPerElement;
++	s->planeCount = 0;
++	s->parentID = 0;
++	s->allocSize = (uint32_t)round_page((uint64_t)rq.size);
++	IOBufferMemoryDescriptor *mem = NULL;
++	if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) + s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
++		mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++	}
++	if (mem == NULL) {
++		OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++		s->release();
++		*ret = kIOReturnNoMemory;
++		return NULL;
++	}
++	bzero(mem->getBytesNoCopy(), s->allocSize);
++	IOMemoryDescriptor *src = IOMemoryDescriptor::withAddressRange(rq.address, rq.size, kIODirectionOut, task);
++	if (src == NULL || src->prepare() != kIOReturnSuccess) {
++		OSSafeReleaseNULL(src);
++		mem->release();
++		OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++		s->release();
++		*ret = kIOReturnVMError;
++		return NULL;
++	}
++	src->readBytes(0, mem->getBytesNoCopy(), rq.size);
++	src->complete();
++	src->release();
++	s->memory = mem;
++	s->mapCache = kIOMapDefaultCache;
++	if (!sweet_surface_publish(s)) {
++		s->release();
++		*ret = kIOReturnNoResources;
++		return NULL;
++	}
++	*ret = kIOReturnSuccess;
++	return s;
++}
++
+ static uint64_t sweet_surf_logged;      /* selectors / traps already logged (< 64) */
+ 
+ static void
+@@ -745,6 +823,25 @@
+ 	}
+ 	case kSweetSurfaceCreate:
+ 		return create(args);
++	case 6: {       /* IOSurfaceWrapClientImage */
++		IOReturn wret = kIOReturnBadArgument;
++		SweetSurface *w = sweet_surface_wrap_image(fTask, args, &wret);
++		if (w == NULL) {
++			static unsigned wrap_said;
++
++			if (wrap_said++ < 8) {
++				IOLog("SWEET SURF: wrap image failed 0x%x (request %u bytes)\n", wret, args->structureInputSize);
++			}
++			return wret;
++		}
++		wret = returnSurface(w, args);
++		w->release();
++		sweet_surf_log_once("sel", selector);
++		return wret;
++	}
++	case 7:         /* IOSurfaceWrapClientMemory: not made; refused, so the framework builds no client from an empty reply */
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnUnsupported;
+ 	case kSweetSurfaceLookup: {
+ 		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+ 		IOReturn ret = kIOReturnNotFound;
