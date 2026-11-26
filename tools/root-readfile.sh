@@ -11,8 +11,11 @@ for i in $(tr -d '\r' < "$PULL/changed-$V.txt"); do
 done
 mkdir -p $MP "$DEST"
 mountpoint -q $MP && umount $MP
-fsck.hfsplus -f -y "$OUT" 2>&1 | tr -d '\000' | tail -1 || true
-mount -t hfsplus -o loop,force,rw "$OUT" $MP
+# read-only copy-out: no repair pass (it took about 8 minutes); only when a read-only mount fails is the volume repaired first
+if ! mount -t hfsplus -o loop,force,ro "$OUT" $MP 2>/dev/null; then
+  fsck.hfsplus -f -y "$OUT" 2>&1 | tr -d '\000' | tail -1 || true
+  mount -t hfsplus -o loop,force,ro "$OUT" $MP
+fi
 [ -z "${FINDCRASH:-}" ] || find $MP/private/var -iname '*.ips' -o -iname '*backboardd*crash*' -o -iname '*.crash' 2>/dev/null | head -20
 for p in "$@"; do cp -rv "$MP$p" "$DEST/" || echo "missing $p"; done
 umount $MP

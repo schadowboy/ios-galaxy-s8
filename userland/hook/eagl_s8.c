@@ -204,6 +204,7 @@ static void eagl_resolve_missing(const char *name);
 
 #define S8GL_LOG_FILE "/private/var/tmp/hook_log.txt"
 static int log_fd = -2;
+static int console_fd = -2;
 static unsigned long trace_lines_left = 20000;  /* gltrace_max=N */
 
 static void
@@ -216,6 +217,24 @@ log_write(const char *line, size_t n)
 		(void)write(log_fd, line, n);    /* O_APPEND: one write = one line, no fsync */
 	}
 	(void)write(2, line, n);
+	/*
+	 * Also on the console: the kernel's console ring is what tools/pull-kernlog.ps1 reads within seconds of a run, where the file
+	 * above costs a 15 minute root reassembly. Summary lines only (not the per-call trace, not the extension lists), each cut at
+	 * 240 bytes so that a frame line fits in one ring record.
+	 */
+	if (console_fd == -2) {
+		console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
+	}
+	if (console_fd >= 0 && strncmp(line, "s8gl: gl:", 9) != 0 && strncmp(line, "s8gl:  ", 7) != 0) {
+		char text[260];
+		size_t m = n < 240 ? n : 240;
+
+		memcpy(text, line, m);
+		if (text[m - 1] != '\n') {
+			text[m++] = '\n';
+		}
+		(void)write(console_fd, text, m);
+	}
 }
 
 /* exported to gl_osmesa_s8.c */
