@@ -182,7 +182,12 @@ call(unsigned number, void *data, size_t size)
 	int64_t began = s8mali_now_ns();
 	kern_return_t result = IOConnectCallStructMethod(connection, number, data, size, data, &returned);
 
-	stat_add(number, began);
+	if (number == 0x40 && size >= 40) {
+		/* jobs split by kind: 0xf0 = vertex/tiler chains (slot 1), 0xf1 = fragment chains (slot 0) */
+		stat_add(0xf0 + (((const struct drm_panfrost_submit *)data)->requirements & 1), began);
+	} else {
+		stat_add(number, began);
+	}
 	last_kr = (int)result;
 	switch ((uint32_t)result) {
 	case 0:
