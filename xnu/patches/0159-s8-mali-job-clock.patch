@@ -1,0 +1,68 @@
+--- a/osfmk/kern/s8_mali_drv.c
++++ b/osfmk/kern/s8_mali_drv.c
+@@ -919,8 +919,25 @@
+ 	uint32_t done = 1u << slot, fail = 1u << (slot + 16);
+ 	uint64_t deadline;
+ 	bool finished = false;
++	/* what a job costs in GPU cycles against wall time: the GPU's real clock (CYCLE_COUNT, started by GPU command 5) and the job's duration */
++	static uint32_t jobcfg = JS_CONFIG_VAL;
++	static bool jobcfg_known;
++	static uint64_t clk_ns, clk_cycles;
++	static uint32_t clk_jobs;
++	uint64_t t0, t1;
++	uint32_t c0, c1;
+ 
+ 	lck_mtx_lock(&s8d_lock);
++	if (!jobcfg_known) {
++		uint32_t v = 0;
++
++		/* boot-arg s8mali_cfg=<hex>: the JS_CONFIG word of every job (the flush bits at the start and end of a job are the suspects of 50 ms jobs) */
++		if (PE_parse_boot_argn("s8mali_cfg", &v, sizeof(v))) {
++			jobcfg = v;
++		}
++		jobcfg_known = true;
++		P("job config word 0x%x", jobcfg);
++	}
+ 	*seq = ++g_seq;
+ 	if (!g_up) {
+ 		lck_mtx_unlock(&s8d_lock);
+@@ -934,10 +951,13 @@
+ 	wr(js + JS_HEAD_NEXT_LO + 4, (uint32_t)(chain >> 32));
+ 	wr(js + JS_AFFINITY_NEXT_LO, g_shader);
+ 	wr(js + JS_AFFINITY_NEXT_HI, 0);
+-	wr(js + JS_CONFIG_NEXT, JS_CONFIG_VAL);
++	wr(js + JS_CONFIG_NEXT, jobcfg);
++	wr(GPU_CMD, 5);         /* GPU_COMMAND_CYCLE_COUNT_START (kbase's value; harmless when it is already counting) */
++	c0 = rd(0x090);         /* GPU_CONTROL CYCLE_COUNT_LO */
++	t0 = mach_absolute_time();
+ 	wr(js + JS_COMMAND_NEXT, JS_COMMAND_START);
+ 	nanoseconds_to_absolutetime((uint64_t)JOB_TIMEOUT_US * NSEC_PER_USEC, &deadline);
+-	deadline += mach_absolute_time();
++	deadline += t0;
+ 	for (;;) {
+ 		raw = rd(JOB_INT_RAWSTAT);
+ 		if (raw & (done | fail)) {
+@@ -947,8 +967,23 @@
+ 			break;
+ 		}
+ 	}
++	t1 = mach_absolute_time();
++	c1 = rd(0x090);
+ 	finished = (raw & done) && !(raw & fail);
+ 	g_jobs++;
++	if (finished) {
++		uint64_t ns = 0;
++
++		absolutetime_to_nanoseconds(t1 - t0, &ns);
++		clk_ns += ns;
++		clk_cycles += (uint32_t)(c1 - c0);
++		if (++clk_jobs == 16) {
++			P("JOBCLK last 16 jobs: %llu us each, %llu kcycles each = %llu MHz (JS%u)", clk_ns / 16000, clk_cycles / 16000,
++			    clk_ns != 0 ? clk_cycles * 1000 / clk_ns : 0, slot);
++			clk_ns = clk_cycles = 0;
++			clk_jobs = 0;
++		}
++	}
+ 	if (!finished) {
+ 		uint64_t fa;
+ 
