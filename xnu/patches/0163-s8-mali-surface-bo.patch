@@ -1,0 +1,296 @@
+--- a/iokit/Kernel/arm/S8Mali.cpp
++++ b/iokit/Kernel/arm/S8Mali.cpp
+@@ -14,7 +14,8 @@
+  * (IOServiceMatching matches by class, subclasses included). The user client class is S8MaliUserClient (property
+  * IOUserClientClass). C++ class names cannot come from a #define: renaming means editing the class names too.
+  *
+- * Differences from the S9+ service: no IOSurface requests (0x7c, 0x7e, 0x7f: kIOReturnUnsupported), no job queue thread
++ * Differences from the S9+ service: IOSurface requests: only 0x7e (an IOSurface's memory as a buffer, patch 0163; 0x7c and
++ * 0x7f: kIOReturnUnsupported), no job queue thread
+  * (the C half runs a job to its end inside SUBMIT, polling, so WAIT is always immediately true), power is up while at
+  * least one client is open, a HEAP buffer is backed only up to boot-arg s8mali_heap_mb (default 64 MiB).
+  *
+@@ -48,6 +49,7 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <mach/vm_param.h>
+ #include <sys/systm.h>
++#include "SweetSurface.h"       /* IOSurface stand-in: sweet_surface_copy(id) -> SweetSurface (0046, 0153) */
+ 
+ #define S8MALI_SERVICE_NAME     "S8Mali"
+ #define S8MALI_CLIENT_CLASS     "S8MaliUserClient"
+@@ -58,6 +60,7 @@
+ uint32_t s8mali_heap_mb(void);
+ uint64_t s8mali_va_alloc(uint64_t size, bool exec);
+ bool s8mali_map_page(uint64_t gpu, uint64_t pa);
++bool s8mali_map_page_pool(uint64_t gpu, uint64_t pa);   /* the same for a page of a scan-out pool surface (outside XNU's RAM, < 4 GiB; patch 0163) */
+ void s8mali_maps_done(uint64_t gpu, uint64_t size);
+ void s8mali_unmap(uint64_t gpu, uint64_t size, uint64_t mapped);
+ bool s8mali_gpu_param(uint32_t which, uint64_t * value);
+@@ -91,6 +94,7 @@
+ 	kPanfrostSetLabelBO     = 0x49,         /* accepted, ignored */
+ 	kPanfrostSyncBO         = 0x4c,         /* accepted, ignored: buffers are write-combined */
+ 	kS8MaliWait             = 0x7d,         /* wait for a job by its number (struct mali_wait) */
++	kS8MaliSurface          = 0x7e,         /* an IOSurface's memory as a buffer (struct mali_surface; patch 0163) */
+ };
+ 
+ struct mali_wait {
+@@ -98,6 +102,18 @@
+ 	int64_t timeout_ns;
+ };
+ 
++#define MALI_SURFACE_DESCRIBE   0xffffffffu     /* mali_surface.handle: only describe, make no buffer */
++
++/* userland/s8mali/s8mali_drm.h struct s8mali_surface */
++struct mali_surface {
++	uint32_t surface;               /* in: the IOSurface's ID */
++	uint32_t handle;                /* in: MALI_SURFACE_DESCRIBE or anything else (make the buffer); out: its handle */
++	uint64_t size;                  /* out: the buffer's size */
++	uint32_t offset, row_bytes;     /* out: where the pixels start in it, bytes a row */
++	uint32_t width, height, pixel_format, planes;
++};
++static_assert(sizeof(struct mali_surface) == 40, "s8mali_drm.h struct s8mali_surface is 40 bytes");
++
+ struct drm_gem_close {
+ 	uint32_t handle, pad;
+ };
+@@ -156,6 +172,9 @@
+ 	vm_offset_t kva;                        /* the kernel virtual address of that memory */
+ 	uint64_t last_seq;
+ 	uint32_t flags;
++	SweetSurface * surface;                 /* patch 0163: != NULL: the buffer is this IOSurface's own memory (`memory` is the surface's
++	                                         * descriptor, retained; `kva` the surface's kernel mapping). Holds a reference on the
++	                                         * surface; GEM_CLOSE unmaps it from the GPU and drops both, it never frees the memory. */
+ };
+ 
+ static IOLock * gLock;
+@@ -309,6 +328,7 @@
+ 	struct mali_buffer * buffer(uint32_t handle);
+ 	void freeBuffer(struct mali_buffer * b);
+ 	IOReturn createBO(struct drm_panfrost_create_bo * request);
++	IOReturn surfaceBO(struct mali_surface * request);
+ 	void syncAll(const char * when, user_addr_t list, uint32_t count);
+ 	void closeAll(void);
+ 
+@@ -366,13 +386,23 @@
+ 	 * The program's mapping is cacheable: clean and invalidate by kernel VA before the pages can go back to the allocator
+ 	 * (S8MaliBO::free does it once more), so no stale line is evicted over what a later owner writes.
+ 	 */
+-	STEP("freeBuffer sync by VA kva=0x%llx bytes=0x%llx", (uint64_t) b->kva, b->backed);
+-	s8mali_bo_sync(b->kva, b->backed);
++	if (b->surface == NULL) {
++		STEP("freeBuffer sync by VA kva=0x%llx bytes=0x%llx", (uint64_t) b->kva, b->backed);
++		s8mali_bo_sync(b->kva, b->backed);
++	}
+ 	if (allow(&gLogBO, 100)) {
+-		IOLog("S8MALI: bo free va=0x%llx size=0x%llx\n", b->address, b->size);
++		IOLog("S8MALI: bo free va=0x%llx size=0x%llx%s\n", b->address, b->size, b->surface != NULL ? " (IOSurface)" : "");
+ 	}
+ 	STEP("freeBuffer releasing memory descriptor");
++	/*
++	 * A surface buffer: `memory` is the surface's own descriptor (retained when the buffer was made) and the pages are the
++	 * surface's, so nothing is synced or freed here: both references are dropped and the surface frees its memory when its
++	 * last user is gone. The GPU's tables no longer point at it (s8mali_unmap above) and jobs have ended inside SUBMIT.
++	 */
+ 	b->memory->release();
++	if (b->surface != NULL) {
++		b->surface->release();
++	}
+ 	STEP("freeBuffer done");
+ 	OSDecrementAtomic((SInt32 *) &gBuffers);
+ 	bzero(b, sizeof(*b));
+@@ -491,6 +521,127 @@
+ }
+ 
+ /*
++ * Selector 0x7e (patch 0163; userland/s8mali/s8mali_drm.h struct s8mali_surface): an IOSurface's own memory as a GPU buffer, so
++ * a GL texture of Mesa/Panfrost can BE the surface (no glTexImage2D of 16 MB in, no glReadPixels out). With the lock held.
++ *   handle == MALI_SURFACE_DESCRIBE: only fills the geometry. Otherwise a buffer is made (or, when this client already has one
++ *   for this very surface, its handle comes back: Mesa asks twice per import, panfrost_bo_import and pan_kmod_bo_import):
++ *   - the surface is looked up by sweet_surface_copy(id) (retained; the buffer keeps that reference until GEM_CLOSE or the
++ *     client's end, so the memory and its kernel mapping outlive the surface's IOSurface id and stay valid for the GPU);
++ *   - every 4 KiB of the surface's memory is entered into the GPU's address space like CREATE_BO does (same VA rules: GPU
++ *     address from s8mali_va_alloc, 16 KiB aligned, non-exec). The PAs come from the kernel pmap by the surface's kernel VA
++ *     (SweetSurface::kernelAddress), except for a scan-out pool surface (scanoutPhys != 0, physically contiguous memory
++ *     outside XNU's RAM) where they are scanoutPhys + offset;
++ *   - cache: the surface's memory is cacheable kernel/user memory (the GPU is not coherent). b->kva/b->backed are the surface's
++ *     kernel mapping and size, so syncAll() (listed buffers only, patches 0161/0162) cleans+invalidates the whole surface
++ *     around a job exactly as for a CREATE_BO buffer. Nothing else is done to the surface's memory here.
++ * The buffer's memory descriptor is the surface's own, so clientMemoryForType(handle) maps the surface into the program.
++ */
++IOReturn
++S8MaliUserClient::surfaceBO(struct mali_surface * r)
++{
++	SweetSurface * ss = sweet_surface_copy(r->surface);
++	struct mali_buffer * b = NULL;
++	uint64_t size, address;
++	vm_offset_t kva;
++	bool pool, mapped = true;
++	bool plane0;
++
++	if (ss == NULL) {
++		return kIOReturnNotFound;
++	}
++	size = round_page_64(ss->allocSize);
++	plane0 = ss->planeCount > 0;
++	r->size = size;
++	r->offset = plane0 ? ss->planes[0].offset : ss->offset;
++	r->row_bytes = plane0 ? ss->planes[0].bytesPerRow : ss->bytesPerRow;
++	r->width = plane0 ? ss->planes[0].width : ss->width;
++	r->height = plane0 ? ss->planes[0].height : ss->height;
++	r->pixel_format = ss->pixelFormat;
++	r->planes = ss->planeCount;
++	if (r->handle == MALI_SURFACE_DESCRIBE) {
++		ss->release();
++		return kIOReturnSuccess;
++	}
++	for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
++		if (fBuffers[i].surface == ss) {
++			r->handle = i + 1;
++			ss->release();
++			return kIOReturnSuccess;
++		}
++	}
++	if (size == 0 || size > MALI_BUFFER_MAX || ss->memory == NULL) {
++		ss->release();
++		return kIOReturnBadArgument;
++	}
++	pool = ss->scanoutPhys != 0;
++	kva = (vm_offset_t) ss->kernelAddress();
++	if (kva == 0) {
++		IOLog("S8MALI: IOSurface %u has no kernel mapping\n", r->surface);
++		ss->release();
++		return kIOReturnNoMemory;
++	}
++	for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % MALI_BUFFERS;
++
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			r->handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL) {
++		IOLog("S8MALI: no handles left\n");
++		ss->release();
++		return kIOReturnNoSpace;
++	}
++	STEP("surfaceBO surface=%u handle=%u size=0x%llx kva=0x%llx pool=%d, va_alloc next", r->surface, r->handle, size, (uint64_t) kva,
++	    pool ? 1 : 0);
++	address = s8mali_va_alloc(size, false);
++	if (address == 0) {
++		IOLog("S8MALI: no GPU address space for IOSurface %u (%llu bytes)\n", r->surface, size);
++		ss->release();
++		return kIOReturnNoSpace;
++	}
++	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++		uint64_t phys = pool ? ss->scanoutPhys + offset : s8mali_kva_pa(kva + (vm_offset_t) offset);
++
++		STEP_PAGE("surfaceBO bo=%u off=0x%llx pa=0x%llx", r->handle, offset, phys);
++		if (!pool && !s8mali_pa_ok(phys, 4096)) {
++			s8mali_log_bad_pa(phys, r->handle, offset, "surfaceBO.pmap_find_phys");
++			mapped = false;
++			break;
++		}
++		mapped = pool ? s8mali_map_page_pool(address + offset, phys) : s8mali_map_page(address + offset, phys);
++		if (!mapped) {
++			printf("S8MALI: map_page failed bo=%u off=0x%llx pa=0x%llx step=surfaceBO.map_page\n", r->handle, offset, phys);
++		}
++	}
++	if (!mapped) {
++		IOLog("S8MALI: IOSurface %u (%llu bytes) cannot be entered into the GPU's address space\n", r->surface, size);
++		s8mali_unmap(address, size, size);
++		ss->release();
++		return kIOReturnNoMemory;
++	}
++	s8mali_maps_done(address, size);
++	ss->memory->retain();           /* freeBuffer releases it like a CREATE_BO descriptor */
++	b->memory = ss->memory;
++	b->surface = ss;                /* the reference sweet_surface_copy gave */
++	b->kva = kva;
++	b->address = address;
++	b->size = size;
++	b->backed = size;
++	b->flags = PANFROST_BO_NOEXEC;
++	OSIncrementAtomic((SInt32 *) &gBuffers);
++	if (allow(&gLogBO, 100)) {
++		IOLog("S8MALI: bo surface id=%u handle=%u va=0x%llx size=0x%llx %ux%u pitch=%u offset=%u fmt=0x%x planes=%u%s (buffers=%u)\n",
++		    r->surface, r->handle, address, size, r->width, r->height, r->row_bytes, r->offset, r->pixel_format, r->planes,
++		    pool ? " scan-out pool" : "", gBuffers);
++	}
++	return kIOReturnSuccess;
++}
++
++/*
+  * With the lock held: clean + invalidate by kernel VA the memory the job is about to use (before it) or has used (after it).
+  * Before patch 0161 this was every buffer of the client, heap included, twice per job: the 64 MiB tiler heap alone is a million
+  * cache lines, and a submit cost 33-70 ms of it while the job itself ran 50-470 us (phone, 2026-11-28, SUBMIT16 vs JOBCLK).
+@@ -621,6 +772,7 @@
+ 		struct drm_panfrost_get_bo_offset offset;
+ 		struct drm_panfrost_madvise madvise;
+ 		struct mali_wait waitseq;
++		struct mali_surface surface;
+ 	} r;
+ 	size_t size = args->structureInputSize;
+ 	struct mali_buffer * b;
+@@ -682,6 +834,9 @@
+ 	case kPanfrostCreateBO:
+ 		ret = createBO(&r.create);
+ 		break;
++	case kS8MaliSurface:
++		ret = surfaceBO(&r.surface);
++		break;
+ 	case kPanfrostMmapBO:                   /* the offset is the handle: the program maps client memory of that type */
+ 		STEP("MMAP_BO handle=%u", r.mmap.handle);
+ 		ret =buffer(r.mmap.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
+--- a/osfmk/kern/s8_mali_drv.c
++++ b/osfmk/kern/s8_mali_drv.c
+@@ -454,17 +454,21 @@
+ 	return (pa & PTE_ADDRESS) | PTE_AF | PTE_SH_INNER | PTE_AP_RW | PTE_PAGE;
+ }
+ 
+-/* one 4 KiB Mali page, no cache maintenance (s8mali_maps_done does it) */
++/*
++ * one 4 KiB Mali page, no cache maintenance (s8mali_maps_done does it). `pool` (patch 0163): the page is of a scan-out pool
++ * surface (SweetSurface::scanoutPhys), memory outside XNU's RAM and below 4 GiB that the display controller reads: it is not in
++ * [gPhysBase, +gPhysSize), so the RAM check is replaced by "below 4 GiB, not 0".
++ */
+ static bool
+-map_page(uint64_t gpu, uint64_t pa)
++map_page(uint64_t gpu, uint64_t pa, bool pool)
+ {
+ 	volatile uint64_t *t0, *t1, *t2, *t3;
+ 
+ 	if (gpu < VA_START || gpu >= VA_END || (g_pa_bits < 64 && (pa >> g_pa_bits) != 0)) {
+ 		return false;
+ 	}
+-	if (!s8mali_pa_ok(pa, MALI_PG)) {
+-		s8mali_log_bad_pa(pa, 0, gpu, "map_page");
++	if (pool ? (pa == 0 || pa >= (4ull << 30)) : !s8mali_pa_ok(pa, MALI_PG)) {
++		s8mali_log_bad_pa(pa, 0, gpu, pool ? "map_page.pool" : "map_page");
+ 		return false;
+ 	}
+ 	if (t_l2[gpu >> 30].va == 0 && !tbl_alloc(&t_l2[gpu >> 30])) {
+@@ -788,7 +792,20 @@
+ 	bool ok;
+ 
+ 	lck_mtx_lock(&s8d_lock);
+-	ok = g_up && map_page(gpu, pa);
++	ok = g_up && map_page(gpu, pa, false);
++	lck_mtx_unlock(&s8d_lock);
++	return ok;
++}
++
++/* the same for a page of a scan-out pool surface's memory (see map_page) */
++bool s8mali_map_page_pool(uint64_t gpu, uint64_t pa);
++bool
++s8mali_map_page_pool(uint64_t gpu, uint64_t pa)
++{
++	bool ok;
++
++	lck_mtx_lock(&s8d_lock);
++	ok = g_up && map_page(gpu, pa, true);
+ 	lck_mtx_unlock(&s8d_lock);
+ 	return ok;
+ }
