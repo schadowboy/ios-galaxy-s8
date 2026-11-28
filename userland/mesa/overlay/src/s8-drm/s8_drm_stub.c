@@ -219,6 +219,15 @@ hakios_drm_map(int fd, uint32_t handle, uint64_t size)
 	NO(ENOSYS, MAP_FAILED);
 }
 
+int
+s8_drm_surface(int fd, struct s8_drm_surface *surface)
+{
+	if (ops.Surface) {
+		return ops.Surface(fd, surface);
+	}
+	NO(ENOSYS, -1);
+}
+
 void
 hakios_drm_unmap(int fd, uint32_t handle, void *address)
 {

@@ -60,4 +60,16 @@ int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t
 void *hakios_drm_map(int fd, uint32_t handle, uint64_t size);
 void hakios_drm_unmap(int fd, uint32_t handle, void *address);
 
+/* An IOSurface described by the kernel driver (selector 0x7e with handle = DESCRIBE; same layout as userland/s8mali/s8mali_drm.h
+ * struct s8mali_surface). `surface` in: the IOSurface's ID. Used by pan_kmod.c and osmesa_target.c (patch 0006). Returns 0, or -1
+ * with errno (ENOSYS when the host has no such call or the kernel no such selector). */
+struct s8_drm_surface {
+	uint32_t surface;
+	uint32_t handle; /* (set by the call) */
+	uint64_t size;
+	uint32_t offset, row_bytes;
+	uint32_t width, height, pixel_format, planes;
+};
+int s8_drm_surface(int fd, struct s8_drm_surface *surface);
+
 #endif

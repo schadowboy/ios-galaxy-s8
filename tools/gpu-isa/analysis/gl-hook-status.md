@@ -46,6 +46,8 @@ Evidence = observations on the phone; guesses are marked. Route and rule: see me
 ## Next
 1. Zero-copy IOSurface import: S8Mali selector 0x7e (IOSurface id -> GPU buffer object over the surface's own memory), Mesa patch 0006 (pan_kmod/pan_bo/osmesa surface +
    glEGLImageTargetTexture2DOES with a surface id), shim s8mali_surface (done); attrs: SweetSurface memory is cached, S9+ used write-combined.
-2. Zero-copy IOSurface import (S8Mali selector 0x7e + Mesa patch 0006) to remove the ~16 MB copies per frame.
+2. Zero-copy IOSurface import: WRITTEN 2026-11-28, never built or run: kernel xnu/patches/0163-s8-mali-surface-bo.patch (selector 0x7e), Mesa
+   userland/mesa/patches/0006-osmesa-panfrost-iosurface-import.patch (+ overlay `s8_drm_surface`/ops `Surface`), hook_gl_surface_texture() in gl_osmesa_s8.c.
+   Test: Mac-built kernel with 0163, rebuilt Mesa (CI) and libs8gl, boot-arg `glshare=1` (log: "is a texture of its own memory", S8MALI "bo surface id=").
 3. Colour channel problem on the Mali path; missing icons/widget contents.
 4. Move the working parts into the kernel (the hook is test-only).

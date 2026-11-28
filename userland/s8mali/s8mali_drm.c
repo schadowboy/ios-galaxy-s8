@@ -642,10 +642,10 @@ drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
 /*
  * Buffers as file descriptors for other programs: there are none. Memory somebody else made does come in, as the S9+ shim
  * does it: an IOSurface, by its ID, where Linux's driver expects a dma-buf descriptor (Mesa's pan_kmod_bo_import ->
- * drmPrimeFDToHandle(fd, surface_id), with the S9+ hunks of panfrost-darwin.patch, NOT in our Mesa patches yet). The kernel
- * selector 0x7e is NOT in S8Mali yet (s8mali_drm.h, struct s8mali_surface), so today this fails with ENOSYS from the
- * kernel's kIOReturnUnsupported, which is what Mesa's caller expects of a surface it could not make a buffer of (it then
- * copies). Exporting a buffer (drmPrimeHandleToFD) stays unsupported: nobody needs it.
+ * drmPrimeFDToHandle(fd, surface_id), with the S9+ hunks of panfrost-darwin.patch ported as our Mesa patch 0006). The kernel
+ * selector 0x7e is S8Mali's since kernel patch 0163 (s8mali_drm.h, struct s8mali_surface); on a kernel without it this fails
+ * with ENOSYS from the kernel's kIOReturnUnsupported, which is what Mesa's caller expects of a surface it could not make a
+ * buffer of (it then copies). Exporting a buffer (drmPrimeHandleToFD) stays unsupported: nobody needs it.
  */
 int
 drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)

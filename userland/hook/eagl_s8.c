@@ -934,7 +934,7 @@ fourcc(uint32_t format)
 
 /*
  * Make a texture, which is bound, of its IOSurface's own memory, if that is what is asked for (the whole of a surface of
- * blue-first pixels, the same way up) and the library can do it (hook_gl_surface_texture(): today it cannot).
+ * blue-first pixels, the same way up) and the library can do it (hook_gl_surface_texture(): Mesa patch 0006 + kernel patch 0163, untested).
  */
 static bool
 surface_shared(struct eagl *e, struct image *image)

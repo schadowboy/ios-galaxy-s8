@@ -36,9 +36,9 @@ void *hook_gl_proc(const char *name);
  * glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (void *)(uintptr_t)surface_id) with a Mesa patch that
  * asks the kernel driver for a buffer object of the surface's memory (selector 0x7e, see
  * s8mali_drm.h). 0: not done; the caller then fills the texture from the surface and reads it back
- * (copy path). NOT WORKING YET on purpose: eagl_s8.c asks only with the boot-arg/environment glshare=1,
- * and the library answers 0 unless it is Panfrost AND has glEGLImageTargetTexture2DOES (it then still
- * fails with a GL error until the Mesa patch and the kernel selector exist).
+ * (copy path). Written, NOT yet run on a phone: eagl_s8.c asks only with the boot-arg/environment glshare=1,
+ * and the library answers 0 unless it is Panfrost AND has glEGLImageTargetTexture2DOES (Mesa patch 0006)
+ * AND the kernel has selector 0x7e (S8Mali patch 0163); any GL error is a 0 (copy path).
  */
 int hook_gl_surface_texture(struct hook_gl *gl, uint32_t surface_id);
 

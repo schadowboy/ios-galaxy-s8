@@ -97,6 +97,12 @@ shim_free_version(void *version)
 	drmFreeVersion(version);
 }
 
+static int
+shim_surface(int fd, void *surface)
+{
+	return s8mali_surface(fd, (struct s8mali_surface *)surface);
+}
+
 static void
 fill_ops(struct s8_drm_ops *o)
 {
@@ -124,6 +130,7 @@ fill_ops(struct s8_drm_ops *o)
 	o->SyncobjTransfer = drmSyncobjTransfer;
 	o->Map = hakios_drm_map;
 	o->Unmap = hakios_drm_unmap;
+	o->Surface = shim_surface;
 }
 
 typedef void *OSMesaContext;

@@ -170,6 +170,13 @@ shim_free_version(void *version)
 	drmFreeVersion(version);
 }
 
+/* Mesa's s8_drm_surface (xf86drm.h of the overlay) has the layout of struct s8mali_surface */
+static int
+shim_surface(int fd, void *surface)
+{
+	return s8mali_surface(fd, (struct s8mali_surface *)surface);
+}
+
 static void
 fill_ops(struct s8_drm_ops *o)
 {
@@ -197,6 +204,7 @@ fill_ops(struct s8_drm_ops *o)
 	o->SyncobjTransfer = drmSyncobjTransfer;
 	o->Map = hakios_drm_map;
 	o->Unmap = hakios_drm_unmap;
+	o->Surface = shim_surface;
 }
 
 /* Load Mesa once, and decide between the GPU and the CPU. 1: loaded. */
@@ -362,18 +370,29 @@ hook_gl_destroy(struct hook_gl *gl)
 }
 
 /*
- * OES_EGL_image, with the IOSurface's ID as the image: the kernel's GPU driver would make a buffer object of the surface's
- * memory. NOT DONE: it needs (1) the S9+ hunks of panfrost-darwin.patch (pan_kmod/pan_bo/osmesa target: drmPrimeFDToHandle
- * with the surface ID, whole-BO import) ported to Mesa 25.0.7 as userland/mesa/patches/0006, and (2) the kernel selector 0x7e in
- * S8Mali (s8mali_drm.h, struct s8mali_surface). Until then the call below fails with a GL error (or the entry point does not
- * exist) and the caller copies. Only the Panfrost driver is asked; eagl_s8.c asks at all only with glshare=1.
+ * OES_EGL_image with the IOSurface's ID as the image (zero copy): the texture bound to GL_TEXTURE_2D becomes the surface's own
+ * memory. The chain (every part written, none run on a phone yet):
+ *   glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (void *)surface_id)
+ *     -> Mesa patch 0006 (osmesa_st_get_egl_image -> osmesa_surface_resource in osmesa_target.c): s8_drm_surface() describes the
+ *        surface (s8_drm_ops.Surface = s8mali_surface(), kernel selector 0x7e with handle = DESCRIBE), then
+ *        resource_from_handle(WINSYS_HANDLE_TYPE_FD, handle = the ID, stride/offset from the description)
+ *     -> panfrost_bo_import -> drmPrimeFDToHandle (s8mali_drm.c: selector 0x7e, S8Mali patch 0163 makes a BO whose GPU pages
+ *        are the surface's memory) and pan_kmod_bo_import (size from the description, GET_BO_OFFSET).
+ * A failure at any step gives GL_INVALID_VALUE (or no entry point) and 0 here: the caller copies, as it always did. Not asked
+ * of softpipe (a CPU renderer has no buffer to share). Called once per texture the caller makes of a surface, never per frame:
+ * the BO lives as long as the texture's last reference (re-targeting a texture frees the old BO, which makes the kernel unmap
+ * and re-enter 16 MB of pages). The first few results are logged, with the surface's geometry.
+ * The kernel's missing selector (ENOSYS, a kernel before 0163) switches the whole thing off after one line in the log.
  */
 int
 hook_gl_surface_texture(struct hook_gl *gl, uint32_t surface_id)
 {
 	static void (*image_target)(unsigned target, void *image);
 	static unsigned (*get_error)(void);
-	static int asked;
+	static int asked, off;
+	static unsigned shared, refused;
+	struct s8mali_surface d;
+	unsigned error;
 
 	(void)gl;
 	if (!asked) {
@@ -383,19 +402,54 @@ hook_gl_surface_texture(struct hook_gl *gl, uint32_t surface_id)
 		s8gl_say("s8gl: surface sharing: glEGLImageTargetTexture2DOES %s, driver %s\n", image_target ? "found" : "NOT in the library",
 		    hook_gl_library());
 	}
-	if (image_target == NULL || get_error == NULL || driver != DRIVER_PANFROST) {
+	if (off || image_target == NULL || get_error == NULL || driver != DRIVER_PANFROST) {
+		return 0;
+	}
+	/* what the kernel says of the surface: no selector (old kernel), no such surface, or a layout the GPU cannot use */
+	memset(&d, 0, sizeof(d));
+	d.surface = surface_id;
+	if (s8mali_surface(0, &d) != 0) {
+		int e = errno;
+
+		if (e == ENOSYS) {
+			off = 1;
+			s8gl_say("s8gl: surface sharing OFF: the S8Mali service has no selector 0x7e (kernel before patch 0163); surfaces are copied\n");
+		} else if (refused++ < 10) {
+			s8gl_say("s8gl: surface %u: the kernel cannot describe it (errno %d, kr 0x%x): copied\n", surface_id, e,
+			    (unsigned)s8mali_last_kr());
+		}
 		return 0;
 	}
 	while (get_error() != 0) {
 	}
 	image_target(GL_TEXTURE_2D, (void *)(uintptr_t)surface_id);
-	return get_error() == 0;
+	error = get_error();
+	while (get_error() != 0) {
+	}
+	if (error != 0) {
+		if (refused++ < 10) {
+			s8gl_say("s8gl: surface %u (%ux%u fmt 0x%x planes %u pitch %u offset %u size %llu): glEGLImageTargetTexture2DOES -> GL error 0x%x: copied\n",
+			    surface_id, d.width, d.height, d.pixel_format, d.planes, d.row_bytes, d.offset, (unsigned long long)d.size, error);
+		}
+		if (refused >= 10 && shared == 0) {
+			off = 1;
+			s8gl_say("s8gl: surface sharing OFF: %u refusals and no success\n", refused);
+		}
+		return 0;
+	}
+	if (shared++ < 6) {
+		s8gl_say("s8gl: surface %u (%ux%u fmt 0x%x planes %u pitch %u offset %u size %llu) is a texture of its own memory (%u so far)\n",
+		    surface_id, d.width, d.height, d.pixel_format, d.planes, d.row_bytes, d.offset, (unsigned long long)d.size, shared);
+	}
+	return 1;
 }
 
 /*
- * Wait for the GPU. glFinish makes Mesa's panfrost wait for its last job (drmSyncobjWait on the shim's job numbers); the
- * S8Mali kernel driver runs jobs synchronously inside SUBMIT today (s8mali-abi.md), so the explicit wait for the last job
- * number is a no-op that stays correct when the kernel gets a queue.
+ * Wait for the GPU. glFinish makes Mesa's panfrost submit what is batched and wait for its last job (drmSyncobjWait on the
+ * shim's job numbers); the S8Mali kernel driver runs jobs synchronously inside SUBMIT today (s8mali-abi.md), so the explicit
+ * wait for the last job number is a no-op that stays correct when the kernel gets a queue. The CPU's cache needs nothing here:
+ * the kernel invalidates the surface's lines after the fragment job of each batch (patch 0162, 0163), so the window server's
+ * CPU reads of the surface (the display driver's copy) see the GPU's pixels.
  */
 int
 hook_gl_surface_wait(struct hook_gl *gl, uint32_t surface_id)

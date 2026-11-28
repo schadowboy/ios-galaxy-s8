@@ -40,6 +40,9 @@ struct s8_drm_ops {
 	    uint32_t flags);
 	void *(*Map)(int fd, uint32_t handle, uint64_t size);
 	void (*Unmap)(int fd, uint32_t handle, void *address);
+	/* patch 0006: describe an IOSurface (struct s8_drm_surface of xf86drm.h, passed as void *): 0 or -1 with errno.
+	 * Appended last: an older host's shorter table (size) leaves it NULL and Mesa then copies surfaces. */
+	int (*Surface)(int fd, void *surface);
 };
 
 /*
