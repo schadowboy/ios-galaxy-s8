@@ -1,0 +1,117 @@
+--- a/osfmk/kern/s8_mali_drv.c
++++ b/osfmk/kern/s8_mali_drv.c
+@@ -1065,6 +1065,34 @@
+ }
+ 
+ /* boot-arg s8mali_syncall=1 (S8Mali.cpp syncAll): clean+invalidate every buffer, heap included, around every job, as before patch 0161 */
++/*
++ * Patch 0166, boot-arg s8mali_lazy=1 (experiment, default off): IOSurface buffers are swept before a job only when their seed moved
++ * (S8Mali.cpp syncAll), never after one; the display copy invalidates the surface it reads: s8mali_cpu_will_read().
++ */
++bool s8mali_lazy(void);
++bool
++s8mali_lazy(void)
++{
++	static int on = -1;
++
++	if (on < 0) {
++		uint32_t v = 0;
++
++		on = PE_parse_boot_argn("s8mali_lazy", &v, sizeof(v)) && v != 0;
++		P("s8mali_lazy=%d: %s", on, on ? "IOSurface buffers swept only when their seed moved" : "every listed buffer swept around every job");
++	}
++	return on != 0;
++}
++
++void s8mali_cpu_will_read(uintptr_t kva, size_t len);
++void
++s8mali_cpu_will_read(uintptr_t kva, size_t len)
++{
++	if (s8mali_lazy() && kva != 0 && len != 0) {
++		FlushPoC_DcacheRegion((vm_offset_t)kva, len);
++	}
++}
++
+ bool s8mali_syncall_requested(void);
+ bool
+ s8mali_syncall_requested(void)
+--- a/iokit/Kernel/arm/S8Mali.cpp
++++ b/iokit/Kernel/arm/S8Mali.cpp
+@@ -67,7 +67,8 @@
+ uint32_t s8mali_gpu_submit(uint64_t chain, bool fragment, uint64_t * seq);
+ uint64_t s8mali_now(void);                      /* s8_mali_drv.c: mach_absolute_time, for the phase timing of a submit */
+ void s8mali_submit_done(uint64_t entered);
+-bool s8mali_coherent(void);                     /* s8_mali_drv.c: ACE-Lite is on (boot-arg s8mali_coh=1), so no cache sweeps around jobs (patch 0164) */
++bool s8mali_lazy(void);                         /* s8_mali_drv.c: boot-arg s8mali_lazy=1 (patch 0166): IOSurface buffers are swept before a job only when their seed moved */
++bool s8mali_coherent(void);                    /* s8_mali_drv.c: ACE-Lite is on (boot-arg s8mali_coh=1), so no cache sweeps around jobs (patch 0164) */
+ bool s8mali_syncall_requested(void);            /* boot-arg s8mali_syncall=1: every buffer, heap included, around every job (the way before patch 0161) */
+ bool s8mali_gpu_wait(uint64_t seq, uint64_t timeout_ns);
+ bool s8mali_pa_ok(uint64_t pa, uint64_t len);
+@@ -176,6 +177,8 @@
+ 	SweetSurface * surface;                 /* patch 0163: != NULL: the buffer is this IOSurface's own memory (`memory` is the surface's
+ 	                                         * descriptor, retained; `kva` the surface's kernel mapping). Holds a reference on the
+ 	                                         * surface; GEM_CLOSE unmaps it from the GPU and drops both, it never frees the memory. */
++	uint32_t seed_seen;                     /* patch 0166 (boot-arg s8mali_lazy=1): the IOSurface seed at this buffer's last sweep before a job */
++	bool seed_valid;
+ };
+ 
+ static IOLock * gLock;
+@@ -653,7 +656,7 @@
+ void
+ S8MaliUserClient::syncAll(const char * when, user_addr_t list, uint32_t count)
+ {
+-	static int everything = -1;
++	static int everything = -1, lazy = -1;
+ 	uint32_t synced = 0;
+ 	uint64_t bytes = 0;
+ 	bool listed = list != 0 && count != 0;
+@@ -663,6 +666,7 @@
+ 	}
+ 	if (everything < 0) {
+ 		everything = s8mali_syncall_requested() ? 1 : 0;
++		lazy = !everything && s8mali_lazy() ? 1 : 0;
+ 	}
+ 	if (everything) {
+ 		listed = false;
+@@ -680,6 +684,21 @@
+ 				struct mali_buffer * b = buffer(handles[k]);
+ 
+ 				if (b != NULL && !(b->flags & PANFROST_BO_HEAP)) {
++					if (lazy && b->surface != NULL) {
++						/*
++						 * Patch 0166, experiment: an imported IOSurface is swept before a job only when its seed moved since the
++						 * last sweep (the CPU writes through IOSurfaceLock/Unlock, which bump it), and never after a job: the
++						 * display copy (AppleCLCD::present) invalidates what it is about to read (s8mali_cpu_will_read). 0x0c is
++						 * SWEET_SURFACE_STATE_SEED in the surface's shared state page.
++						 */
++						uint32_t seed = *(volatile uint32_t *)((uint8_t *)b->surface->state->getBytesNoCopy() + 0x0c);
++
++						if (when[0] != 'b' || (b->seed_valid && b->seed_seen == seed)) {
++							continue;
++						}
++						b->seed_seen = seed;
++						b->seed_valid = true;
++					}
+ 					s8mali_bo_sync(b->kva, b->backed);
+ 					synced++;
+ 					bytes += b->backed;
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -92,6 +92,7 @@
+     thread_t *new_thread);
+ extern "C" void thread_deallocate(thread_t thread);
+ extern "C" void clean_dcache(vm_offset_t addr, unsigned length, boolean_t phys);
++extern "C" void s8mali_cpu_will_read(uintptr_t kva, size_t len);        /* s8_mali_drv.c (patch 0166): invalidates when s8mali_lazy=1 */
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -905,6 +906,9 @@
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		if (src != 0 && s->memory != NULL) {
++			s8mali_cpu_will_read(src, (size_t)s->memory->getLength());      /* patch 0166: the GPU wrote it, drop the CPU's stale lines first */
++		}
+ 		if (fScale && src != 0 && bpe == 4 && s->width == fLogicalW && s->height == fLogicalH &&
+ 		    s->elementWidth == 1 && s->elementHeight == 1 && sx <= 0 && sy <= 0 && dx <= 0 && dy <= 0 &&
+ 		    s->memory != NULL && (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height <= s->memory->getLength()) {
