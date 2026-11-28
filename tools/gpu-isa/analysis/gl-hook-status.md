@@ -86,3 +86,9 @@ Evidence = observations on the phone; guesses are marked. Route and rule: see me
 - The decisive experiment needs the user: boot with the hook (s8_inject on) AND without (baseline image) and have the home screen shown (swipe up); compare icons, and pull the kernel
   log of the attended run (SWEET SURF creators, iconservicesagent surfaces, selectors 40/41) plus the hook log (icon-sized uploads).
 - Baseline lock screen via CPU: red clock text (hook run: cyan clock) on the blue gradient; the hook run's colours differ on the lock screen too (wallpaper tint? colour matrix?).
+
+## 2026-11-28 night, CORRECTION of the colour claim
+- Three lock-screen thumbnails of three boots: CPU baseline = blue wallpaper + red clock; hook with the colour-matrix programs ON = teal/blue wallpaper + cyan clock; hook with
+  glvibrant=0 glds8=0 = red->blue gradient wallpaper + white clock. The wallpaper is the default gradient poster made by CollectionsPoster and it is NOT the same on every boot, so
+  "colours differ from the software renderer" cannot be concluded from different boots. A fair colour comparison needs the same wallpaper (e.g. fix a photo wallpaper in the root) or the
+  same-boot A/B (not possible). The vcm/c4p/ds8 programs ran without faults/errors; their correctness is still unverified.
