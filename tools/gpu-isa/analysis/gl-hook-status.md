@@ -51,3 +51,11 @@ Evidence = observations on the phone; guesses are marked. Route and rule: see me
    Test: Mac-built kernel with 0163, rebuilt Mesa (CI) and libs8gl, boot-arg `glshare=1` (log: "is a texture of its own memory", S8MALI "bo surface id=").
 3. Colour channel problem on the Mali path; missing icons/widget contents.
 4. Move the working parts into the kernel (the hook is test-only).
+
+## 2026-11-28 evening: zero-copy IOSurface import (0163 + Mesa 0006/0007 + libs8gl) measured on the phone
+- Kernel selector 0x7e imports the 1440x2960 BGRA surfaces as GPU buffers (kernel log `S8MALI: bo surface id=...`), Mesa textures of their own memory (hook log
+  "is a texture of its own memory"), no faults, no GL errors on them. Small surfaces (194x237, pitch 776 not 64-aligned) are refused by Mesa (GL error 0x501) and copied.
+- Frames: copy-out 0 ms, simple frames 15-25 ms, typical 150-200 ms, heaviest ~0.7 s. A typical frame is now 9 vertex + 9 fragment submits at ~7 ms each (cache
+  sweeps of the 17 MB surfaces; the jobs run 0.2-0.5 ms).
+- Next: 0164 (xnu/patches) logs COHERENCY_FEATURES and, with boot-arg s8mali_coh=1, enables ACE-Lite and skips the sweeps (experiment). Blocked on a kernel built with
+  Xcode 15.4: the Mac's Xcode is 16.4 since the last build, see memory feedback-hosted-kernel-build-broken.
