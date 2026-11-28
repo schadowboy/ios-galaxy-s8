@@ -1,0 +1,47 @@
+--- a/iokit/Kernel/arm/S8Mali.cpp
++++ b/iokit/Kernel/arm/S8Mali.cpp
+@@ -161,6 +161,7 @@
+ static IOLock * gLock;
+ static uint32_t gLogOpen, gLogBO, gLogSubmit, gLogMisc;
+ static uint32_t gClients, gBuffers, gSubmits, gFailed;
++static bool gPairOpen;                  /* a vertex/tiler job has run and its fragment job has not yet (patch 0162) */
+ 
+ /* rate limit: the first `first` lines, then every 1024th */
+ static inline bool
+@@ -700,11 +701,32 @@
+ 		STEP("SUBMIT enter jc=0x%llx req=0x%x bos=%u", r.submit.jc, r.submit.requirements, r.submit.bo_handle_count);
+ 		if (r.submit.jc != 0) {
+ 			/* cacheable program mappings, non-coherent GPU: clean+invalidate every buffer by kernel VA (data caches are physically
+-			 * tagged, so lines dirtied through the program's own mapping are covered) before the job, and again after it */
+-			syncAll("before the job", (user_addr_t) r.submit.bo_handles, r.submit.bo_handle_count);
++			 * tagged, so lines dirtied through the program's own mapping are covered) before the job, and again after it.
++			 * Patch 0162: Mesa submits a batch's vertex/tiler job (JS1) and then its fragment job (JS0) with no CPU access between
++			 * them, so the buffers are cleaned before the first and invalidated after the second only (two sweeps of the 17 MB
++			 * texture and render target buffers per batch instead of four). A vertex job that is not followed by its fragment job
++			 * gets its after-sync before the next batch; s8mali_syncall=1 turns the pairing off with the rest of the sync savings. */
++			static int pairing = -1;
++			const bool fragment = (r.submit.requirements & PANFROST_JD_REQ_FS) != 0;
++			const user_addr_t list = (user_addr_t) r.submit.bo_handles;
++
++			if (pairing < 0) {
++				pairing = s8mali_syncall_requested() ? 0 : 1;
++			}
++			if (!pairing || !(fragment && gPairOpen)) {
++				if (pairing && !fragment && gPairOpen) {
++					syncAll("after the vertex job that had no fragment job", 0, 0);
++				}
++				syncAll("before the job", list, r.submit.bo_handle_count);
++			}
+ 			__asm__ volatile ("dsb sy" ::: "memory");
+-			status = s8mali_gpu_submit(r.submit.jc, (r.submit.requirements & PANFROST_JD_REQ_FS) != 0, &seq);
+-			syncAll("after the job", (user_addr_t) r.submit.bo_handles, r.submit.bo_handle_count);
++			status = s8mali_gpu_submit(r.submit.jc, fragment, &seq);
++			if (pairing && !fragment) {
++				gPairOpen = true;
++			} else {
++				gPairOpen = false;
++				syncAll("after the job", list, r.submit.bo_handle_count);
++			}
+ 			if (status != 0) {
+ 				/* the GPU was reset; the job is lost. The call still succeeds (Mesa would abort on an error) */
+ 				gFailed++;
