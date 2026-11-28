@@ -1,0 +1,68 @@
+--- a/osfmk/kern/s8_mali_drv.c
++++ b/osfmk/kern/s8_mali_drv.c
+@@ -328,6 +328,8 @@
+ 	    rd(AS0 + AS_STATUS), rd(AS0 + AS_FAULTSTATUS), rd(AS0 + AS_FAULTADDR_HI), rd(AS0 + AS_FAULTADDR_LO));
+ }
+ 
++static bool g_coherent;         /* ACE-Lite enabled (boot-arg s8mali_coh=1 and the GPU offers it) */
++
+ static bool
+ gpu_reset(void)
+ {
+@@ -337,11 +339,35 @@
+ 		return false;
+ 	}
+ 	wr(GPU_INT_CLEAR, 0xffffffffu);
+-	wr(COHERENCY_ENABLE, COHERENCY_NONE);
++	{
++		/*
++		 * COHERENCY_FEATURES (0x300) says which coherency protocols the GPU's bus port speaks (bit 0 ACE-Lite, bit 1 ACE, bit 31 none):
++		 * logged once. Boot-arg s8mali_coh=1 enables ACE-Lite (COHERENCY_ENABLE = 0) when bit 0 is there, and s8mali_coherent() then tells
++		 * the user client that the per-job cache sweeps are not needed (patch 0164, experiment: a wrong guess shows as stale or torn pixels
++		 * or a GPU/bus hang; default off = non-coherent as before).
++		 */
++		static bool said;
++		uint32_t feat = rd(0x300), want = 0;
++
++		if (!said) {
++			(void)PE_parse_boot_argn("s8mali_coh", &want, sizeof(want));
++			g_coherent = want != 0 && (feat & 1u) != 0;
++			P("coherency features 0x%x, s8mali_coh=%u -> %s", feat, want, g_coherent ? "ACE-Lite ON, no cache sweeps" : "non-coherent");
++			said = true;
++		}
++		wr(COHERENCY_ENABLE, g_coherent ? 0u : COHERENCY_NONE);
++	}
+ 	wr(GPU_L2_MMU_CONFIG, rd(GPU_L2_MMU_CONFIG) & ~L2_MMU_LIMIT_EXTERNAL);
+ 	return true;
+ }
+ 
++bool s8mali_coherent(void);
++bool
++s8mali_coherent(void)
++{
++	return g_coherent;
++}
++
+ static bool
+ power_wait(uint32_t pwron, uint32_t ready, uint32_t mask, const char *name)
+ {
+--- a/iokit/Kernel/arm/S8Mali.cpp
++++ b/iokit/Kernel/arm/S8Mali.cpp
+@@ -67,6 +67,7 @@
+ uint32_t s8mali_gpu_submit(uint64_t chain, bool fragment, uint64_t * seq);
+ uint64_t s8mali_now(void);                      /* s8_mali_drv.c: mach_absolute_time, for the phase timing of a submit */
+ void s8mali_submit_done(uint64_t entered);
++bool s8mali_coherent(void);                     /* s8_mali_drv.c: ACE-Lite is on (boot-arg s8mali_coh=1), so no cache sweeps around jobs (patch 0164) */
+ bool s8mali_syncall_requested(void);            /* boot-arg s8mali_syncall=1: every buffer, heap included, around every job (the way before patch 0161) */
+ bool s8mali_gpu_wait(uint64_t seq, uint64_t timeout_ns);
+ bool s8mali_pa_ok(uint64_t pa, uint64_t len);
+@@ -657,6 +658,9 @@
+ 	uint64_t bytes = 0;
+ 	bool listed = list != 0 && count != 0;
+ 
++	if (s8mali_coherent()) {
++		return;                 /* the GPU snoops the CPU caches (ACE-Lite): nothing to clean or invalidate (patch 0164) */
++	}
+ 	if (everything < 0) {
+ 		everything = s8mali_syncall_requested() ? 1 : 0;
+ 	}
