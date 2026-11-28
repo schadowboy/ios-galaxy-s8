@@ -78,3 +78,11 @@ Evidence = observations on the phone; guesses are marked. Route and rule: see me
 - Working hypothesis (unverified): IconServices renders icons with Metal/CoreImage in iconservicesagent and fails without a Metal device (no AGX Metal here). Cheap checks: process
   logs of iconservicesagent (S9+ port's exec_applog_oslog sets OS_ACTIVITY_DT_MODE=YES for all programs so os_log reaches the console: ref/s9plus xnu/hakios.patch ~720-830),
   its sandbox denials, whether the baseline CPU image shows icons at all.
+
+## 2026-11-28 night, CORRECTION of the icon conclusion above
+- The icon analysis (iconservicesagent creates no IOSurface, SpringBoard creates few) was read from UNATTENDED runs: the kernel thumbnails (sweetfb_shot=5) of the baseline (no hook) run
+  and of the 0165 run show only the LOCK screen; nobody swiped to the home screen, and the icon service builds icons when the home screen is shown. So that evidence says nothing
+  about the icons. The only home-screen evidence is the user's photo (labels, widget frames, no icons) from an attended GL run.
+- The decisive experiment needs the user: boot with the hook (s8_inject on) AND without (baseline image) and have the home screen shown (swipe up); compare icons, and pull the kernel
+  log of the attended run (SWEET SURF creators, iconservicesagent surfaces, selectors 40/41) plus the hook log (icon-sized uploads).
+- Baseline lock screen via CPU: red clock text (hook run: cyan clock) on the blue gradient; the hook run's colours differ on the lock screen too (wallpaper tint? colour matrix?).
