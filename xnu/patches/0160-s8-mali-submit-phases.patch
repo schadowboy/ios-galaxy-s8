@@ -1,0 +1,105 @@
+--- a/osfmk/kern/s8_mali_drv.c
++++ b/osfmk/kern/s8_mali_drv.c
+@@ -924,10 +924,12 @@
+ 	static bool jobcfg_known;
+ 	static uint64_t clk_ns, clk_cycles;
+ 	static uint32_t clk_jobs;
+-	uint64_t t0, t1;
++	static uint64_t ph_lock, ph_setup, ph_post;     /* where a submit's wall time goes: waiting for s8d_lock, before the start command, after the job */
++	uint64_t t0, t1, ta = mach_absolute_time(), tl;
+ 	uint32_t c0, c1;
+ 
+ 	lck_mtx_lock(&s8d_lock);
++	tl = mach_absolute_time();
+ 	if (!jobcfg_known) {
+ 		uint32_t v = 0;
+ 
+@@ -978,12 +980,21 @@
+ 		clk_ns += ns;
+ 		clk_cycles += (uint32_t)(c1 - c0);
+ 		if (++clk_jobs == 16) {
+-			P("JOBCLK last 16 jobs: %llu us each, %llu kcycles each = %llu MHz (JS%u)", clk_ns / 16000, clk_cycles / 16000,
+-			    clk_ns != 0 ? clk_cycles * 1000 / clk_ns : 0, slot);
++			uint64_t lock_ns = 0, setup_ns = 0, post_ns = 0;
++
++			absolutetime_to_nanoseconds(ph_lock, &lock_ns);
++			absolutetime_to_nanoseconds(ph_setup, &setup_ns);
++			absolutetime_to_nanoseconds(ph_post, &post_ns);
++			P("JOBCLK last 16 jobs: %llu us each, %llu kcycles each = %llu MHz (JS%u); lock wait %llu us, setup %llu us, tail %llu us each",
++			    clk_ns / 16000, clk_cycles / 16000, clk_ns != 0 ? clk_cycles * 1000 / clk_ns : 0, slot, lock_ns / 16000, setup_ns / 16000,
++			    post_ns / 16000);
+ 			clk_ns = clk_cycles = 0;
+ 			clk_jobs = 0;
++			ph_lock = ph_setup = ph_post = 0;
+ 		}
+ 	}
++	ph_lock += tl - ta;
++	ph_setup += t0 - tl;
+ 	if (!finished) {
+ 		uint64_t fa;
+ 
+@@ -1005,10 +1016,37 @@
+ 	}
+ 	wr(JOB_INT_CLEAR, done | fail);
+ 	g_done_seq = *seq;
++	ph_post += mach_absolute_time() - t1;
+ 	lck_mtx_unlock(&s8d_lock);
+ 	return status;
+ }
+ 
++/* the whole SUBMIT case from the entry of the user client's externalMethod (S8Mali.cpp) to its end, against the driver's own phases above */
++uint64_t s8mali_now(void);
++uint64_t
++s8mali_now(void)
++{
++	return mach_absolute_time();
++}
++
++void s8mali_submit_done(uint64_t entered);
++void
++s8mali_submit_done(uint64_t entered)
++{
++	static uint64_t total;
++	static uint32_t n;
++
++	total += mach_absolute_time() - entered;
++	if (++n == 16) {
++		uint64_t ns = 0;
++
++		absolutetime_to_nanoseconds(total, &ns);
++		P("SUBMIT16: %llu us each from the kernel entry to the end of the submit case", ns / 16000);
++		total = 0;
++		n = 0;
++	}
++}
++
+ /* jobs run to their end inside submit: a number that has been given out is done */
+ bool s8mali_gpu_wait(uint64_t seq, uint64_t timeout_ns);
+ bool
+--- a/iokit/Kernel/arm/S8Mali.cpp
++++ b/iokit/Kernel/arm/S8Mali.cpp
+@@ -62,6 +62,8 @@
+ void s8mali_unmap(uint64_t gpu, uint64_t size, uint64_t mapped);
+ bool s8mali_gpu_param(uint32_t which, uint64_t * value);
+ uint32_t s8mali_gpu_submit(uint64_t chain, bool fragment, uint64_t * seq);
++uint64_t s8mali_now(void);                      /* s8_mali_drv.c: mach_absolute_time, for the phase timing of a submit */
++void s8mali_submit_done(uint64_t entered);
+ bool s8mali_gpu_wait(uint64_t seq, uint64_t timeout_ns);
+ bool s8mali_pa_ok(uint64_t pa, uint64_t len);
+ uint64_t s8mali_kva_pa(vm_offset_t kva);
+@@ -589,6 +591,7 @@
+ 	(void)dispatch;
+ 	(void)target;
+ 	(void)reference;
++	uint64_t ext_entered = s8mali_now();
+ 	STEP_Q("externalMethod selector=0x%x in=%zu", selector, size);
+ 	if (selector == 0x70) {         /* a line of text from the user side (libs8gl) into the kernel log: printf lines go on arriving after the console is muted */
+ 		char text[240];
+@@ -691,6 +694,7 @@
+ 			    r.submit.bo_handle_count, seq, status);
+ 		}
+ 		STEP("SUBMIT done job %llu", seq);
++		s8mali_submit_done(ext_entered);
+ 		r.submit.jc = seq;      /* back in jc, as S9+: the shim puts the chain address back and keeps the number */
+ 		break;
+ 	}
