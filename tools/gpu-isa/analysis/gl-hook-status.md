@@ -59,3 +59,12 @@ Evidence = observations on the phone; guesses are marked. Route and rule: see me
   sweeps of the 17 MB surfaces; the jobs run 0.2-0.5 ms).
 - Next: 0164 (xnu/patches) logs COHERENCY_FEATURES and, with boot-arg s8mali_coh=1, enables ACE-Lite and skips the sweeps (experiment). Blocked on a kernel built with
   Xcode 15.4: the Mac's Xcode is 16.4 since the last build, see memory feedback-hosted-kernel-build-broken.
+
+## 2026-11-28 late: coherency, Xcode, colour-matrix programs, icons
+- COHERENCY_FEATURES reads 0x0 on this G71 (kernel log `S8MALI: coherency features 0x0`): no ACE-Lite, so the per-job cache sweeps cannot be dropped by enabling coherency
+  (s8mali_coh=1 stays as an off-by-default knob, patch 0164). The sweeps have to get cheaper instead (idea: sweep big BOs once per frame, not per batch; the CPU does not
+  write the textures/render targets between batches of one frame; the display copy must then invalidate the surface itself).
+- Mac runner: Xcode is 15.4 again (build log: "Xcode 15.4, Build version 15F31d" at /Applications/Xcode.app); kernel 17370608 bytes, boot image 18950160 = the good signature.
+- Colour-matrix substitutes (functions 45 vcm, 20 c4p, 28 ds8) built and used on the phone (census: ours 18/10/4, no faults); effect on the picture not yet looked at.
+- Icons: no icon-sized surface or compressed upload ever reaches GL (only the ASTC wallpaper); SpringBoard creates almost no IOSurfaces; it asks IOSurface selectors 40
+  and 41, which our stand-in answers with an empty success (patch 0165 logs their shape and refuses them like the S9+ port); iconservicesagent does start.
