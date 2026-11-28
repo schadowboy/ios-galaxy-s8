@@ -92,3 +92,15 @@ Evidence = observations on the phone; guesses are marked. Route and rule: see me
   glvibrant=0 glds8=0 = red->blue gradient wallpaper + white clock. The wallpaper is the default gradient poster made by CollectionsPoster and it is NOT the same on every boot, so
   "colours differ from the software renderer" cannot be concluded from different boots. A fair colour comparison needs the same wallpaper (e.g. fix a photo wallpaper in the root) or the
   same-boot A/B (not possible). The vcm/c4p/ds8 programs ran without faults/errors; their correctness is still unverified.
+
+## 2026-11-28 late: first home-screen evidence on both paths (emulator CPU baseline vs phone GL run gl22)
+- Emulator, kernel v188 (CPU rendering, no hook, s8autohome=480): home screen has ALL icons (Photos, App Store, Settings; dock Phone/Safari/Messages) and two "Waiting..." widgets.
+  So the icons exist on the CPU path; the missing icons are a GL-path bug, not an icon-service gap.
+- Phone, gl22 (v188 + hook on Mali-G71/Panfrost, s8autohome=150): no panic, Home key pressed at 150 s, thumbnails show the home screen with wallpaper, widget panels and an empty
+  dock, NO icons. (Control Center in two shots: the user opened it by hand.)
+- Hook log of that run (hook_log.txt holds several boots; the Mali contexts are the later ones): about 190 ms a frame, 90-150 draws, 14 GPU jobs a frame; the kernel calls take ~80 ms
+  of it (0xf0 job waits ~75 ms), the rest ~110 ms is CPU work in the userland (command building / Mesa), "handing on" only 1 ms. Framerate target: the CPU part.
+- Icon suspects in the same log: surfaces of 194x237 (icon + label, BGRA) fail glEGLImageTargetTexture2DOES with GL error 0x501 and are "copied"; IOSurfaces of format '....'
+  (not BGRA: 1105x1160, 256x1) are "copied, not shared: not BGRA bytes"; a copy of the surface may be taken before the icon image is written, or the copy path loses the alpha/swizzle.
+  Not yet proven: needs the draw that samples those textures (gltrace of one home-screen frame).
+- Next: reproduce the icon loss on softpipe in the emulator (hook installed into the emulator root) to iterate unattended, then gltrace one home-screen frame.
