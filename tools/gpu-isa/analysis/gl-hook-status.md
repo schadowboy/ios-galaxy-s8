@@ -33,8 +33,19 @@ Evidence = observations on the phone; guesses are marked. Route and rule: see me
   once the screen is up, so the kernel ring does not carry the hook's lines (0158 would).
 - Boot-arg line limit: 608 bytes in the loader. Keep s8gpudvfs/s8gputmu/dvfsch/s8dvfs/s8dvfs_ms in test images (they were dropped by mistake for a while).
 
+## Result of the 50 ms investigation (2026-11-28, phone, kernel printf lines S8MALI: JOBCLK / SUBMIT16)
+- GPU clock is the requested 546 MHz; a job takes 50-500 us inside the kernel. Driver phases: lock wait 0, setup 15 us, tail 3 us.
+- The 33-70 ms per submit were syncAll(): clean+invalidate of EVERY buffer (64 MiB tiler heap included) before and after every job.
+- 0161 (listed buffers only, never the heap, s8mali_syncall=1 = old way): submit 3-14 ms, ~5x more GPU jobs in 8 minutes, frames: heavy 4-6 s -> 0.3-0.9 s, simple
+  0.2 s -> 80 ms, typical 150-400 ms.
+- 0162 (clean before a batch's vertex job, invalidate after its fragment job only): submit 1-7 ms, simple frames 40-70 ms, typical 120-250 ms, heavy 0.4-0.7 s.
+- What is left in a ~150-250 ms frame: ~85 ms uploading screen-sized IOSurface textures into GL textures + ~55 ms reading the render target out into the surface (the
+  zero-copy IOSurface import would remove both), the rest submits (two 17 MB buffers per job are still swept twice per batch).
+- Hosted-runner kernels panic at boot: only Mac-built kernels. Mac runner drops out mid-build now and then: check the build result before using it.
+
 ## Next
-1. Mac-built kernel with: 0158 log selector + GPU cycle counter / per-job timing in s8mali_gpu_submit (find out why a trivial job takes 50 ms).
+1. Zero-copy IOSurface import: S8Mali selector 0x7e (IOSurface id -> GPU buffer object over the surface's own memory), Mesa patch 0006 (pan_kmod/pan_bo/osmesa surface +
+   glEGLImageTargetTexture2DOES with a surface id), shim s8mali_surface (done); attrs: SweetSurface memory is cached, S9+ used write-combined.
 2. Zero-copy IOSurface import (S8Mali selector 0x7e + Mesa patch 0006) to remove the ~16 MB copies per frame.
 3. Colour channel problem on the Mali path; missing icons/widget contents.
 4. Move the working parts into the kernel (the hook is test-only).
