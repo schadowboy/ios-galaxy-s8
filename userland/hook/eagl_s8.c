@@ -390,7 +390,8 @@ struct eagl {
 	GLuint program;                 /* the one in use, as CoreAnimation has it */
 	GLuint plain, lookup;           /* programs of ours for when that is none (plain_draw_begin()) */
 	GLint plain_matrix, plain_textured, lookup_matrix;
-	unsigned unit;                  /* the texture unit being spoken of */
+	bool blended;                   /* plain_draw_begin() turned blending off for a program that blends itself */
+	unsigned unit;                 /* the texture unit being spoken of */
 	GLuint bound[8];                /* the 2D texture bound to each of the first units */
 	const GLfloat *matrix;          /* where CoreAnimation keeps the matrix it gives its programs (read at draw time, as the S9+ port does) */
 	struct {
@@ -423,10 +424,13 @@ static int wait_for_frames = 1;         /* glwait=0: 0 */
 static int fetch_offered = 1;           /* glfetch=0: 0 */
 static int full_precision = 1;          /* glprecision=0: 0 */
 static int plain_draws = 1;             /* glplain= */
+static int vibrant_on = 1;              /* glvibrant=0: functions 45 (vcm) and 20 (c4p) stay as plain colour times texture / left out */
+static int downsample_on = 1;           /* glds8=0: function 28 (ds8) stays as plain colour times texture */
 static int resolved;                    /* eagl_resolve_functions() done */
 static unsigned unresolved;
 
 #define GL_SCISSOR_TEST                 0x0c11
+#define GL_BLEND                        0x0be2
 
 static const char *eagl_slot_name(unsigned offset);
 static int eagl_slot_expected(unsigned offset);
@@ -1262,7 +1266,7 @@ drawing(struct eagl *e)
  * screen's wallpaper and clock). Here such a draw is made with a program of ours, the plainest there could be:
  * CoreAnimation's own vertex arrays (position 0, colour 1, texture coordinates 2, the latter in the texture's pixels), the
  * matrix it gives every program of its own, and the colour times the texture on the first unit; one with a one-row texture
- * on the second unit is a lookup table (the home indicator). Function-specific programs are NOT ported: see the TODO at
+ * on the second unit is a lookup table (the home indicator). Functions 45, 20 and 28 have programs of ours (sub_ready()); the others are NOT ported: see the TODO at
  * the top of this file.
  */
 static const char plain_vertex[] =
@@ -1309,6 +1313,8 @@ static const char table_fragment[] =
     "  result = vec4(clamp(both + over.rgb * (1. - under.a) + under.rgb * (1. - over.a), 0., opacity), opacity);\n"
     "}\n";
 
+static void plain_shader_log(GLuint shader, const char *what, const char *kind);
+
 /* One of our programs, made: CoreAnimation's own vertex arrays go in at the places it has them. */
 static GLuint
 plain_program(const char *fragment, const char *what)
@@ -1321,11 +1327,13 @@ plain_program(const char *fragment, const char *what)
 	text = plain_vertex;
 	glShaderSource(shader, 1, &text, NULL);
 	glCompileShader(shader);
+	plain_shader_log(shader, what, "vertex");
 	glAttachShader(program, shader);
 	shader = glCreateShader(GL_FRAGMENT_SHADER);
 	text = fragment;
 	glShaderSource(shader, 1, &text, NULL);
 	glCompileShader(shader);
+	plain_shader_log(shader, what, "fragment");
 	glAttachShader(program, shader);
 	glBindAttribLocation(program, 0, "vertex_position");
 	glBindAttribLocation(program, 1, "vertex_color");
@@ -1333,7 +1341,103 @@ plain_program(const char *fragment, const char *what)
 	glLinkProgram(program);
 	glGetProgramiv(program, GL_LINK_STATUS, &good);
 	say("s8gl: a program of ours for the draws CoreAnimation makes with none (%s): %s\n", what, good ? "made" : "NOT MADE");
+	if (!good) {
+		char log[512] = "";
+
+		glGetProgramInfoLog(program, sizeof(log) - 1, NULL, log);
+		say("s8gl: link log (%s): %s\n", what, log);
+	}
 	return program;
+}
+
+/* The compile errors of one of our shaders, if there are any. */
+static void
+plain_shader_log(GLuint shader, const char *what, const char *kind)
+{
+	GLint good = 0;
+	char log[512] = "";
+
+	glGetShaderiv(shader, GL_COMPILE_STATUS, &good);
+	if (!good) {
+		glGetShaderInfoLog(shader, sizeof(log) - 1, NULL, log);
+		say("s8gl: %s shader of ours (%s) did NOT COMPILE: %s\n", kind, what, log);
+	}
+}
+
+/*
+ * Programs of ours that stand in for CoreAnimation's functions that have no GL shader (S9+ eagl.c plain_draw_begin()).
+ * Numbers are CoreAnimation's own, from ca_function_s8.c.
+ *   vcm (45): the vibrant colour matrix: 5 vec4 (four columns and what is added) applied to what is behind (read with
+ *     EXT_shader_framebuffer_fetch), mixed in by the layer's alpha. Needs the extension: without it the draw is left out.
+ *   c4p (20): the same matrix over the layer's own (premultiplied) pixels.
+ *   ds8 (28): eight times smaller in one go: 4 places mirrored both ways, 16 samples.
+ */
+static const char vibrant_fragment[] =
+    "#version 300 es\n"
+    "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+    "uniform lowp sampler2D texture0;\n"
+    "uniform mediump vec4 colours[5];\n"
+    "in lowp vec4 color;\n"
+    "in highp vec2 texcoord;\n"
+    "layout(location = 0) inout highp vec4 result;\n"
+    "void main() {\n"
+    "  mediump vec4 layer = color * texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
+    "  mediump vec4 behind = result, s = behind;\n"
+    "  s.rgb = s.rgb / max(s.a, .005);\n"
+    "  s = s.r * colours[0] + s.g * colours[1] + s.b * colours[2] + s.a * colours[3] + colours[4];\n"
+    "  s.a = clamp(s.a, 0., 1.);\n"
+    "  s.rgb = clamp(s.rgb * s.a, 0., 1.);\n"
+    "  result = mix(behind, s, layer.a);\n"
+    "}\n";
+static const char masking_fragment[] =
+    "#version 300 es\n"
+    "uniform lowp sampler2D texture0;\n"
+    "uniform mediump vec4 colours[5];\n"
+    "in lowp vec4 color;\n"
+    "in highp vec2 texcoord;\n"
+    "out lowp vec4 result;\n"
+    "void main() {\n"
+    "  mediump vec4 s = color * texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
+    "  result = clamp(s.r * colours[0] + s.g * colours[1] + s.b * colours[2] + s.a * colours[3] + colours[4], 0., 1.);\n"
+    "}\n";
+static const char box_fragment[] =
+    "#version 300 es\n"
+    "uniform lowp sampler2D texture0;\n"
+    "uniform highp vec2 places[4];\n"
+    "in lowp vec4 color;\n"
+    "in highp vec2 texcoord;\n"
+    "out lowp vec4 result;\n"
+    "void main() {\n"
+    "  highp vec2 middle = texcoord / vec2(textureSize(texture0, 0));\n"
+    "  highp vec4 sum = vec4(0.);\n"
+    "  for (int i = 0; i < 4; i++) {\n"
+    "    sum += texture(texture0, middle + places[i]) + texture(texture0, middle - places[i]);\n"
+    "    sum += texture(texture0, middle + places[i] * vec2(1., -1.)) + texture(texture0, middle + places[i] * vec2(-1., 1.));\n"
+    "  }\n"
+    "  result = sum * .0625;\n"
+    "}\n";
+
+enum { SUB_VIBRANT, SUB_MASKING, SUB_BOX, SUBS };
+static struct {
+	GLuint program;
+	GLint matrix, values;
+	bool tried, usable;
+} subs[SUBS];
+
+static bool
+sub_ready(unsigned which, const char *fragment, const char *what, const char *values)
+{
+	if (!subs[which].tried) {
+		GLint good = 0;
+
+		subs[which].tried = true;
+		subs[which].program = plain_program(fragment, what);
+		glGetProgramiv(subs[which].program, GL_LINK_STATUS, &good);
+		subs[which].usable = good != 0;      /* (not so with a library without the extension) */
+		subs[which].matrix = glGetUniformLocation(subs[which].program, "vertex_matrix");
+		subs[which].values = glGetUniformLocation(subs[which].program, values);
+	}
+	return subs[which].usable;
 }
 
 /*
@@ -1342,6 +1446,9 @@ plain_program(const char *fragment, const char *what)
  * left out, drawn as colour times texture, drawn through a table (substituted: none yet). The first draw of each function is
  * written down with its textures (size, internal format), vertex arrays and numbers; every 10 s a line of the counts.
  */
+#define CA_FUNCTION_MATRIX_PREMULTIPLIED 20
+#define CA_FUNCTION_DOWNSAMPLE_8 28
+#define CA_FUNCTION_VIBRANT_MATRIX 45
 enum { CENSUS_LEFT_OUT, CENSUS_PLAIN, CENSUS_TABLE, CENSUS_SUBSTITUTED, CENSUS_KINDS };
 static const char *const census_kinds[CENSUS_KINDS] = {
 	"LEFT OUT", "drawn as colour times texture", "drawn through a table (ours)", "substituted by a program of ours",
@@ -1374,14 +1481,14 @@ census_report(void)
 			drawn_lately += c->lately[k];
 		}
 		if (drawn_lately != 0 && used_lately < sizeof(lately) - 60) {
-			used_lately += (size_t)snprintf(lately + used_lately, sizeof(lately) - used_lately, " %u %s x%u (out %u, plain %u, table %u)",
+			used_lately += (size_t)snprintf(lately + used_lately, sizeof(lately) - used_lately, " %u %s x%u (out %u, plain %u, table %u, ours %u)",
 			    f == CA_FUNCTIONS ? CA_FUNCTION_UNKNOWN : f, name, drawn_lately, c->lately[CENSUS_LEFT_OUT], c->lately[CENSUS_PLAIN],
-			    c->lately[CENSUS_TABLE]);
+			    c->lately[CENSUS_TABLE], c->lately[CENSUS_SUBSTITUTED]);
 		}
 		if (drawn != 0 && used_all < sizeof(all) - 60) {
-			used_all += (size_t)snprintf(all + used_all, sizeof(all) - used_all, " %u %s x%u (out %u, plain %u, table %u)",
+			used_all += (size_t)snprintf(all + used_all, sizeof(all) - used_all, " %u %s x%u (out %u, plain %u, table %u, ours %u)",
 			    f == CA_FUNCTIONS ? CA_FUNCTION_UNKNOWN : f, name, drawn, c->draws[CENSUS_LEFT_OUT], c->draws[CENSUS_PLAIN],
-			    c->draws[CENSUS_TABLE]);
+			    c->draws[CENSUS_TABLE], c->draws[CENSUS_SUBSTITUTED]);
 		}
 		memset(c->lately, 0, sizeof(c->lately));
 	}
@@ -1460,6 +1567,45 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		}
 		return false;
 	}
+	/* the functions that have a program of ours of their own (numbers: CoreAnimation's, 20 floats; ds8: 8) */
+	if (e->bound[0] != 0 && function < CA_FUNCTIONS && plain_draws != 3) {
+		float values[20];
+		unsigned given = s8gl_ca_values(function, values), which = SUBS;
+
+		if (vibrant_on && function == CA_FUNCTION_VIBRANT_MATRIX && fetch_offered && given == 20) {
+			which = sub_ready(SUB_VIBRANT, vibrant_fragment, "a colour matrix over what is behind", "colours") ? SUB_VIBRANT : SUBS;
+			if (which == SUBS) {
+				census_draw(e, function, CENSUS_LEFT_OUT);      /* better nothing than the mask as a picture */
+				return false;
+			}
+		} else if (vibrant_on && function == CA_FUNCTION_MATRIX_PREMULTIPLIED && given == 20) {
+			which = sub_ready(SUB_MASKING, masking_fragment, "a colour matrix over premultiplied pixels", "colours") ? SUB_MASKING : SUBS;
+		} else if (downsample_on && function == CA_FUNCTION_DOWNSAMPLE_8 && given == 8) {
+			which = sub_ready(SUB_BOX, box_fragment, "eight times smaller, sixteen samples", "places") ? SUB_BOX : SUBS;
+		}
+		if (which != SUBS) {
+			census_draw(e, function, CENSUS_SUBSTITUTED);
+			glUseProgram(subs[which].program);
+			glUniformMatrix4fv(subs[which].matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
+			if (which == SUB_BOX) {
+				glUniform2fv(subs[which].values, 4, values);
+			} else {
+				glUniform4fv(subs[which].values, 5, values);
+			}
+			if (which == SUB_VIBRANT && glIsEnabled(GL_BLEND)) {
+				e->blended = true;      /* the program has blended already (it read what is behind) */
+				glDisable(GL_BLEND);
+			}
+			for (GLuint i = 0; i < 3; i++) {
+				glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]);
+				if (!enabled[i]) {
+					glEnableVertexAttribArray(i);
+				}
+			}
+			e->plain_drawn++;
+			return true;
+		}
+	}
 	if (e->bound[0] != 0 && e->bound[1] != 0) {
 		glActiveTexture(GL_TEXTURE0 + 1);
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &rows);
@@ -1516,6 +1662,10 @@ plain_draw_end(struct eagl *e, const GLint enabled[4])
 		}
 	}
 	glUseProgram(0);
+	if (e->blended) {
+		glEnable(GL_BLEND);
+		e->blended = false;
+	}
 }
 
 /* ---- the entries written by hand ---------------------------------------------------------------- */
@@ -2613,6 +2763,8 @@ s8gl_install(void)
 	fetch_offered = arg_int("glfetch", 1) != 0;
 	full_precision = arg_int("glprecision", 1) != 0;
 	plain_draws = (int)arg_int("glplain", 1);
+	vibrant_on = arg_int("glvibrant", 1) != 0;
+	downsample_on = arg_int("glds8", 1) != 0;
 	wait_for_frames = arg_int("glwait", 1) != 0;
 	if ((argument = arg_get("glsurfaces")) != NULL) {
 		images_most = (unsigned)strtoul(argument, NULL, 10);
