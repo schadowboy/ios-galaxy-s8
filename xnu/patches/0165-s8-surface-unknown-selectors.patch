@@ -1,0 +1,34 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1018,7 +1018,30 @@
+ 		return kIOReturnSuccess;
+ 	}
+ 	default:
+-		/* Values, notifications, ownership, timestamps...: accept and ignore. */
++		/*
++		 * Values, notifications, ownership, timestamps...: accept and ignore. What is asked for is written down once per selector
++		 * (the shape of the request: scalars and structure sizes in and out), as the S9+ port does for the ones it does not know
++		 * (patch 0165; SpringBoard asks selectors 40 and 41 and no icon bitmap is ever made by it). Selectors 40 and 41 are refused
++		 * honestly (S9+ answers every unknown selector so): an empty "success" is a lie that IOSurface.framework turns into
++		 * clients and results with nothing in them (patch 0157 was that story for selector 6).
++		 */
++		{
++			static uint64_t shape_said;
++
++			if (selector < 64 && !(shape_said & (1ULL << selector))) {
++				char name[32];
++
++				shape_said |= 1ULL << selector;
++				proc_selfname(name, sizeof(name));
++				IOLog("SWEET SURF: %s selector %u not implemented: scalars %u in (%#llx %#llx) %u out, structure %u in %u out\n", name,
++				    selector, args->scalarInputCount, args->scalarInputCount > 0 ? args->scalarInput[0] : 0ULL,
++				    args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL, args->scalarOutputCount, args->structureInputSize,
++				    args->structureOutputSize);
++			}
++		}
++		if (selector == 40 || selector == 41) {
++			return kIOReturnUnsupported;
++		}
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 			args->scalarOutput[i] = 0;
+ 		}
