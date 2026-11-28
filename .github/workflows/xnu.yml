@@ -69,7 +69,19 @@ jobs:
         run: |
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app /Applications/Xcode.app 2>/dev/null | sort -V | head -1)
+          if [ "$RUNNER_ENVIRONMENT" = "github-hosted" ]; then
+            XC=$(ls -d /Applications/Xcode_*.app /Applications/Xcode.app 2>/dev/null | sort -V | head -1)
+          else
+            # self-hosted: the Xcode 15.x, whatever its folder is called. A kernel built with Xcode 16 panics at boot on the phone
+            # (device tree check; boot image 59 KB larger), so no 15.x means the job stops here instead of building a bad kernel.
+            XC=""
+            for a in /Applications/Xcode*.app; do
+              v=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$a/Contents/Info.plist" 2>/dev/null)
+              echo "found $a = Xcode $v"
+              case "$v" in 15.*) [ -n "$XC" ] || XC="$a" ;; esac
+            done
+            [ -n "$XC" ] || { echo "::error::no Xcode 15.x under /Applications on this runner"; exit 1; }
+          fi
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           export DEVELOPER_DIR="$XC/Contents/Developer"
           if [ "$RUNNER_ENVIRONMENT" = "github-hosted" ]; then
