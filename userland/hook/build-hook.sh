@@ -41,7 +41,7 @@ fi
 xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -dynamiclib -O2 -Wall -Wextra -Wno-unused-parameter \
 	-fvisibility=hidden -I"$HERE" -F"$FW" \
 	-framework CoreFoundation -framework IOKit -lobjc -install_name /usr/lib/libs8gl.dylib \
-	-o "$OUT/libs8gl.dylib" "$HERE/eagl_s8.c" "$HERE/gl_osmesa_s8.c" "$HERE/../s8mali/s8mali_drm.c"
+	-o "$OUT/libs8gl.dylib" "$HERE/eagl_s8.c" "$HERE/ca_function_s8.c" "$HERE/gl_osmesa_s8.c" "$HERE/../s8mali/s8mali_drm.c"
 
 "$LDID" -S "$OUT/libs8gl.dylib"
 file "$OUT/libs8gl.dylib" || true

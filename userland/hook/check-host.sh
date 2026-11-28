@@ -6,7 +6,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CC="${CC:-clang}"
 FLAGS=(-fsyntax-only -std=gnu11 -Wall -Wextra -Wno-unused-parameter -I"$HERE/stubs" -I"$HERE" -include "$HERE/stubs/compat.h")
-for f in eagl_s8.c gl_osmesa_s8.c; do
+for f in eagl_s8.c ca_function_s8.c gl_osmesa_s8.c; do
 	echo "check-host: $f"
 	"$CC" "${FLAGS[@]}" "$HERE/$f"
 done
