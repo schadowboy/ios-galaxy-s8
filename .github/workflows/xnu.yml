@@ -39,7 +39,7 @@ jobs:
   build:
     # macos-14 is retired; macos-15 oldest Xcode is 16.0 (was: macos-14 shipped Xcode 15.x): its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: ${{ fromJSON(inputs.runner_labels || '["macos-15"]') }}
+    runs-on: ${{ fromJSON(inputs.runner_labels || vars.RUNNER_LABELS || '["macos-15"]') }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
