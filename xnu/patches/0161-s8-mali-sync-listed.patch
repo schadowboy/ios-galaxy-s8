@@ -1,0 +1,123 @@
+--- a/osfmk/kern/s8_mali_drv.c
++++ b/osfmk/kern/s8_mali_drv.c
+@@ -1021,6 +1021,16 @@
+ 	return status;
+ }
+ 
++/* boot-arg s8mali_syncall=1 (S8Mali.cpp syncAll): clean+invalidate every buffer, heap included, around every job, as before patch 0161 */
++bool s8mali_syncall_requested(void);
++bool
++s8mali_syncall_requested(void)
++{
++	uint32_t v = 0;
++
++	return PE_parse_boot_argn("s8mali_syncall", &v, sizeof(v)) && v != 0;
++}
++
+ /* the whole SUBMIT case from the entry of the user client's externalMethod (S8Mali.cpp) to its end, against the driver's own phases above */
+ uint64_t s8mali_now(void);
+ uint64_t
+--- a/iokit/Kernel/arm/S8Mali.cpp
++++ b/iokit/Kernel/arm/S8Mali.cpp
+@@ -64,6 +64,7 @@
+ uint32_t s8mali_gpu_submit(uint64_t chain, bool fragment, uint64_t * seq);
+ uint64_t s8mali_now(void);                      /* s8_mali_drv.c: mach_absolute_time, for the phase timing of a submit */
+ void s8mali_submit_done(uint64_t entered);
++bool s8mali_syncall_requested(void);            /* boot-arg s8mali_syncall=1: every buffer, heap included, around every job (the way before patch 0161) */
+ bool s8mali_gpu_wait(uint64_t seq, uint64_t timeout_ns);
+ bool s8mali_pa_ok(uint64_t pa, uint64_t len);
+ uint64_t s8mali_kva_pa(vm_offset_t kva);
+@@ -307,7 +308,7 @@
+ 	struct mali_buffer * buffer(uint32_t handle);
+ 	void freeBuffer(struct mali_buffer * b);
+ 	IOReturn createBO(struct drm_panfrost_create_bo * request);
+-	void syncAll(const char * when);
++	void syncAll(const char * when, user_addr_t list, uint32_t count);
+ 	void closeAll(void);
+ 
+ public:
+@@ -488,24 +489,60 @@
+ 	return kIOReturnSuccess;
+ }
+ 
+-/* With the lock held: clean + invalidate by kernel VA the memory of every buffer of this client */
++/*
++ * With the lock held: clean + invalidate by kernel VA the memory the job is about to use (before it) or has used (after it).
++ * Before patch 0161 this was every buffer of the client, heap included, twice per job: the 64 MiB tiler heap alone is a million
++ * cache lines, and a submit cost 33-70 ms of it while the job itself ran 50-470 us (phone, 2026-11-28, SUBMIT16 vs JOBCLK).
++ * Now: the buffers the submit lists (`list`, `count` handles in the caller's memory), heap buffers never (only the GPU touches
++ * the tiler heap; the CPU zeroed and flushed it when it was made); when the list cannot be read, every buffer but the heaps.
++ * Boot-arg s8mali_syncall=1 brings the old behaviour back (every buffer, heap included).
++ */
+ void
+-S8MaliUserClient::syncAll(const char * when)
++S8MaliUserClient::syncAll(const char * when, user_addr_t list, uint32_t count)
+ {
+-	uint32_t n = 0;
++	static int everything = -1;
++	uint32_t synced = 0;
++	uint64_t bytes = 0;
++	bool listed = list != 0 && count != 0;
++
++	if (everything < 0) {
++		everything = s8mali_syncall_requested() ? 1 : 0;
++	}
++	if (everything) {
++		listed = false;
++	}
++	if (listed) {
++		for (uint32_t i = 0; i < count && i < 4096 && listed; i += 64) {
++			uint32_t handles[64];
++			uint32_t n = count - i < 64 ? count - i : 64;
++
++			if (copyin(list + i * sizeof(uint32_t), handles, n * sizeof(uint32_t)) != 0) {
++				listed = false;
++				break;
++			}
++			for (uint32_t k = 0; k < n; k++) {
++				struct mali_buffer * b = buffer(handles[k]);
+ 
+-	for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
+-		if (fBuffers[i].memory != NULL) {
+-			n++;
++				if (b != NULL && !(b->flags & PANFROST_BO_HEAP)) {
++					s8mali_bo_sync(b->kva, b->backed);
++					synced++;
++					bytes += b->backed;
++				}
++			}
+ 		}
+ 	}
+-	STEP("SUBMIT sync %s: %u buffers", when, n);
+-	for (uint32_t i = 0; i < MALI_BUFFERS && n != 0; i++) {
+-		if (fBuffers[i].memory != NULL) {
+-			s8mali_bo_sync(fBuffers[i].kva, fBuffers[i].backed);
+-			n--;
++	if (!listed) {
++		synced = 0;
++		bytes = 0;
++		for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
++			if (fBuffers[i].memory != NULL && (everything || !(fBuffers[i].flags & PANFROST_BO_HEAP))) {
++				s8mali_bo_sync(fBuffers[i].kva, fBuffers[i].backed);
++				synced++;
++				bytes += fBuffers[i].backed;
++			}
+ 		}
+ 	}
++	STEP_Q("SUBMIT sync %s: %u buffers, %llu KB%s", when, synced, bytes >> 10, listed ? "" : " (all)");
+ }
+ 
+ void
+@@ -664,10 +701,10 @@
+ 		if (r.submit.jc != 0) {
+ 			/* cacheable program mappings, non-coherent GPU: clean+invalidate every buffer by kernel VA (data caches are physically
+ 			 * tagged, so lines dirtied through the program's own mapping are covered) before the job, and again after it */
+-			syncAll("before the job");
++			syncAll("before the job", (user_addr_t) r.submit.bo_handles, r.submit.bo_handle_count);
+ 			__asm__ volatile ("dsb sy" ::: "memory");
+ 			status = s8mali_gpu_submit(r.submit.jc, (r.submit.requirements & PANFROST_JD_REQ_FS) != 0, &seq);
+-			syncAll("after the job");
++			syncAll("after the job", (user_addr_t) r.submit.bo_handles, r.submit.bo_handle_count);
+ 			if (status != 0) {
+ 				/* the GPU was reset; the job is lost. The call still succeeds (Mesa would abort on an error) */
+ 				gFailed++;
