@@ -69,6 +69,7 @@
 #include <unistd.h>
 
 #include "hook_gl.h"
+#include "ca_function_s8.h"
 
 /* ---- CoreFoundation and IOSurface: a few functions, reached by name so that nothing but libSystem/objc/CF is linked ---- */
 
@@ -176,6 +177,8 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_TEXTURE                      0x1702
 #define GL_TEXTURE0                     0x84c0
 #define GL_TEXTURE_HEIGHT               0x1001
+#define GL_TEXTURE_WIDTH                0x1000
+#define GL_TEXTURE_INTERNAL_FORMAT      0x1003
 #define GL_VERTEX_ATTRIB_ARRAY_ENABLED  0x8622
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE 0x8cd0
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME 0x8cd1
@@ -1333,17 +1336,124 @@ plain_program(const char *fragment, const char *what)
 	return program;
 }
 
+/*
+ * Census of the draws CoreAnimation makes with no program (S9+ eagl.c census_draw()/census_report(), always on here; logging only).
+ * By CoreAnimation's function number (ca_function_s8.c; CA_FUNCTION_UNKNOWN = 255 is counted in the extra last row) and what was done:
+ * left out, drawn as colour times texture, drawn through a table (substituted: none yet). The first draw of each function is
+ * written down with its textures (size, internal format), vertex arrays and numbers; every 10 s a line of the counts.
+ */
+enum { CENSUS_LEFT_OUT, CENSUS_PLAIN, CENSUS_TABLE, CENSUS_SUBSTITUTED, CENSUS_KINDS };
+static const char *const census_kinds[CENSUS_KINDS] = {
+	"LEFT OUT", "drawn as colour times texture", "drawn through a table (ours)", "substituted by a program of ours",
+};
+static struct census {
+	unsigned draws[CENSUS_KINDS], lately[CENSUS_KINDS];
+	uint8_t said, said_kinds;       /* said: the function's first line; said_kinds: a bit for each kind met */
+} census[CA_FUNCTIONS + 1];
+static uint64_t census_told;
+
+static void
+census_report(void)
+{
+	char lately[900] = "", all[900] = "";
+	size_t used_lately = 0, used_all = 0;
+	uint64_t now = now_us();
+
+	if (now - census_told < 10000000) {
+		return;
+	}
+	census_told = now;
+	for (unsigned f = 0; f <= CA_FUNCTIONS; f++) {
+		struct census *c = &census[f];
+		unsigned drawn = 0, drawn_lately = 0;
+		char name[16];
+
+		snprintf(name, sizeof(name), "%s", f == CA_FUNCTIONS ? "unknown" : s8gl_ca_name(f));
+		for (unsigned k = 0; k < CENSUS_KINDS; k++) {
+			drawn += c->draws[k];
+			drawn_lately += c->lately[k];
+		}
+		if (drawn_lately != 0 && used_lately < sizeof(lately) - 60) {
+			used_lately += (size_t)snprintf(lately + used_lately, sizeof(lately) - used_lately, " %u %s x%u (out %u, plain %u, table %u)",
+			    f == CA_FUNCTIONS ? CA_FUNCTION_UNKNOWN : f, name, drawn_lately, c->lately[CENSUS_LEFT_OUT], c->lately[CENSUS_PLAIN],
+			    c->lately[CENSUS_TABLE]);
+		}
+		if (drawn != 0 && used_all < sizeof(all) - 60) {
+			used_all += (size_t)snprintf(all + used_all, sizeof(all) - used_all, " %u %s x%u (out %u, plain %u, table %u)",
+			    f == CA_FUNCTIONS ? CA_FUNCTION_UNKNOWN : f, name, drawn, c->draws[CENSUS_LEFT_OUT], c->draws[CENSUS_PLAIN],
+			    c->draws[CENSUS_TABLE]);
+		}
+		memset(c->lately, 0, sizeof(c->lately));
+	}
+	if (lately[0] != 0) {
+		say("s8gl: census: no program, in the last ten seconds:%s\n", lately);
+		say("s8gl: census: no program, since the start:%s\n", all);
+	}
+}
+
+static void
+census_draw(struct eagl *e, unsigned function, unsigned kind)
+{
+	struct census *c = &census[function < CA_FUNCTIONS ? function : CA_FUNCTIONS];
+	char textures[240] = "", arrays[240] = "", numbers[200] = "";
+	float values[20];
+	size_t used = 0;
+	unsigned given;
+
+	c->draws[kind]++;
+	c->lately[kind]++;
+	if (!c->said) {
+		c->said = 1;
+		say("s8gl: a draw with no program is CoreAnimation's function %u (\"%s\")%s\n", function, s8gl_ca_name(function),
+		    s8gl_ca_hooked() ? "" : " (function numbers unavailable: the hook is not in place)");
+	}
+	if (!(c->said_kinds & (1u << kind))) {
+		c->said_kinds |= (uint8_t)(1u << kind);
+		for (unsigned unit = 0; unit < 8; unit++) {
+			GLint width = 0, height = 0, format = 0;
+
+			if (e->bound[unit] == 0) {
+				continue;
+			}
+			glActiveTexture(GL_TEXTURE0 + unit);
+			glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+			glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+			glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
+			used += (size_t)snprintf(textures + used, sizeof(textures) - used, " [%u] tex %u %d x %d (%#x)", unit, e->bound[unit],
+			    width, height, (unsigned)format);
+		}
+		glActiveTexture(GL_TEXTURE0 + e->unit);
+		used = 0;
+		for (unsigned i = 0; i < 4; i++) {
+			used += (size_t)snprintf(arrays + used, sizeof(arrays) - used, " [%u] %s size %d type %#x stride %d", i,
+			    e->arrays[i].pointer != NULL ? "client" : "none", e->arrays[i].size, e->arrays[i].type, e->arrays[i].stride);
+		}
+		used = 0;
+		given = s8gl_ca_values(function, values);
+		for (unsigned i = 0; i < given && used < sizeof(numbers) - 16; i++) {
+			used += (size_t)snprintf(numbers + used, sizeof(numbers) - used, " %.4g", (double)values[i]);
+		}
+		say("s8gl: census: function %u (\"%s\") with no program, %s: framebuffer %u (colour texture %u); textures%s; arrays%s; "
+		    "enabled %d; its numbers:%s\n", function, s8gl_ca_name(function), census_kinds[kind], e->framebuffer, e->colour,
+		    textures[0] ? textures : " none", arrays, e->arrays[0].pointer != NULL, numbers[0] ? numbers : " none");
+	}
+	census_report();
+}
+
 static bool
 plain_draw_begin(struct eagl *e, GLint enabled[4])
 {
 	static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 	GLint rows = 0;
 	GLuint program;
+	unsigned function;
 
 	if (e->program != 0) {
 		return false;
 	}
+	function = s8gl_ca_function();
 	if (!plain_draws || (plain_draws == 1 && e->bound[0] == 0) || (e->colour != 0 && e->colour == e->bound[0])) {
+		census_draw(e, function, CENSUS_LEFT_OUT);
 		if (e->plain_left_out++ < 8) {
 			say("s8gl: a draw with no program is left out (glplain %d, texture %u on the first unit, framebuffer %u)\n",
 			    plain_draws, e->bound[0], e->framebuffer);
@@ -1371,6 +1481,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		}
 		program = e->plain;
 	}
+	census_draw(e, function, program == e->lookup ? CENSUS_TABLE : CENSUS_PLAIN);
 	glUseProgram(program);
 	glUniformMatrix4fv(program == e->plain ? e->plain_matrix : e->lookup_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
 	if (program == e->plain) {
@@ -2476,6 +2587,9 @@ s8gl_install(void)
 	}
 	say("s8gl: libs8gl loaded in %s pid %d (boot-args: %s)\n", name, getpid(), bootargs);
 	s8gl_fault_install();
+	if (arg_int("gl", -1) != 0) {
+		s8gl_ca_install();              /* census only: CoreAnimation's function numbers; verified before any write */
+	}
 	if (arg_int("gl", -1) == 0) {
 		say("s8gl: gl=0: nothing is replaced\n");
 		return;
