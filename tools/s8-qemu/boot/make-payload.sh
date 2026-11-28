@@ -24,8 +24,10 @@ mkdir -p "$OUT"
 # s8recov (PMU reset to recovery) and a53freq/mngsexp. Kept: s8rtc, vm_compression_limit, s8mali_drv/s8agx*, sweetfb_*, ufsroot.
 args="debug=0xc serial=3 cpus=$QCPUS keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsroot=USERDATA \
 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 \
-a5touchprobe=0 s8touch=0 a5fb_keep_on=1 a5fb_noconsole=1 sweetfb_native=1 \
-vm_compression_limit=524288 s8rtc=$(date +%s) s8mali_drv=1 s8panicwait=30 sweetfb_async=1 s8agx=1 s8agxskip=59 $*"
+a5touchprobe=0 ${S8_TOUCH-s8touch=0} a5fb_keep_on=1 a5fb_noconsole=1 sweetfb_native=1 \
+vm_compression_limit=524288 s8rtc=$(date +%s) s8mali_drv=1 s8panicwait=30 sweetfb_async=1 ${S8_AGXARGS-s8agx=1 s8agxskip=59} $*"
+# S8_AGXARGS="" (set, empty) drops the software GPU stand-in: iOS then draws on the CPU, like the phone's baseline image (the stand-in made the
+# emulated screen black after the first minutes: the executor is slow without the phone's CPU speed)
 python3 -I "$here/mkadt_qemu.py" "$OUT/dreamlte-qemu.adt" --cpus "$QCPUS" --dram-size "$DRAM_SIZE" --dram-base "$DRAM_BASE" --canvas "$CANVAS"
 python3 "$tools/mkpayload.py" "$KERNEL" "$OUT/dreamlte-qemu.adt" "$OUT/payload.bin" --cmdline "$args" | tee "$OUT/payload.info"
 OUT="$OUT" "$here/build.sh"

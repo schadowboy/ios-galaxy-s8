@@ -35,6 +35,48 @@
  bool s8mali_syncall_requested(void);
  bool
  s8mali_syncall_requested(void)
+@@ -1126,13 +1154,41 @@
+ 	thread_terminate_self();
+ }
+ 
++/*
++ * Patch 0166, boot-arg s8autohome=<seconds> (test aid): press the Home key through the HID stand-in once, that many seconds after boot, so an
++ * unattended run leaves the lock screen and shows the home screen (kernel log thumbnails, hook log). Key 3 is Home (Power, Volume Up,
++ * Volume Down, Home), as the emulator's 'h' key and the A5XELTE keys driver number them.
++ */
++extern void sweet_hid_key(int key, int down);
++
++static void
++s8_autohome_thread(void *arg, wait_result_t result)
++{
++	uint32_t secs = (uint32_t)(uintptr_t)arg;
++
++	(void)result;
++	IOSleep(secs * 1000);
++	printf("S8AUTOHOME: Home key pressed after %u s\n", secs);
++	sweet_hid_key(3, 1);
++	IOSleep(200);
++	sweet_hid_key(3, 0);
++	thread_terminate_self();
++}
++
+ void s8mali_drv_init(void);
+ void
+ s8mali_drv_init(void)
+ {
+ 	uint32_t on = 0;
+ 	thread_t thread;
++	uint32_t home_secs = 0;
+ 
++	if (PE_parse_boot_argn("s8autohome", &home_secs, sizeof(home_secs)) && home_secs != 0) {
++		if (kernel_thread_start_priority(s8_autohome_thread, (void *)(uintptr_t)home_secs, BASEPRI_DEFAULT, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			P("s8autohome=%u: the Home key is pressed once after that many seconds", home_secs);
++		}
++	}
+ 	if (!PE_parse_boot_argn("s8mali_drv", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
 --- a/iokit/Kernel/arm/S8Mali.cpp
 +++ b/iokit/Kernel/arm/S8Mali.cpp
 @@ -67,7 +67,8 @@
