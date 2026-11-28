@@ -68,3 +68,13 @@ Evidence = observations on the phone; guesses are marked. Route and rule: see me
 - Colour-matrix substitutes (functions 45 vcm, 20 c4p, 28 ds8) built and used on the phone (census: ours 18/10/4, no faults); effect on the picture not yet looked at.
 - Icons: no icon-sized surface or compressed upload ever reaches GL (only the ASTC wallpaper); SpringBoard creates almost no IOSurfaces; it asks IOSurface selectors 40
   and 41, which our stand-in answers with an empty success (patch 0165 logs their shape and refuses them like the S9+ port); iconservicesagent does start.
+
+## 2026-11-28 night: the icons (kernel log of the 0165 run, Xcode 15.4 kernel from the Mac)
+- Unknown IOSurface selectors (patch 0165 log): SpringBoard 40 (no scalars, no structure), 41 (one scalar that looks like a user pointer, 0x280f556a0); CollectionsPoster 20/21;
+  backboardd 5/9/27. Nothing that returns data to the caller, so 40/41 are probably not what hides the icons; 40/41 are refused now (S9+ way), no visible change.
+- IOSurface creators in the run: backboardd 24, CollectionsPoster 19, mediaserverd 12, SpringBoard 7 (272x184 BGRA, 230x186/105x144/102x144/360x246 LA08 masks, one 1440x2960).
+  `exec iconservicesagent` happens but it (and iconservicesd) never creates an IOSurface: no icon bitmap is ever produced or handed over, so CoreAnimation has nothing to draw
+  (matches the hook log: no icon-sized texture ever reaches GL, only one ASTC upload = the wallpaper).
+- Working hypothesis (unverified): IconServices renders icons with Metal/CoreImage in iconservicesagent and fails without a Metal device (no AGX Metal here). Cheap checks: process
+  logs of iconservicesagent (S9+ port's exec_applog_oslog sets OS_ACTIVITY_DT_MODE=YES for all programs so os_log reaches the console: ref/s9plus xnu/hakios.patch ~720-830),
+  its sandbox denials, whether the baseline CPU image shows icons at all.
